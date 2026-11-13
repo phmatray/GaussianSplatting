@@ -1,0 +1,436 @@
+//! Splat storage (CPU + GPU), depth sorting and the splat draw call.
+
+use glam::{Mat4, Vec3};
+use gs_core::codec::{self, LayerHeader, LayerMode};
+use gs_core::sort::DepthSorter;
+use gs_core::splat::{ViewParams, CUTOFF_SIGMA};
+use gs_core::Splat;
+use wasm_bindgen::JsValue;
+use web_sys::{WebGl2RenderingContext as GL, WebGlBuffer, WebGlProgram, WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject};
+
+use crate::glutil::{link_program, uniform, QUAD_CORNERS};
+use crate::pack::{pack_splats, TextureLayout, MIN_ROWS, WORDS_PER_SPLAT};
+use crate::params::{RenderParams, LAYER_COUNT};
+use crate::shaders::{SPLAT_FS, SPLAT_VS};
+
+/// Splats packed per staging-buffer fill when (re)uploading a large range:
+/// bounds the staging memory to a few megabytes.
+const UPLOAD_CHUNK_ROWS: usize = 64;
+
+/// A sort slower than this is not repeated on the very next frame.
+const SLOW_SORT_MS: f64 = 4.0;
+
+/// The order is kept while the view direction stays within about a quarter
+/// of a degree (`1 − cos`), which hides nothing visible but lets a still or
+/// slowly drifting head skip most sorts.
+const SORT_DIRECTION_TOLERANCE: f32 = 1.0e-5;
+
+/// What, besides the data and the view direction, determines the order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SortKey {
+    pub show: [bool; LAYER_COUNT],
+    /// Splats centered above this height are left out (`+∞` = none).
+    pub clip_y: f32,
+}
+
+struct Layer {
+    splats: Vec<Splat>,
+    /// Centers only, densely packed for the sorter.
+    positions: Vec<[f32; 3]>,
+    texture: WebGlTexture,
+    /// Allocated texture height.
+    rows: u32,
+}
+
+struct Uniforms {
+    split: WebGlUniformLocation,
+    counts: WebGlUniformLocation,
+    spr: WebGlUniformLocation,
+    view: WebGlUniformLocation,
+    focal: WebGlUniformLocation,
+    center: WebGlUniformLocation,
+    viewport: WebGlUniformLocation,
+    near: WebGlUniformLocation,
+    splat_scale: WebGlUniformLocation,
+    max_radius: WebGlUniformLocation,
+    point_radius: WebGlUniformLocation,
+    clip_y: WebGlUniformLocation,
+}
+
+/// State of the index buffer on the GPU.
+struct Sorted {
+    /// Data version the order was computed for.
+    version: u64,
+    forward: Vec3,
+    key: SortKey,
+    /// Indices `>= split` address layer 1 (see the vertex shader).
+    split: u32,
+    /// Instances to draw.
+    instances: u32,
+    /// The previous frame sorted.
+    sorted_last_frame: bool,
+}
+
+/// Both splat layers, their GPU copies and the sorted draw order.
+pub(crate) struct SplatScene {
+    gl: GL,
+    program: WebGlProgram,
+    uniforms: Uniforms,
+    vao: WebGlVertexArrayObject,
+    corner_buffer: WebGlBuffer,
+    index_buffer: WebGlBuffer,
+    /// Allocated size of the index buffer, in indices.
+    index_capacity: usize,
+    layout: TextureLayout,
+    layers: [Layer; LAYER_COUNT],
+    /// Packed words on their way to the GPU.
+    staging: Vec<u32>,
+    /// Decode target for layer messages; swapped with the layer on `Replace`.
+    scratch: Vec<Splat>,
+    sorter: DepthSorter,
+    order: Vec<u32>,
+    /// Bumped on every change of the splat data.
+    version: u64,
+    sorted: Sorted,
+    /// Duration of the last sort, milliseconds.
+    pub sort_ms: f64,
+    /// Number of sorts so far.
+    pub sort_count: u64,
+}
+
+fn create_data_texture(gl: &GL, layout: &TextureLayout, rows: u32) -> Result<WebGlTexture, JsValue> {
+    let texture = gl.create_texture().ok_or("WebGL: createTexture failed")?;
+    gl.bind_texture(GL::TEXTURE_2D, Some(&texture));
+    gl.tex_storage_2d(GL::TEXTURE_2D, 1, GL::RGBA32UI, layout.width() as i32, rows as i32);
+    // Integer textures are incomplete with any filtering but NEAREST.
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::NEAREST as i32);
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MAG_FILTER, GL::NEAREST as i32);
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_S, GL::CLAMP_TO_EDGE as i32);
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_T, GL::CLAMP_TO_EDGE as i32);
+    Ok(texture)
+}
+
+impl SplatScene {
+    pub fn new(gl: &GL) -> Result<Self, JsValue> {
+        let program = link_program(gl, SPLAT_VS, SPLAT_FS)?;
+        let u = |name: &str| uniform(gl, &program, name);
+        let uniforms = Uniforms {
+            split: u("u_split")?,
+            counts: u("u_counts")?,
+            spr: u("u_spr")?,
+            view: u("u_view")?,
+            focal: u("u_focal")?,
+            center: u("u_center")?,
+            viewport: u("u_viewport")?,
+            near: u("u_near")?,
+            splat_scale: u("u_splat_scale")?,
+            max_radius: u("u_max_radius")?,
+            point_radius: u("u_point_radius")?,
+            clip_y: u("u_clip_y")?,
+        };
+        // The samplers never change units.
+        gl.use_program(Some(&program));
+        gl.uniform1i(Some(&u("u_data0")?), 0);
+        gl.uniform1i(Some(&u("u_data1")?), 1);
+
+        let vao = gl.create_vertex_array().ok_or("WebGL: createVertexArray failed")?;
+        gl.bind_vertex_array(Some(&vao));
+        let corner_buffer = gl.create_buffer().ok_or("WebGL: createBuffer failed")?;
+        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&corner_buffer));
+        // SAFETY: the view is consumed by bufferData before anything can
+        // allocate (and so move) wasm memory.
+        gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &unsafe { js_sys::Float32Array::view(&QUAD_CORNERS) }, GL::STATIC_DRAW);
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_with_i32(0, 2, GL::FLOAT, false, 0, 0);
+        let index_buffer = gl.create_buffer().ok_or("WebGL: createBuffer failed")?;
+        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&index_buffer));
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_i_pointer_with_i32(1, 1, GL::UNSIGNED_INT, 0, 0);
+        gl.vertex_attrib_divisor(1, 1);
+        gl.bind_vertex_array(None);
+
+        let max_texture_size = gl.get_parameter(GL::MAX_TEXTURE_SIZE)?.as_f64().unwrap_or(2048.0) as u32;
+        let layout = TextureLayout::new(max_texture_size);
+        let layer = || -> Result<Layer, JsValue> {
+            Ok(Layer { splats: Vec::new(), positions: Vec::new(), texture: create_data_texture(gl, &layout, MIN_ROWS)?, rows: MIN_ROWS })
+        };
+        Ok(Self {
+            gl: gl.clone(),
+            program,
+            uniforms,
+            vao,
+            corner_buffer,
+            index_buffer,
+            index_capacity: 0,
+            layout,
+            layers: [layer()?, layer()?],
+            staging: Vec::new(),
+            scratch: Vec::new(),
+            sorter: DepthSorter::new(),
+            order: Vec::new(),
+            version: 1,
+            sorted: Sorted {
+                version: 0,
+                forward: Vec3::ZERO,
+                key: SortKey { show: [true; LAYER_COUNT], clip_y: f32::INFINITY },
+                split: 0,
+                instances: 0,
+                sorted_last_frame: false,
+            },
+            sort_ms: 0.0,
+            sort_count: 0,
+        })
+    }
+
+    /// Splats in one layer.
+    pub fn layer_len(&self, layer: usize) -> usize {
+        self.layers[layer].splats.len()
+    }
+
+    /// Splats in all layers.
+    pub fn total(&self) -> usize {
+        self.layers.iter().map(|l| l.splats.len()).sum()
+    }
+
+    /// Instances the next draw submits.
+    pub fn instances(&self) -> u32 {
+        self.sorted.instances
+    }
+
+    /// Copy of all splats, layer 0 first.
+    pub fn splats(&self) -> Vec<Splat> {
+        let mut out = Vec::with_capacity(self.total());
+        for layer in &self.layers {
+            out.extend_from_slice(&layer.splats);
+        }
+        out
+    }
+
+    fn check_capacity(&self, count: usize) -> Result<(), String> {
+        let max = self.layout.max_splats();
+        if count > max {
+            return Err(format!("layer would hold {count} splats, this GPU allows {max} per layer"));
+        }
+        Ok(())
+    }
+
+    /// Replaces the content of a layer. O(new size).
+    pub fn replace(&mut self, layer: usize, splats: &[Splat]) -> Result<(), String> {
+        self.check_capacity(splats.len())?;
+        let l = &mut self.layers[layer];
+        l.splats.clear();
+        l.splats.extend_from_slice(splats);
+        self.refresh(layer, 0)
+    }
+
+    /// Adds splats to a layer. O(added), amortized.
+    pub fn append(&mut self, layer: usize, splats: &[Splat]) -> Result<(), String> {
+        let start = self.layers[layer].splats.len();
+        self.check_capacity(start + splats.len())?;
+        self.layers[layer].splats.extend_from_slice(splats);
+        self.refresh(layer, start)
+    }
+
+    /// Removes every splat. The textures keep their size.
+    pub fn clear(&mut self) {
+        for layer in &mut self.layers {
+            layer.splats.clear();
+            layer.positions.clear();
+        }
+        self.version += 1;
+    }
+
+    /// Decodes a wire layer message straight into the layers and uploads it.
+    /// On error nothing changes. Returns the message header and the size of
+    /// the layer afterwards.
+    pub fn apply_layer_message(&mut self, bytes: &[u8]) -> Result<(LayerHeader, usize), String> {
+        self.scratch.clear();
+        let header = codec::decode_layer_into(bytes, &mut self.scratch).map_err(|e| e.to_string())?;
+        let layer = header.layer_id as usize;
+        if layer >= LAYER_COUNT {
+            return Err(format!("unknown layer id {}", header.layer_id));
+        }
+        let start = match header.mode {
+            LayerMode::Replace => {
+                self.check_capacity(self.scratch.len())?;
+                // The decoded vector becomes the layer; the old one is reused
+                // as the decode target of the next message. No copy.
+                std::mem::swap(&mut self.layers[layer].splats, &mut self.scratch);
+                0
+            }
+            LayerMode::Append => {
+                let start = self.layers[layer].splats.len();
+                self.check_capacity(start + self.scratch.len())?;
+                self.layers[layer].splats.extend_from_slice(&self.scratch);
+                start
+            }
+        };
+        self.refresh(layer, start)?;
+        Ok((header, self.layers[layer].splats.len()))
+    }
+
+    /// Brings the sort positions and the GPU texture of `layer` up to date
+    /// after its splats changed from index `start` on.
+    fn refresh(&mut self, layer: usize, start: usize) -> Result<(), String> {
+        let gl = &self.gl;
+        let layout = self.layout;
+        let l = &mut self.layers[layer];
+        l.positions.truncate(start);
+        l.positions.extend(l.splats[start..].iter().map(|s| s.pos));
+        self.version += 1;
+
+        let end = l.splats.len();
+        let mut start = start;
+        let needed = layout.rows_for(end);
+        if needed > l.rows {
+            // Immutable storage cannot grow: allocate a bigger texture and
+            // fill it from the CPU copy. Doubling keeps appends amortized O(1).
+            let rows = layout.grown_rows(l.rows, needed);
+            let texture = create_data_texture(gl, &layout, rows).map_err(|e| format!("{e:?}"))?;
+            gl.delete_texture(Some(&l.texture));
+            l.texture = texture;
+            l.rows = rows;
+            start = 0;
+        }
+
+        gl.bind_texture(GL::TEXTURE_2D, Some(&l.texture));
+        let spr = layout.splats_per_row as usize;
+        while start < end {
+            // Chunks end on a row boundary so that each is at most three rectangles.
+            let chunk_end = end.min((start / spr + UPLOAD_CHUNK_ROWS) * spr);
+            pack_splats(&l.splats[start..chunk_end], &mut self.staging);
+            for rect in layout.rects(start, chunk_end) {
+                let words = &self.staging[(rect.first_splat - start) * WORDS_PER_SPLAT..][..rect.splat_count * WORDS_PER_SPLAT];
+                // SAFETY: the view aliases wasm memory and is only valid until
+                // the next allocation; texSubImage2D copies it synchronously.
+                let view = unsafe { js_sys::Uint32Array::view(words) };
+                gl.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_array_buffer_view(
+                    GL::TEXTURE_2D,
+                    0,
+                    rect.x as i32,
+                    rect.y as i32,
+                    rect.width as i32,
+                    rect.height as i32,
+                    GL::RGBA_INTEGER,
+                    GL::UNSIGNED_INT,
+                    Some(&view),
+                )
+                .map_err(|e| format!("texSubImage2D failed: {e:?}"))?;
+            }
+            start = chunk_end;
+        }
+        Ok(())
+    }
+
+    /// Makes sure the index buffer holds a back-to-front order that is valid
+    /// for `view`. Call once per frame, before drawing any view of that frame
+    /// (both eyes share the order of the head pose).
+    ///
+    /// The planar depth order only depends on the view *direction*, so
+    /// translating the camera never triggers a sort. A slow sort (large
+    /// scene) is done at most every other frame unless `force` is set.
+    /// `now` returns milliseconds. Returns `true` when a sort happened.
+    pub fn sort(&mut self, view: &Mat4, key: SortKey, now: &dyn Fn() -> f64, force: bool) -> bool {
+        // Row 2 of the view matrix, negated: depth = forward·p + offset. A
+        // uniform world scale changes its length, not the order.
+        let forward = Vec3::new(-view.x_axis.z, -view.y_axis.z, -view.z_axis.z);
+        let offset = -view.w_axis.z;
+        let direction = forward.normalize_or_zero();
+        let stale = self.sorted.version != self.version
+            || self.sorted.key != key
+            || !(self.sorted.forward.dot(direction) >= 1.0 - SORT_DIRECTION_TOLERANCE);
+        let throttled = self.sort_ms > SLOW_SORT_MS && self.sorted.sorted_last_frame;
+        if !stale || (throttled && !force) {
+            self.sorted.sorted_last_frame = false;
+            return false;
+        }
+
+        let start = now();
+        let (first, second) = (&self.layers[0].positions, &self.layers[1].positions);
+        let first = if key.show[0] { &first[..] } else { &[] };
+        let second = if key.show[1] { &second[..] } else { &[] };
+        let clip_y = key.clip_y;
+        let mut hidden = 0u32;
+        // Clipped splats get a NaN depth: the sorter puts non-finite depths
+        // last, so dropping them is just a shorter draw call.
+        let depths = first.iter().chain(second).map(|p| {
+            let depth = if p[1] > clip_y { f32::NAN } else { forward.x * p[0] + forward.y * p[1] + forward.z * p[2] + offset };
+            hidden += !depth.is_finite() as u32;
+            depth
+        });
+        self.sorter.sort_by_depth(depths, &mut self.order);
+        let instances = self.order.len() - hidden as usize;
+
+        let gl = &self.gl;
+        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&self.index_buffer));
+        if instances > self.index_capacity {
+            self.index_capacity = instances.next_power_of_two().max(1 << 14);
+            gl.buffer_data_with_i32(GL::ARRAY_BUFFER, (self.index_capacity * 4) as i32, GL::DYNAMIC_DRAW);
+        }
+        if instances > 0 {
+            // SAFETY: see `refresh`; bufferSubData copies synchronously.
+            let view = unsafe { js_sys::Uint32Array::view(&self.order[..instances]) };
+            gl.buffer_sub_data_with_i32_and_array_buffer_view(GL::ARRAY_BUFFER, 0, &view);
+        }
+
+        self.sorted = Sorted { version: self.version, forward: direction, key, split: first.len() as u32, instances: instances as u32, sorted_last_frame: true };
+        self.sort_ms = now() - start;
+        self.sort_count += 1;
+        true
+    }
+
+    /// Draws the sorted splats into the bound framebuffer and viewport.
+    /// `clip_y` is the height above which splats are hidden (`+∞` = none).
+    pub fn draw(&self, vp: &ViewParams, params: &RenderParams, clip_y: f32) {
+        if self.sorted.instances == 0 {
+            return;
+        }
+        let gl = &self.gl;
+        let u = &self.uniforms;
+        gl.use_program(Some(&self.program));
+        gl.active_texture(GL::TEXTURE1);
+        gl.bind_texture(GL::TEXTURE_2D, Some(&self.layers[1].texture));
+        gl.active_texture(GL::TEXTURE0);
+        gl.bind_texture(GL::TEXTURE_2D, Some(&self.layers[0].texture));
+        gl.uniform1ui(Some(&u.split), self.sorted.split);
+        gl.uniform2ui(Some(&u.counts), self.layers[0].splats.len() as u32, self.layers[1].splats.len() as u32);
+        gl.uniform1i(Some(&u.spr), self.layout.splats_per_row as i32);
+        gl.uniform_matrix4fv_with_f32_array(Some(&u.view), false, &vp.view.to_cols_array());
+        gl.uniform2f(Some(&u.focal), vp.fx, vp.fy);
+        gl.uniform2f(Some(&u.center), vp.cx, vp.cy);
+        gl.uniform2f(Some(&u.viewport), vp.width, vp.height);
+        gl.uniform1f(Some(&u.near), vp.near);
+        gl.uniform1f(Some(&u.splat_scale), params.splat_scale);
+        gl.uniform1f(Some(&u.max_radius), params.max_radius_px);
+        gl.uniform1f(Some(&u.point_radius), if params.point_mode { CUTOFF_SIGMA * params.point_sigma_px } else { 0.0 });
+        // Finite stand-in for "no clip": uniforms must not be infinite on every driver.
+        gl.uniform1f(Some(&u.clip_y), clip_y.min(f32::MAX));
+
+        // Back-to-front "over" on premultiplied alpha, no depth buffer.
+        gl.disable(GL::DEPTH_TEST);
+        gl.disable(GL::CULL_FACE);
+        gl.enable(GL::BLEND);
+        gl.blend_func(GL::ONE, GL::ONE_MINUS_SRC_ALPHA);
+        gl.bind_vertex_array(Some(&self.vao));
+        gl.draw_arrays_instanced(GL::TRIANGLE_STRIP, 0, 4, self.sorted.instances as i32);
+        gl.bind_vertex_array(None);
+    }
+
+    /// Forces the next [`Self::sort`] to run (the index buffer was reused for
+    /// another view, e.g. by a snapshot).
+    pub fn invalidate_order(&mut self) {
+        self.sorted.version = 0;
+    }
+
+    /// Frees the GPU objects. The scene must not be used afterwards.
+    pub fn destroy(&self) {
+        let gl = &self.gl;
+        for layer in &self.layers {
+            gl.delete_texture(Some(&layer.texture));
+        }
+        gl.delete_buffer(Some(&self.index_buffer));
+        gl.delete_buffer(Some(&self.corner_buffer));
+        gl.delete_vertex_array(Some(&self.vao));
+        gl.delete_program(Some(&self.program));
+    }
+}
