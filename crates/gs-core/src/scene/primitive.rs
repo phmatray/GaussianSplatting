@@ -40,20 +40,39 @@ pub struct Primitive {
     /// Lengths of the local axes in world units: local point * `tex_scale`
     /// is the object-space position in meters used by material patterns.
     tex_scale: Vec3A,
+    /// World-space corners when the primitive is a box whose edges run along
+    /// the world axes (most architecture and furniture): such boxes are
+    /// intersected directly in world space, without transforming the ray.
+    world_box: Option<(Vec3A, Vec3A)>,
 }
 
 impl Primitive {
     /// Places `shape` with an arbitrary invertible affine transform.
+    ///
+    /// A singular or non-finite transform (a zero scale, a NaN) does not
+    /// panic, but the resulting primitive is never hit by a ray.
     pub fn new(shape: Shape, world_from_local: Affine3A, material: Material) -> Self {
         let m = world_from_local.matrix3;
-        Self {
+        let mut prim = Self {
             shape,
             material,
             dynamic: false,
             world_from_local,
             local_from_world: world_from_local.inverse(),
             tex_scale: Vec3A::new(m.x_axis.length(), m.y_axis.length(), m.z_axis.length()),
+            world_box: None,
+        };
+        // A box under a scaled signed permutation of the axes (rotations by
+        // multiples of 90 degrees) coincides with its own bounding box.
+        let axis_aligned = |c: Vec3A| {
+            let a = c.abs();
+            a.max_element() > 0.0 && a.x + a.y + a.z - a.max_element() <= 1e-6 * a.max_element()
+        };
+        if shape == Shape::Box && axis_aligned(m.x_axis) && axis_aligned(m.y_axis) && axis_aligned(m.z_axis) {
+            let bb = prim.world_aabb();
+            prim.world_box = Some((bb.min.into(), bb.max.into()));
         }
+        prim
     }
 
     /// Places `shape` in a rigid `frame` with an extra per-axis `scale`
@@ -69,7 +88,11 @@ impl Primitive {
 
     /// Ellipsoid with semi-axes `radii` along its rotated local axes.
     pub fn ellipsoid(center: Vec3, rotation: Quat, radii: Vec3, material: Material) -> Self {
-        Self::new(Shape::Sphere, Affine3A::from_scale_rotation_translation(radii, rotation, center), material)
+        Self::new(
+            Shape::Sphere,
+            Affine3A::from_scale_rotation_translation(radii, rotation, center),
+            material,
+        )
     }
 
     /// Axis-aligned box from its center and half extents.
@@ -84,13 +107,21 @@ impl Primitive {
 
     /// Rotated box.
     pub fn oriented_box(center: Vec3, rotation: Quat, half_extents: Vec3, material: Material) -> Self {
-        Self::new(Shape::Box, Affine3A::from_scale_rotation_translation(half_extents, rotation, center), material)
+        Self::new(
+            Shape::Box,
+            Affine3A::from_scale_rotation_translation(half_extents, rotation, center),
+            material,
+        )
     }
 
     /// Capped cylinder whose axis is the rotated local Y axis.
     pub fn cylinder(center: Vec3, rotation: Quat, radius: f32, half_height: f32, material: Material) -> Self {
         let scale = Vec3::new(radius, half_height, radius);
-        Self::new(Shape::Cylinder, Affine3A::from_scale_rotation_translation(scale, rotation, center), material)
+        Self::new(
+            Shape::Cylinder,
+            Affine3A::from_scale_rotation_translation(scale, rotation, center),
+            material,
+        )
     }
 
     /// Upright capped cylinder.
@@ -105,9 +136,20 @@ impl Primitive {
     pub fn capsule(a: Vec3, b: Vec3, radius: f32, material: Material) -> Self {
         let axis = b - a;
         let len = axis.length();
-        let rotation = if len > 1e-9 { Quat::from_rotation_arc(Vec3::Y, axis / len) } else { Quat::IDENTITY };
+        let rotation = if len > 1e-9 {
+            Quat::from_rotation_arc(Vec3::Y, axis / len)
+        } else {
+            Quat::IDENTITY
+        };
         let frame = Affine3A::from_rotation_translation(rotation, 0.5 * (a + b));
-        Self::new(Shape::Capsule { half_len: 0.5 * len, radius }, frame, material)
+        Self::new(
+            Shape::Capsule {
+                half_len: 0.5 * len,
+                radius,
+            },
+            frame,
+            material,
+        )
     }
 
     /// Capped cone frustum whose axis is the rotated local Y axis, with
@@ -123,7 +165,10 @@ impl Primitive {
         let r = bottom_radius.max(top_radius).max(1e-6);
         let scale = Vec3::new(r, half_height, r);
         Self::new(
-            Shape::Cone { r0: bottom_radius / r, r1: top_radius / r },
+            Shape::Cone {
+                r0: bottom_radius / r,
+                r1: top_radius / r,
+            },
             Affine3A::from_scale_rotation_translation(scale, rotation, center),
             material,
         )
@@ -166,14 +211,30 @@ impl Primitive {
     }
 
     /// Nearest intersection with the world-space ray `origin + t * dir` for
-    /// `t` in `(t_min, t_max)`. Returns `t` and the (unnormalized, arbitrarily
-    /// signed) local-space normal; convert it with [`Primitive::world_normal`].
+    /// `t` in `(t_min, t_max)`; `inv_dir` is [`safe_recip`] of `dir`. Returns
+    /// `t` and the (unnormalized, arbitrarily signed) local-space normal;
+    /// convert it with [`Primitive::world_normal`].
     #[inline]
-    pub(crate) fn intersect(&self, origin: Vec3A, dir: Vec3A, t_min: f32, t_max: f32) -> Option<(f32, Vec3A)> {
+    pub(crate) fn intersect(
+        &self,
+        origin: Vec3A,
+        dir: Vec3A,
+        inv_dir: Vec3A,
+        t_min: f32,
+        t_max: f32,
+    ) -> Option<(f32, Vec3A)> {
+        if let Some((min, max)) = self.world_box {
+            let (t, axis) = hit_slabs(min, max, origin, inv_dir, t_min, t_max)?;
+            // The local normal that `world_normal` maps back onto this world
+            // axis is the matching row of the local-to-world matrix.
+            let m = &self.world_from_local.matrix3;
+            return Some((t, Vec3A::new(m.x_axis[axis], m.y_axis[axis], m.z_axis[axis])));
+        }
         let o = self.local_from_world.transform_point3a(origin);
         let d = self.local_from_world.matrix3 * dir;
         if let Shape::Box = self.shape {
-            return hit_box(o, d, t_min, t_max);
+            let (t, axis) = hit_slabs(Vec3A::NEG_ONE, Vec3A::ONE, o, safe_recip(d), t_min, t_max)?;
+            return Some((t, Vec3A::AXES[axis]));
         }
         // Re-origin the ray at its closest approach to the shape center. The
         // quadratics below then work on small numbers even when the camera is
@@ -219,15 +280,11 @@ impl Primitive {
 /// ray starts inside. Returns `(t, is_entry)`.
 #[inline]
 fn pick_interval(enter: f32, exit: f32, t_min: f32, t_max: f32) -> Option<(f32, bool)> {
-    if enter > exit {
-        None
-    } else if enter > t_min {
-        (enter < t_max).then_some((enter, true))
-    } else if exit > t_min && exit < t_max {
-        Some((exit, false))
-    } else {
-        None
-    }
+    // Written so that the selection compiles to conditional moves and only
+    // the final hit-or-miss decision is a branch.
+    let is_entry = enter > t_min;
+    let t = if is_entry { enter } else { exit };
+    (enter <= exit && t > t_min && t < t_max).then_some((t, is_entry))
 }
 
 /// Unit sphere; `o` is already the closest point of the ray to the center.
@@ -242,25 +299,25 @@ fn hit_sphere(o: Vec3A, d: Vec3A, dd: f32, t_min: f32, t_max: f32) -> Option<(f3
     Some((t, o + d * t))
 }
 
-/// Box `[-1, 1]^3` by slabs.
+/// Axis-aligned box `[min, max]` by slabs. Returns `t` and the index of the
+/// axis whose face was hit.
 #[inline]
-fn hit_box(o: Vec3A, d: Vec3A, t_min: f32, t_max: f32) -> Option<(f32, Vec3A)> {
-    let inv = safe_recip(d);
-    let ta = (Vec3A::NEG_ONE - o) * inv;
-    let tb = (Vec3A::ONE - o) * inv;
+fn hit_slabs(min: Vec3A, max: Vec3A, o: Vec3A, inv: Vec3A, t_min: f32, t_max: f32) -> Option<(f32, usize)> {
+    let ta = (min - o) * inv;
+    let tb = (max - o) * inv;
     let near = ta.min(tb);
     let far = ta.max(tb);
     let (t, entry) = pick_interval(near.max_element(), far.min_element(), t_min, t_max)?;
     let v = if entry { near } else { far };
     // The face that produced `t`.
-    let n = if v.x == t {
-        Vec3A::X
+    let axis = if v.x == t {
+        0
     } else if v.y == t {
-        Vec3A::Y
+        1
     } else {
-        Vec3A::Z
+        2
     };
-    Some((t, n))
+    Some((t, axis))
 }
 
 /// Component-wise reciprocal that maps zero components to a huge finite value
@@ -421,7 +478,7 @@ mod tests {
     /// Intersects and returns `(t, unit world normal facing the ray)`.
     fn cast(p: &Primitive, origin: Vec3, dir: Vec3) -> Option<(f32, Vec3)> {
         let dir = dir.normalize();
-        let (t, n) = p.intersect(origin.into(), dir.into(), 1e-4, f32::INFINITY)?;
+        let (t, n) = p.intersect(origin.into(), dir.into(), safe_recip(dir.into()), 1e-4, f32::INFINITY)?;
         let mut n: Vec3 = p.world_normal(n).into();
         if n.dot(dir) > 0.0 {
             n = -n;
@@ -479,7 +536,12 @@ mod tests {
     #[test]
     fn rotated_ellipsoid_extent() {
         // Long axis (local X, 2 m) rotated onto world Z.
-        let e = Primitive::ellipsoid(Vec3::new(0.0, 1.0, 0.0), Quat::from_rotation_y(FRAC_PI_2), Vec3::new(2.0, 0.5, 1.0), mat());
+        let e = Primitive::ellipsoid(
+            Vec3::new(0.0, 1.0, 0.0),
+            Quat::from_rotation_y(FRAC_PI_2),
+            Vec3::new(2.0, 0.5, 1.0),
+            mat(),
+        );
         let (t, n) = cast(&e, Vec3::new(0.0, 1.0, 10.0), Vec3::NEG_Z).unwrap();
         assert!((t - 8.0).abs() < 1e-4);
         assert_close(n, Vec3::Z, 1e-4);
@@ -512,7 +574,12 @@ mod tests {
     #[test]
     fn oriented_box_diagonal() {
         // Unit cube rotated 45 degrees about Y: its corner points at +X.
-        let b = Primitive::oriented_box(Vec3::ZERO, Quat::from_rotation_y(core::f32::consts::FRAC_PI_4), Vec3::ONE, mat());
+        let b = Primitive::oriented_box(
+            Vec3::ZERO,
+            Quat::from_rotation_y(core::f32::consts::FRAC_PI_4),
+            Vec3::ONE,
+            mat(),
+        );
         let (t, _) = cast(&b, Vec3::new(5.0, 0.0, 0.0), Vec3::NEG_X).unwrap();
         assert!((t - (5.0 - 2f32.sqrt())).abs() < 1e-4);
         let (t, n) = cast(&b, Vec3::new(5.0, 0.0, 0.5), Vec3::NEG_X).unwrap();
@@ -599,8 +666,13 @@ mod tests {
         let mut hits = 0;
         for i in 0..400 {
             let f = i as f32;
-            let origin = Vec3::new((f * 0.37).sin() * 3.0, 0.7 + (f * 0.11).cos() * 2.0, (f * 0.23).cos() * 3.0);
-            let target = a.lerp(b, (f * 0.619).fract()) + 0.25 * Vec3::new((f * 1.3).sin(), (f * 2.1).cos(), (f * 0.7).sin());
+            let origin = Vec3::new(
+                (f * 0.37).sin() * 3.0,
+                0.7 + (f * 0.11).cos() * 2.0,
+                (f * 0.23).cos() * 3.0,
+            );
+            let target =
+                a.lerp(b, (f * 0.619).fract()) + 0.25 * Vec3::new((f * 1.3).sin(), (f * 2.1).cos(), (f * 0.7).sin());
             if let Some((t, n)) = cast(&c, origin, target - origin) {
                 hits += 1;
                 let p = origin + (target - origin).normalize() * t;
@@ -656,16 +728,25 @@ mod tests {
         let mut hits = 0;
         for i in 0..500 {
             let f = i as f32;
-            let origin = Vec3::new((f * 0.31).sin() * 4.0, 1.0 + (f * 0.17).cos() * 3.0, (f * 0.13).cos() * 4.0);
+            let origin = Vec3::new(
+                (f * 0.31).sin() * 4.0,
+                1.0 + (f * 0.17).cos() * 3.0,
+                (f * 0.13).cos() * 4.0,
+            );
             let target = Vec3::new(0.2, 1.0, -0.3) + 0.8 * Vec3::new((f * 1.7).sin(), (f * 0.9).cos(), (f * 2.3).sin());
-            let (a, b) = (cast(&cyl, origin, target - origin), cast(&cone, origin, target - origin));
+            let (a, b) = (
+                cast(&cyl, origin, target - origin),
+                cast(&cone, origin, target - origin),
+            );
             assert_eq!(a.is_some(), b.is_some(), "ray {i}");
             if let (Some((ta, na)), Some((tb, nb))) = (a, b) {
                 hits += 1;
                 assert!((ta - tb).abs() < 1e-3, "ray {i}: {ta} vs {tb}");
                 // Normals may legitimately differ exactly on the rim.
                 if na.dot(nb) < 0.999 {
-                    let p = cyl.local_from_world().transform_point3(origin + (target - origin).normalize() * ta);
+                    let p = cyl
+                        .local_from_world()
+                        .transform_point3(origin + (target - origin).normalize() * ta);
                     assert!((p.y.abs() - 1.0).abs() < 1e-2, "ray {i}");
                 }
             }
@@ -684,7 +765,10 @@ mod tests {
             Shape::Sphere,
             Shape::Box,
             Shape::Cylinder,
-            Shape::Capsule { half_len: 0.8, radius: 0.6 },
+            Shape::Capsule {
+                half_len: 0.8,
+                radius: 0.6,
+            },
             Shape::Cone { r0: 1.0, r1: 0.3 },
         ];
         for shape in shapes {
@@ -694,15 +778,22 @@ mod tests {
             for i in 0..3000 {
                 let f = i as f32;
                 let dir = Vec3::new((f * 0.731).sin(), (f * 0.317).cos(), (f * 1.113).sin()).normalize();
-                let origin = Vec3::new(1.0, 2.0, 3.0) - dir * 10.0 + dir.any_orthonormal_vector() * ((f * 0.05).sin() * 1.5);
+                let origin =
+                    Vec3::new(1.0, 2.0, 3.0) - dir * 10.0 + dir.any_orthonormal_vector() * ((f * 0.05).sin() * 1.5);
                 if let Some((t, _)) = cast(&p, origin, dir) {
                     let hit = origin + dir * t;
                     touched.expand(hit);
-                    assert!(hit.cmpge(bb.min - 1e-3).all() && hit.cmple(bb.max + 1e-3).all(), "{shape:?} {hit:?} outside {bb:?}");
+                    assert!(
+                        hit.cmpge(bb.min - 1e-3).all() && hit.cmple(bb.max + 1e-3).all(),
+                        "{shape:?} {hit:?} outside {bb:?}"
+                    );
                 }
             }
             // The box is reasonably tight, not wildly conservative.
-            assert!((bb.size() - touched.size()).max_element() < 0.6, "{shape:?}: {bb:?} vs {touched:?}");
+            assert!(
+                (bb.size() - touched.size()).max_element() < 0.6,
+                "{shape:?}: {bb:?} vs {touched:?}"
+            );
         }
     }
 

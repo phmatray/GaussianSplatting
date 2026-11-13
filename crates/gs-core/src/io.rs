@@ -667,6 +667,105 @@ mod tests {
     }
 
     #[test]
+    fn inria_ply_with_higher_order_harmonics() {
+        // The property list of a real 3DGS training output, for SH degrees
+        // 0 to 3 (0, 9, 24 or 45 `f_rest_*`), with unnormalized quaternions.
+        let mut rng = Rng::new(7);
+        for rest in [0usize, 9, 24, 45] {
+            let mut names: Vec<String> =
+                ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"].map(String::from).to_vec();
+            names.extend((0..rest).map(|i| format!("f_rest_{i}")));
+            names.extend(
+                ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"].map(String::from),
+            );
+            let props: Vec<(&str, &str)> = names.iter().map(|n| ("float", n.as_str())).collect();
+            let expected = cloud(50, 70 + rest as u64);
+            let rows: Vec<Vec<f64>> = expected
+                .iter()
+                .map(|s| {
+                    let mut row: Vec<f64> = s.pos.iter().map(|&v| v as f64).collect();
+                    row.extend([0.0; 3]);
+                    row.extend(s.rgba[..3].iter().map(|&c| (c as f64 / 255.0 - 0.5) / 0.282_094_791_773_878_14));
+                    row.extend((0..rest).map(|_| rng.range(-1.0, 1.0) as f64));
+                    row.push(logit((s.rgba[3] as f64 / 255.0).clamp(1e-4, 1.0 - 1e-4)));
+                    row.extend(s.scale.iter().map(|&v| (v as f64).ln()));
+                    let k = rng.range(0.5, 3.0) as f64;
+                    row.extend([s.rot[3], s.rot[0], s.rot[1], s.rot[2]].map(|c| c as f64 * k));
+                    row
+                })
+                .collect();
+            let bytes = build_ply("\n", &props, &rows);
+            assert_eq!(
+                bytes.len() - bytes.windows(11).position(|w| w == b"end_header\n").unwrap() - 11,
+                50 * (17 + rest) * 4
+            );
+            let got = read_any(&bytes).unwrap();
+            assert_eq!(got.len(), expected.len());
+            for (a, b) in expected.iter().zip(&got) {
+                assert_eq!((a.pos, a.rgba), (b.pos, b.rgba), "{rest} f_rest properties");
+                for k in 0..3 {
+                    assert!((a.scale[k] / b.scale[k] - 1.0).abs() < 1e-5);
+                }
+                assert!(angle_deg(a.rot, b.rot) < 0.05);
+            }
+        }
+    }
+
+    #[test]
+    fn splat_file_follows_the_antimatter15_conventions() {
+        // A record built the way antimatter15's converter does it: linear
+        // scales, 8-bit color and opacity, rotation bytes w, x, y, z.
+        let q = Quat::from_euler(glam::EulerRot::XYZ, 0.3, -0.7, 1.9);
+        let mut record = Vec::new();
+        for v in [1.0f32, 2.0, 3.0, 0.1, 0.2, 0.3] {
+            record.extend_from_slice(&v.to_le_bytes());
+        }
+        record.extend_from_slice(&[10, 20, 30, 200]);
+        record.extend([q.w, q.x, q.y, q.z].map(|c| (c * 128.0 + 128.0).clamp(0.0, 255.0) as u8));
+        let splats = read_splat(&record).unwrap();
+        assert_eq!(splats.len(), 1);
+        assert_eq!(
+            (splats[0].pos, splats[0].scale, splats[0].rgba),
+            ([1.0, 2.0, 3.0], [0.1, 0.2, 0.3], [10, 20, 30, 200])
+        );
+        assert!(angle_deg(splats[0].rot, q.to_array()) < 1.5, "{:?} vs {q:?}", splats[0].rot);
+        // Writing it back changes no byte by more than one level.
+        for (a, b) in write_splat(&splats).iter().zip(&record) {
+            assert!(a.abs_diff(*b) <= 1);
+        }
+    }
+
+    #[test]
+    fn unusual_but_legal_ply_headers_are_read() {
+        let xyz = "property float x\nproperty float y\nproperty float z\n";
+        let data: Vec<u8> = [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let with_data = |header: String| [header.into_bytes(), data.clone()].concat();
+        let f = "ply\nformat binary_little_endian 1.0\n";
+        // An element without properties before the vertices occupies no bytes.
+        let empty_element = with_data(format!("{f}element junk 99999999999\nelement vertex 1\n{xyz}end_header\n"));
+        // Blank lines, tabs and repeated spaces.
+        let spaced = with_data(
+            "ply\n\n   \nformat    binary_little_endian   1.0   \n  element   vertex   1  \n\tproperty\tfloat\tx\n\
+             property float y\nproperty float z\nend_header\n"
+                .to_string(),
+        );
+        // A comment that mentions end_header does not end the header.
+        let comment = with_data(format!("{f}comment end_header\nelement vertex 1\n{xyz}end_header\n"));
+        for bytes in [empty_element, spaced, comment] {
+            assert_eq!(read_any(&bytes).unwrap()[0].pos, [1.0, 2.0, 3.0]);
+        }
+        // A duplicated property name: the first one is used, offsets still count both.
+        let mut dup = format!("{f}element vertex 1\nproperty float x\n{xyz}end_header\n").into_bytes();
+        dup.extend([5.0f32, 6.0, 7.0, 8.0].iter().flat_map(|v| v.to_le_bytes()));
+        assert_eq!(read_ply(&dup).unwrap()[0].pos, [5.0, 7.0, 8.0]);
+        // Scales whose exponential overflows drop the splat instead of producing infinities.
+        let mut big = format!("{f}element vertex 1\n{xyz}property double scale_0\nproperty double scale_1\nproperty double scale_2\nend_header\n").into_bytes();
+        big.extend(data.iter());
+        big.extend([1e300f64, -1e300, 0.0].iter().flat_map(|v| v.to_le_bytes()));
+        assert_eq!(read_ply(&big), Ok(vec![]));
+    }
+
+    #[test]
     fn plain_point_cloud_ply_gets_defaults() {
         let props =
             [("float", "x"), ("float", "y"), ("float", "z"), ("uchar", "red"), ("uchar", "green"), ("uchar", "blue")];

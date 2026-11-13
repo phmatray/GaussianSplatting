@@ -29,6 +29,7 @@ pub use primitive::{Primitive, Shape};
 pub use stage::StageScene;
 
 use bvh::Bvh;
+use primitive::safe_recip;
 
 /// Rays ignore intersections closer than this (meters).
 const T_MIN: f32 = 1.0e-5;
@@ -73,7 +74,11 @@ struct SrgbTables {
 fn srgb_tables() -> &'static SrgbTables {
     static TABLES: OnceLock<SrgbTables> = OnceLock::new();
     TABLES.get_or_init(|| {
-        let mut t = SrgbTables { decode: [0.0; 256], upper: [f32::INFINITY; 256], guess: [0; ENCODE_LUT_SIZE] };
+        let mut t = SrgbTables {
+            decode: [0.0; 256],
+            upper: [f32::INFINITY; 256],
+            guess: [0; ENCODE_LUT_SIZE],
+        };
         for code in 0..256 {
             t.decode[code] = srgb_decode(code as f32 / 255.0);
             if code < 255 {
@@ -108,14 +113,22 @@ fn encode_channel(t: &SrgbTables, x: f32) -> u8 {
 #[inline]
 pub fn linear_to_srgb8(linear: Vec3) -> [u8; 3] {
     let t = srgb_tables();
-    [encode_channel(t, linear.x), encode_channel(t, linear.y), encode_channel(t, linear.z)]
+    [
+        encode_channel(t, linear.x),
+        encode_channel(t, linear.y),
+        encode_channel(t, linear.z),
+    ]
 }
 
 /// Converts an 8-bit sRGB color to linear RGB in `[0, 1]`.
 #[inline]
 pub fn srgb8_to_linear(srgb: [u8; 3]) -> Vec3 {
     let t = srgb_tables();
-    Vec3::new(t.decode[srgb[0] as usize], t.decode[srgb[1] as usize], t.decode[srgb[2] as usize])
+    Vec3::new(
+        t.decode[srgb[0] as usize],
+        t.decode[srgb[1] as usize],
+        t.decode[srgb[2] as usize],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -153,12 +166,27 @@ impl Light {
 
     /// Shadow-casting directional light shining from `to_light`.
     pub fn directional(to_light: Vec3, color: Vec3) -> Self {
-        Self { kind: LightKind::Directional { to_light: to_light.normalize() }, color, casts_shadow: true, region: None }
+        Self {
+            kind: LightKind::Directional {
+                to_light: to_light.normalize(),
+            },
+            color,
+            casts_shadow: true,
+            region: None,
+        }
     }
 
     /// Shadow-casting point light.
     pub fn point(pos: Vec3, reference_distance: f32, color: Vec3) -> Self {
-        Self { kind: LightKind::Point { pos, reference_distance }, color, casts_shadow: true, region: None }
+        Self {
+            kind: LightKind::Point {
+                pos,
+                reference_distance,
+            },
+            color,
+            casts_shadow: true,
+            region: None,
+        }
     }
 
     /// Confines the light to a box (see [`Light::region`]).
@@ -240,21 +268,41 @@ struct SnapshotData {
 
 impl SceneSnapshot {
     /// Freezes a set of primitives and builds the acceleration structure.
+    ///
+    /// A primitive whose transform is not finite (NaN or infinite) stays in
+    /// the list, so indices keep their meaning, but it is never hit and does
+    /// not count toward [`SceneSnapshot::bounds`].
     pub fn new(prims: Vec<Primitive>, lighting: Lighting) -> Self {
         let boxes: Vec<Aabb> = prims.iter().map(Primitive::world_aabb).collect();
-        let bounds = boxes.iter().fold(Aabb::EMPTY, |acc, b| acc.union(b));
-        Self { inner: Arc::new(SnapshotData { bvh: Bvh::build(&boxes), prims, lighting, bounds }) }
+        let bounds = boxes
+            .iter()
+            .filter(|b| b.min.is_finite() && b.max.is_finite())
+            .fold(Aabb::EMPTY, |acc, b| acc.union(b));
+        Self {
+            inner: Arc::new(SnapshotData {
+                bvh: Bvh::build(&boxes),
+                prims,
+                lighting,
+                bounds,
+            }),
+        }
     }
 
     /// Nearest surface along the ray `origin + t * dir` with `t < t_max`.
     ///
     /// `dir` should be a unit vector; `t` is then a distance in meters.
+    /// Degenerate rays hit nothing: a zero or non-finite `dir`, a non-finite
+    /// `origin`, or a `t_max` that is not positive (including NaN).
     pub fn raycast(&self, origin: Vec3, dir: Vec3, t_max: f32) -> Option<Hit> {
+        if !valid_ray(origin, dir, t_max) {
+            return None;
+        }
         let (o, d) = (Vec3A::from(origin), Vec3A::from(dir));
+        let inv = safe_recip(d);
         let mut best: Option<(u32, Vec3A)> = None;
         let mut t_hit = t_max;
-        self.inner.bvh.traverse(o, d, t_max, |i, t_far| {
-            if let Some((t, n)) = self.inner.prims[i as usize].intersect(o, d, T_MIN, *t_far) {
+        self.inner.bvh.traverse(o, inv, t_max, |i, t_far| {
+            if let Some((t, n)) = self.inner.prims[i as usize].intersect(o, d, inv, T_MIN, *t_far) {
                 *t_far = t;
                 t_hit = t;
                 best = Some((i, n));
@@ -272,6 +320,10 @@ impl SceneSnapshot {
         if normal.dot(d) > 0.0 {
             normal = -normal;
         }
+        if normal == Vec3A::ZERO {
+            // A point without a normal (the apex of a cone): face the ray.
+            normal = -d.normalize_or_zero();
+        }
         Hit {
             t,
             pos: pos.into(),
@@ -283,11 +335,20 @@ impl SceneSnapshot {
     }
 
     /// True when anything blocks the segment `origin .. origin + t_max * dir`.
+    ///
+    /// Agrees with [`SceneSnapshot::raycast`]: `occluded(o, d, t)` is
+    /// `raycast(o, d, t).is_some()`, only cheaper.
     pub fn occluded(&self, origin: Vec3, dir: Vec3, t_max: f32) -> bool {
+        if !valid_ray(origin, dir, t_max) {
+            return false;
+        }
         let (o, d) = (Vec3A::from(origin), Vec3A::from(dir));
+        let inv = safe_recip(d);
         let mut blocked = false;
-        self.inner.bvh.traverse(o, d, t_max, |i, t_far| {
-            blocked = self.inner.prims[i as usize].intersect(o, d, T_MIN, *t_far).is_some();
+        self.inner.bvh.traverse(o, inv, t_max, |i, t_far| {
+            blocked = self.inner.prims[i as usize]
+                .intersect(o, d, inv, T_MIN, *t_far)
+                .is_some();
             blocked
         });
         blocked
@@ -306,7 +367,10 @@ impl SceneSnapshot {
         for light in &l.lights {
             let mut weight = 1.0;
             if let Some(region) = &light.region {
-                let outside = (region.min - hit.pos).max(hit.pos - region.max).max(Vec3::ZERO).length();
+                let outside = (region.min - hit.pos)
+                    .max(hit.pos - region.max)
+                    .max(Vec3::ZERO)
+                    .length();
                 weight = 1.0 - outside / Light::REGION_FADE;
                 if weight <= 0.0 {
                     continue;
@@ -314,7 +378,10 @@ impl SceneSnapshot {
             }
             let (to_light, distance) = match light.kind {
                 LightKind::Directional { to_light } => (to_light, f32::INFINITY),
-                LightKind::Point { pos, reference_distance } => {
+                LightKind::Point {
+                    pos,
+                    reference_distance,
+                } => {
                     let v = pos - hit.pos;
                     let d = v.length();
                     let q = d / reference_distance;
@@ -338,7 +405,10 @@ impl SceneSnapshot {
     /// Background radiance (linear RGB) seen along `dir` when nothing is hit.
     pub fn sky(&self, dir: Vec3) -> Vec3 {
         let up = dir.normalize_or_zero().y.clamp(0.0, 1.0);
-        self.inner.lighting.sky_horizon.lerp(self.inner.lighting.sky_zenith, up.sqrt())
+        self.inner
+            .lighting
+            .sky_horizon
+            .lerp(self.inner.lighting.sky_zenith, up.sqrt())
     }
 
     /// World bounds of all primitives ([`Aabb::EMPTY`] for an empty snapshot).
@@ -370,17 +440,32 @@ impl SceneSnapshot {
     /// [`SceneSnapshot::raycast`]. For tests and diagnostics.
     #[doc(hidden)]
     pub fn raycast_brute_force(&self, origin: Vec3, dir: Vec3, t_max: f32) -> Option<Hit> {
+        if !valid_ray(origin, dir, t_max) {
+            return None;
+        }
         let (o, d) = (Vec3A::from(origin), Vec3A::from(dir));
+        let inv = safe_recip(d);
         let mut best: Option<(u32, Vec3A)> = None;
         let mut t_hit = t_max;
         for (i, p) in self.inner.prims.iter().enumerate() {
-            if let Some((t, n)) = p.intersect(o, d, T_MIN, t_hit) {
+            if let Some((t, n)) = p.intersect(o, d, inv, T_MIN, t_hit) {
                 t_hit = t;
                 best = Some((i as u32, n));
             }
         }
         best.map(|(i, n)| self.finish_hit(o, d, t_hit, i, n))
     }
+}
+
+/// Rays that can hit something: finite origin, finite non-zero direction and
+/// a positive (possibly infinite) length.
+#[inline]
+fn valid_ray(origin: Vec3, dir: Vec3, t_max: f32) -> bool {
+    // Directions shorter than this are indistinguishable from zero for the
+    // slab tests (see `safe_recip`).
+    const MIN_DIR_LENGTH_SQUARED: f32 = 1.0e-24;
+    let len2 = dir.length_squared();
+    t_max > 0.0 && origin.is_finite() && len2.is_finite() && len2 > MIN_DIR_LENGTH_SQUARED
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +520,10 @@ pub(crate) mod test_util {
 
     impl Lcg {
         pub fn next_f32(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 40) as f32) / (1u64 << 24) as f32
         }
 
@@ -454,7 +542,11 @@ pub(crate) mod test_util {
         }
 
         pub fn in_box(&mut self, min: Vec3, max: Vec3) -> Vec3 {
-            Vec3::new(self.range(min.x, max.x), self.range(min.y, max.y), self.range(min.z, max.z))
+            Vec3::new(
+                self.range(min.x, max.x),
+                self.range(min.y, max.y),
+                self.range(min.z, max.z),
+            )
         }
     }
 }
@@ -476,7 +568,11 @@ mod tests {
     fn srgb_encode_matches_formula_and_clamps() {
         let mut rng = Lcg(7);
         for i in 0..20000 {
-            let x = if i < 2000 { rng.range(0.0, 0.01) } else { rng.range(0.0, 1.0) };
+            let x = if i < 2000 {
+                rng.range(0.0, 0.01)
+            } else {
+                rng.range(0.0, 1.0)
+            };
             let exact = srgb_encode(x) * 255.0;
             let got = linear_to_srgb8(Vec3::splat(x))[0] as f32;
             assert!((got - exact).abs() <= 0.5 + 2e-3, "{x}: {got} vs {exact}");
@@ -488,14 +584,22 @@ mod tests {
     #[test]
     fn scene_kind_serializes_snake_case() {
         assert_eq!(serde_json::to_string(&SceneKind::Stage).unwrap(), "\"stage\"");
-        assert_eq!(serde_json::from_str::<SceneKind>("\"house\"").unwrap(), SceneKind::House);
+        assert_eq!(
+            serde_json::from_str::<SceneKind>("\"house\"").unwrap(),
+            SceneKind::House
+        );
         assert_eq!(make_scene(SceneKind::Stage).name(), "stage");
         assert_eq!(make_scene(SceneKind::House).name(), "house");
     }
 
     fn two_spheres() -> SceneSnapshot {
-        let floor = Primitive::cuboid(Vec3::new(0.0, -0.5, 0.0), Vec3::new(10.0, 0.5, 10.0), Material::solid(Vec3::splat(0.8)));
-        let ball = Primitive::sphere(Vec3::new(0.0, 1.0, 0.0), 0.5, Material::solid(Vec3::new(1.0, 0.0, 0.0))).with_dynamic(true);
+        let floor = Primitive::cuboid(
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(10.0, 0.5, 10.0),
+            Material::solid(Vec3::splat(0.8)),
+        );
+        let ball = Primitive::sphere(Vec3::new(0.0, 1.0, 0.0), 0.5, Material::solid(Vec3::new(1.0, 0.0, 0.0)))
+            .with_dynamic(true);
         let lighting = Lighting {
             ambient_sky: Vec3::splat(0.2),
             ambient_ground: Vec3::splat(0.2),
@@ -508,7 +612,8 @@ mod tests {
     #[test]
     fn empty_snapshot() {
         let s = SceneSnapshot::new(Vec::new(), Lighting::default());
-        assert!(s.is_empty() && s.len() == 0 && s.bounds().is_empty());
+        assert!(s.is_empty() && s.bounds().is_empty());
+        assert_eq!(s.len(), 0);
         assert!(s.raycast(Vec3::ZERO, Vec3::X, 100.0).is_none());
         assert!(!s.occluded(Vec3::ZERO, Vec3::X, 100.0));
     }
@@ -551,7 +656,11 @@ mod tests {
         let s = two_spheres();
         let target = Vec3::new(0.2, 1.0, 0.1).normalize() * 0.5 + Vec3::new(0.0, 1.0, 0.0);
         let mut colors = Vec::new();
-        for eye in [Vec3::new(3.0, 3.0, 2.0), Vec3::new(1.0, 4.0, -0.5), Vec3::new(2.0, 2.2, 3.0)] {
+        for eye in [
+            Vec3::new(3.0, 3.0, 2.0),
+            Vec3::new(1.0, 4.0, -0.5),
+            Vec3::new(2.0, 2.2, 3.0),
+        ] {
             let dir = (target - eye).normalize();
             let hit = s.raycast(eye, dir, 100.0).unwrap();
             assert!((hit.pos - target).length() < 1e-3);
@@ -564,11 +673,24 @@ mod tests {
 
     #[test]
     fn region_limited_point_light_and_emissive() {
-        let floor = Primitive::cuboid(Vec3::new(0.0, -0.5, 0.0), Vec3::new(10.0, 0.5, 10.0), Material::solid(Vec3::ONE));
-        let glow = Primitive::cuboid(Vec3::new(0.0, 0.5, -3.0), Vec3::splat(0.5), Material::solid(Vec3::ONE).with_emissive(2.0));
+        let floor = Primitive::cuboid(
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(10.0, 0.5, 10.0),
+            Material::solid(Vec3::ONE),
+        );
+        let glow = Primitive::cuboid(
+            Vec3::new(0.0, 0.5, -3.0),
+            Vec3::splat(0.5),
+            Material::solid(Vec3::ONE).with_emissive(2.0),
+        );
         let region = Aabb::new(Vec3::new(-2.0, 0.0, -2.0), Vec3::new(2.0, 3.0, 2.0));
         let light = Light::point(Vec3::new(0.0, 2.0, 0.0), 2.0, Vec3::splat(1.0)).with_region(region);
-        let lighting = Lighting { ambient_sky: Vec3::ZERO, ambient_ground: Vec3::ZERO, lights: vec![light], ..Lighting::default() };
+        let lighting = Lighting {
+            ambient_sky: Vec3::ZERO,
+            ambient_ground: Vec3::ZERO,
+            lights: vec![light],
+            ..Lighting::default()
+        };
         let s = SceneSnapshot::new(vec![floor, glow], lighting);
         let shade_at = |x: f32| {
             let h = s.raycast(Vec3::new(x, 1.0, 0.0), Vec3::NEG_Y, 10.0).unwrap();
@@ -582,6 +704,96 @@ mod tests {
         // Emissive surfaces glow without any light reaching them.
         let h = s.raycast(Vec3::new(0.0, 0.5, -10.0), Vec3::Z, 100.0).unwrap();
         assert!((s.shade(&h, true) - Vec3::splat(2.0)).abs().max_element() < 1e-5);
+    }
+
+    #[test]
+    fn degenerate_rays_hit_nothing() {
+        let s = two_spheres();
+        let o = Vec3::new(0.0, 5.0, 0.0);
+        assert!(s.raycast(o, Vec3::NEG_Y, 100.0).is_some());
+        let bad_dirs = [
+            Vec3::ZERO,
+            Vec3::splat(f32::NAN),
+            Vec3::new(0.0, f32::NEG_INFINITY, 0.0),
+            Vec3::new(0.0, -1e-30, 0.0),
+            Vec3::new(0.0, -1e30, 0.0),
+        ];
+        for d in bad_dirs {
+            assert!(s.raycast(o, d, f32::INFINITY).is_none(), "{d:?}");
+            assert!(s.raycast_brute_force(o, d, f32::INFINITY).is_none(), "{d:?}");
+            assert!(!s.occluded(o, d, f32::INFINITY), "{d:?}");
+        }
+        for t_max in [0.0, -1.0, f32::NAN, f32::NEG_INFINITY] {
+            assert!(s.raycast(o, Vec3::NEG_Y, t_max).is_none(), "{t_max}");
+            assert!(!s.occluded(o, Vec3::NEG_Y, t_max), "{t_max}");
+        }
+        for origin in [Vec3::splat(f32::NAN), Vec3::splat(f32::INFINITY)] {
+            assert!(s.raycast(origin, Vec3::NEG_Y, 100.0).is_none());
+            assert!(!s.occluded(origin, Vec3::NEG_Y, 100.0));
+        }
+        // An unnormalized direction is fine: `t` is then in units of its length.
+        let hit = s.raycast(o, Vec3::NEG_Y * 0.5, f32::INFINITY).unwrap();
+        assert!((hit.t - 7.0).abs() < 1e-4 && (hit.pos.y - 1.5).abs() < 1e-4);
+        let hit = s.raycast(o, Vec3::NEG_Y * 1e-6, f32::INFINITY).unwrap();
+        assert!((hit.pos.y - 1.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_broken_primitive_does_not_poison_the_snapshot() {
+        // One primitive with a NaN transform among healthy ones (what a NaN
+        // animation time would produce): the others still render.
+        let mut prims: Vec<Primitive> = (0..12)
+            .map(|i| Primitive::sphere(Vec3::new(i as f32 * 2.0, 0.0, 0.0), 0.5, Material::default()))
+            .collect();
+        prims.insert(5, Primitive::sphere(Vec3::splat(f32::NAN), 0.5, Material::default()));
+        prims.push(Primitive::cuboid(
+            Vec3::ZERO,
+            Vec3::splat(f32::INFINITY),
+            Material::default(),
+        ));
+        let s = SceneSnapshot::new(prims, Lighting::default());
+        assert_eq!(s.len(), 14);
+        let b = s.bounds();
+        assert!(b.min.is_finite() && b.max.is_finite(), "{b:?}");
+        assert!((b.min - Vec3::new(-0.5, -0.5, -0.5)).length() < 1e-5);
+        assert!((b.max - Vec3::new(22.5, 0.5, 0.5)).length() < 1e-5);
+        for i in 0..12 {
+            let x = i as f32 * 2.0;
+            let hit = s.raycast(Vec3::new(x, 3.0, 0.0), Vec3::NEG_Y, 10.0).unwrap();
+            assert!((hit.t - 2.5).abs() < 1e-5, "sphere {i}");
+            assert_eq!(
+                hit,
+                s.raycast_brute_force(Vec3::new(x, 3.0, 0.0), Vec3::NEG_Y, 10.0)
+                    .unwrap()
+            );
+            assert!(s.occluded(Vec3::new(x, 3.0, 0.0), Vec3::NEG_Y, 10.0));
+        }
+        assert!(s.raycast(Vec3::new(1.0, 3.0, 0.0), Vec3::NEG_Y, 10.0).is_none());
+    }
+
+    #[test]
+    fn cone_apex_has_a_unit_normal() {
+        // The apex is the one surface point without a normal; a horizontal
+        // ray through it must still report a unit vector facing the ray.
+        let cone = Primitive::cone(
+            Vec3::new(0.0, 1.0, 0.0),
+            glam::Quat::IDENTITY,
+            1.0,
+            0.0,
+            1.0,
+            Material::default(),
+        );
+        let s = SceneSnapshot::new(vec![cone], Lighting::default());
+        for dir in [Vec3::NEG_X, Vec3::Z, Vec3::new(1.0, 0.0, 1.0).normalize()] {
+            let hit = s.raycast(Vec3::new(0.0, 2.0, 0.0) - dir * 3.0, dir, 10.0).unwrap();
+            assert!((hit.t - 3.0).abs() < 1e-4);
+            assert!((hit.normal.length() - 1.0).abs() < 1e-5, "{:?}", hit.normal);
+            assert!(hit.normal.dot(dir) < 0.0);
+            assert!(s.shade(&hit, true).is_finite());
+        }
+        // Straight down the axis onto the apex.
+        let hit = s.raycast(Vec3::new(0.0, 5.0, 0.0), Vec3::NEG_Y, 10.0).unwrap();
+        assert!((hit.t - 3.0).abs() < 1e-5 && (hit.normal - Vec3::Y).length() < 1e-5);
     }
 
     #[test]

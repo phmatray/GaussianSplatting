@@ -962,6 +962,83 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_bounds_hold_for_any_extent_and_offset() {
+        // Property test: boxes from a millimetre to a kilometre, far from the
+        // origin, unnormalized quaternions, every header field.
+        let mut rng = Rng::new(20);
+        for round in 0..300u32 {
+            let n = 1 + rng.below(40);
+            let extent = 10f32.powf(rng.range(-3.0, 3.0));
+            let offset = rng.vec3(-100.0, 100.0);
+            let splats: Vec<Splat> = (0..n)
+                .map(|_| {
+                    let mut s = rng.splat(extent, 0.0, 1.0);
+                    s.pos = (offset + s.position()).to_array();
+                    s.scale = [0; 3].map(|_| 10f32.powf(rng.range(-4.0, 1.0)));
+                    s.rot = s.rot.map(|c| c * 7.5);
+                    s
+                })
+                .collect();
+            let mode = if round % 2 == 0 { LayerMode::Replace } else { LayerMode::Append };
+            let mut bytes = Vec::new();
+            encode_layer(round, round * 3, round as u8, mode, &splats, &mut bytes);
+            assert_eq!(bytes.len(), HEADER_SIZE + LAYER_HEADER_SIZE + n * SPLAT_WIRE_SIZE);
+            let mut decoded = Vec::new();
+            let header = decode_layer_into(&bytes, &mut decoded).unwrap();
+            assert_eq!(
+                (header.seq, header.time_ms, header.layer_id, header.mode, header.count as usize),
+                (round, round * 3, round as u8, mode, n)
+            );
+            let step = header.aabb.size() / 65535.0;
+            for (a, b) in splats.iter().zip(&decoded) {
+                assert_eq!(a.rgba, b.rgba);
+                for k in 0..3 {
+                    // One quantization step, plus f32 rounding of the lerp.
+                    let slack = 4.0 * f32::EPSILON * a.pos[k].abs().max(1.0);
+                    assert!((a.pos[k] - b.pos[k]).abs() <= step[k] + slack, "{} -> {}", a.pos[k], b.pos[k]);
+                    assert!(header.aabb.min[k] <= b.pos[k] && b.pos[k] <= header.aabb.max[k]);
+                    assert!((b.scale[k] / a.scale[k] - 1.0).abs() < 0.03, "{} -> {}", a.scale[k], b.scale[k]);
+                }
+                assert!(angle_deg(a.rot, b.rot) < 2.0);
+            }
+            match decode(&bytes).unwrap() {
+                Message { seq, time_ms, body: Body::Layer(layer) } => {
+                    assert_eq!((seq, time_ms, layer.layer_id, layer.mode), (round, round * 3, round as u8, mode));
+                    assert_eq!(layer.splats, decoded);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_layer_bodies_decode_to_finite_unit_splats() {
+        // The largest box a message can declare, and every byte pattern in
+        // the splat record: nothing overflows, rotations stay unit.
+        let unit = Splat { pos: [1.0; 3], scale: [0.1; 3], rot: [0.0, 0.0, 0.0, 1.0], rgba: [1, 2, 3, 4] };
+        let mut bytes = layer_bytes(&[unit]);
+        for (k, v) in [-f32::MAX, -f32::MAX, -f32::MAX, f32::MAX, f32::MAX, f32::MAX].iter().enumerate() {
+            bytes[HEADER_SIZE + 8 + 4 * k..][..4].copy_from_slice(&v.to_le_bytes());
+        }
+        // Flags and reserved bytes are ignored.
+        for i in [5, 6, 7, HEADER_SIZE + 2, HEADER_SIZE + 3] {
+            bytes[i] = 0xFF;
+        }
+        let mut rng = Rng::new(21);
+        for fill in 0..=300u32 {
+            for b in &mut bytes[HEADER_SIZE + LAYER_HEADER_SIZE..] {
+                *b = if fill < 256 { fill as u8 } else { rng.next_u64() as u8 };
+            }
+            let mut out = Vec::new();
+            decode_layer_into(&bytes, &mut out).unwrap();
+            let s = out[0];
+            assert!(s.pos.iter().chain(&s.scale).chain(&s.rot).all(|v| v.is_finite()), "{s:?}");
+            assert!(s.scale.iter().all(|&v| (SCALE_MIN..=SCALE_MAX).contains(&v)));
+            assert!((Quat::from_array(s.rot).length() - 1.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
     fn empty_layer_roundtrips() {
         let bytes = layer_bytes(&[]);
         assert_eq!(bytes.len(), HEADER_SIZE + LAYER_HEADER_SIZE);
@@ -1147,6 +1224,31 @@ mod tests {
         for (a, b) in frame.depth.iter().zip(&back.depth).skip(7) {
             assert!((a - b).abs() <= 0.0005 + 1e-6);
         }
+    }
+
+    #[test]
+    fn preview_keeps_row_order_and_crops_oversized_frames() {
+        // Top-left pixel red at 1 m, bottom-right pixel blue at 2.5 m.
+        let mut frame = RgbdFrame::new(5, 3);
+        frame.rgb[0] = 255;
+        frame.rgb[5 * 3 * 3 - 1] = 255;
+        frame.depth[0] = 1.0;
+        frame.depth[14] = 2.5;
+        let preview = PreviewMsg::from_frame(9, &frame);
+        assert_eq!((preview.depth_mm[0], preview.depth_mm[14]), (1000, 2500));
+        let bytes = encode(&Message { seq: 0, time_ms: 0, body: Body::Preview(preview) });
+        let body = &bytes[HEADER_SIZE + PREVIEW_HEADER_SIZE..];
+        assert_eq!((body[0], body[44]), (255, 255), "rgb plane first, row-major from the top-left");
+        assert_eq!(u16_at(body, 45), 1000, "depth plane follows");
+        assert_eq!(u16_at(body, 45 + 28), 2500);
+        let Body::Preview(decoded) = decode(&bytes).unwrap().body else { panic!() };
+        assert_eq!(decoded.to_frame(), frame);
+
+        // Wider than the 16-bit size field: cropped, still consistent.
+        let wide = RgbdFrame { width: 70_000, height: 1, rgb: vec![7; 210_000], depth: vec![1.0; 70_000] };
+        let preview = PreviewMsg::from_frame(0, &wide);
+        assert_eq!((preview.width, preview.height), (65535, 1));
+        assert_eq!((preview.rgb.len(), preview.depth_mm.len()), (65535 * 3, 65535));
     }
 
     #[test]

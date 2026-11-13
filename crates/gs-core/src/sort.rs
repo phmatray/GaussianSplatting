@@ -79,10 +79,12 @@ impl DepthSorter {
         }
 
         // Pass 1: range of the finite depths. All-equal, empty or overflowing
-        // ranges collapse to a single bucket.
+        // ranges collapse to a single bucket; so do ranges so small (below
+        // about 2e-34) that the scale factor itself would overflow.
         let (near, far) = finite_range(&self.depths);
         let range = far - near;
-        let to_key = if range > 0.0 && range.is_finite() { MAX_FINITE_KEY as f32 / range } else { 0.0 };
+        let to_key = MAX_FINITE_KEY as f32 / range;
+        let to_key = if range > 0.0 && to_key.is_finite() { to_key } else { 0.0 };
 
         // Pass 2: quantize (farthest → key 0), then build the histogram.
         self.keys.clear();
@@ -183,7 +185,7 @@ mod tests {
         let near = finite.clone().fold(f32::INFINITY, f32::min);
         let far = finite.fold(f32::NEG_INFINITY, f32::max);
         let range = far - near;
-        let to_key = if range > 0.0 && range.is_finite() { 65534.0 / range } else { 0.0 };
+        let to_key = if range > 0.0 && (65534.0 / range).is_finite() { 65534.0 / range } else { 0.0 };
         let key = |d: f32| if d.is_finite() { (((far - d) * to_key) as u32).min(65534) } else { 65535 };
         let mut order: Vec<u32> = (0..depths.len() as u32).collect();
         order.sort_by_key(|&i| key(depths[i as usize]));
@@ -321,6 +323,15 @@ mod tests {
         let tiny = [1.0, 1.0 + f32::EPSILON, 1.0, 1.0 + 2.0 * f32::EPSILON];
         sorter.sort_by_depth(tiny.iter().copied(), &mut out);
         assert_eq!(out, [3, 1, 0, 2]);
+        // Smallest range for which the key scale is still finite: exact order.
+        let small = [2.0e-34, 0.0, 6.0e-34, 4.0e-34, -0.0];
+        sorter.sort_by_depth(small.iter().copied(), &mut out);
+        assert_eq!(out, [2, 3, 0, 1, 4]);
+        // Subnormal range: the scale would be infinite, so the depths count
+        // as equal and keep their input order (instead of a garbage order).
+        let subnormal = [1.0e-45, 0.0, 4.0e-45, 3.0e-45];
+        sorter.sort_by_depth(subnormal.iter().copied(), &mut out);
+        assert_eq!(out, [0, 1, 2, 3]);
     }
 
     #[test]

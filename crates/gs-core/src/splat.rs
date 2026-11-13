@@ -41,20 +41,29 @@
 //! 5. Screen-space covariance in pixel². `Wm` is the upper-left 3×3 of
 //!    `view` (`mat3(view)` in GLSL), so a uniform world scale baked into the
 //!    view matrix (VR "dollhouse" mode) scales the footprint correctly:
-//!    `T = J · Wm` (2×3), `Σ' = k² · T·Σ·Tᵀ + 0.3·I`.
-//!    Write `Σ' = [[a, b], [b, c]]`. The `0.3 px²` term ([`LOW_PASS_PX2`]) is
-//!    the anti-aliasing low-pass of the reference 3DGS implementation; it is
-//!    added *after* the `k²` scaling.
-//! 6. `det = a·c − b²`. Cull when `det ≤ 0` or not finite.
-//!    `conic = Σ'⁻¹ = [[c, −b], [−b, a]] / det`, stored as
-//!    `(conic.xx, conic.xy, conic.yy) = (c/det, −b/det, a/det)`.
-//! 7. Eigen-decomposition of `Σ'` for the quad:
+//!    `T = J · Wm` (2×3), `M = k² · T·Σ·Tᵀ = [[ma, mb], [mb, mc]]`,
+//!    `Σ' = M + 0.3·I = [[a, b], [b, c]]`, i.e. `a = ma + 0.3`, `b = mb`,
+//!    `c = mc + 0.3`. The `0.3 px²` term ([`LOW_PASS_PX2`]) is the
+//!    anti-aliasing low-pass of the reference 3DGS implementation; it is
+//!    added *after* the `k²` scaling. `M` is positive semi-definite, so
+//!    `ma` and `mc` are clamped to `≥ 0` (rounding noise only).
+//! 6. Determinant, written so that 32-bit cancellation can never make it
+//!    negative or smaller than the low-pass allows:
+//!    `det = max(ma·mc − mb², 0) + 0.3·(ma + mc) + 0.09`
+//!    (algebraically `a·c − b²`). Cull when `det` is not finite.
+//! 7. Eigen-decomposition of `Σ'`:
 //!    `mid = (a + c)/2`, `rad = length(((a − c)/2, b))`,
-//!    `λ1 = mid + rad`, `λ2 = det/λ1` (stable form of `mid − rad`),
-//!    `v1 = normalize(a ≥ c ? (λ1 − c, b) : (b, λ1 − a))` (use `(1, 0)` when
-//!    that vector is zero, i.e. for a circle), `v2 = (−v1.y, v1.x)`.
+//!    `λ1 = mid + rad`, `λ2 = det/λ1` (stable form of `mid − rad`; `≥ 0.3`),
+//!    `v1 = normalize(a ≥ c ? ((a − c)/2 + rad, b) : (b, (c − a)/2 + rad))`
+//!    (use `(1, 0)` when that vector is zero, i.e. for a circle),
+//!    `v2 = (−v1.y, v1.x)`.
 //!    Half-axes of the 3σ ellipse in pixels ([`CUTOFF_SIGMA`]):
-//!    `major = 3·√λ1 · v1`, `minor = 3·√λ2 · v2`.
+//!    `major = 3·√λ1 · v1`, `minor = 3·√λ2 · v2`
+//!    ([`Projected::ellipse_axes`]).
+//!    The inverse used by the CPU rasterizer is built from the same numbers,
+//!    which keeps it positive definite: `conic = Σ'⁻¹ = v1·v1ᵀ/λ1 + v2·v2ᵀ/λ2`,
+//!    stored as `(conic.xx, conic.xy, conic.yy)`
+//!    (algebraically `(c, −b, a)/det`).
 //! 8. The instanced quad has corners `q ∈ {−1, +1}²`. Each vertex is placed at
 //!    `offset_px = q.x·major + q.y·minor` around the center, i.e. in NDC
 //!    `ndc + offset_px · (2/W, −2/H)` (minus: `py` grows downward). Pass `q`
@@ -69,8 +78,11 @@
 //!    On the quad of step 8 the interpolated corner coordinate gives the same
 //!    number without a matrix: `m = 9·dot(q, q)`.
 //! 10. Discard when `m > 9` (outside 3σ). `α = o · exp(−0.5·m)`. Discard when
-//!     `α < 1/255` ([`MIN_ALPHA`]). There is no upper clamp on `α`: a fully
-//!     opaque splat shows exactly its color at its center.
+//!     `α < 1/255` ([`MIN_ALPHA`]). There is no 0.99 clamp on `α`: a fully
+//!     opaque splat shows exactly its color at its center. (`m ≥ 0`, so
+//!     `α ≤ o`; the CPU code enforces this bound explicitly because the
+//!     conic form of `m` can cancel to a negative number for extreme
+//!     needles.)
 //! 11. Splats are drawn **back to front** ([`crate::sort`]) and composited
 //!     with "over" on premultiplied alpha, directly on sRGB values:
 //!     `dst.rgb = c·α + dst.rgb·(1 − α)`
@@ -95,14 +107,16 @@
 //! vec3 T0 =  (fx / d) * (Wt[0] + uv.x * Wt[2]);    // rows of T = J * mat3(view)
 //! vec3 T1 = -(fy / d) * (Wt[1] + uv.y * Wt[2]);
 //! mat3 S = mat3(c0, c1, c2,  c1, c3, c4,  c2, c4, c5);
-//! float a = k * k * dot(T0, S * T0) + 0.3;
-//! float b = k * k * dot(T0, S * T1);
-//! float c = k * k * dot(T1, S * T1) + 0.3;
-//! float det = a * c - b * b;                       // cull if det <= 0.0
+//! float ma = max(k * k * dot(T0, S * T0), 0.0);
+//! float mb = k * k * dot(T0, S * T1);
+//! float mc = max(k * k * dot(T1, S * T1), 0.0);
+//! float a = ma + 0.3, b = mb, c = mc + 0.3;
+//! float det = max(ma * mc - mb * mb, 0.0) + 0.3 * (ma + mc) + 0.09;
 //! float mid = 0.5 * (a + c);
-//! float l1 = mid + length(vec2(0.5 * (a - c), b));
+//! float rad = length(vec2(0.5 * (a - c), b));
+//! float l1 = mid + rad;
 //! float l2 = det / l1;
-//! vec2 v1 = a >= c ? vec2(l1 - c, b) : vec2(b, l1 - a);
+//! vec2 v1 = a >= c ? vec2(0.5 * (a - c) + rad, b) : vec2(b, 0.5 * (c - a) + rad);
 //! float len = length(v1);
 //! v1 = len > 1e-12 ? v1 / len : vec2(1.0, 0.0);
 //! vec2 major = 3.0 * sqrt(l1) * v1;
@@ -118,6 +132,18 @@
 //! if (alpha < 1.0 / 255.0) discard;
 //! fragColor = vec4(color * alpha, alpha);          // blendFunc(ONE, ONE_MINUS_SRC_ALPHA)
 //! ```
+//!
+//! # Numerical limits
+//!
+//! Everything is 32-bit float, like the shader. The world covariance of a
+//! needle (`σ_long ≫ σ_thin`) keeps its thin axis only to about
+//! `10⁻⁷·σ_long²`, so once the *unforeshortened* long axis exceeds roughly a
+//! thousand pixels the thin axis is noise of up to a pixel or so. Steps 5–7
+//! are arranged so that this noise can only make such a splat a little
+//! thicker: it is never culled and never thinner than the low-pass, and its
+//! conic is assembled from two positive eigenvalues. (Evaluating the conic
+//! form of step 9 can still cancel at that point, which is why the shader
+//! and the CPU rasterizer use the quad form.)
 //!
 //! # Intrinsics from a projection matrix
 //!
@@ -276,6 +302,26 @@ pub struct Projected {
 }
 
 impl Projected {
+    /// Half-axes `(major, minor)` of the 3σ ellipse in pixels: step 7 of the
+    /// module documentation. The quad corner `q ∈ {−1, +1}²` sits at
+    /// `q.x·major + q.y·minor` from the center; `minor` is `major` rotated by
+    /// +90° and shortened.
+    ///
+    /// Unlike the free function [`ellipse_axes`], which only sees the
+    /// covariance, this stays accurate for extreme needles: the minor axis
+    /// comes from the conic, where it is the well-conditioned eigenvalue.
+    #[inline]
+    pub fn ellipse_axes(&self) -> ([f32; 2], [f32; 2]) {
+        let (lambda1, (vx, vy)) = major_eigenpair(self.cov);
+        let [qa, qb, qc] = self.conic;
+        // 1/λ2 is the larger eigenvalue of the conic: a sum, no cancellation.
+        let inv_lambda2 = 0.5 * (qa + qc) + (0.5 * (qa - qc)).hypot(qb);
+        let lambda2 = if inv_lambda2 > 0.0 { inv_lambda2.recip().min(lambda1) } else { 0.0 };
+        let l1 = CUTOFF_SIGMA * lambda1.max(0.0).sqrt();
+        let l2 = CUTOFF_SIGMA * lambda2.max(0.0).sqrt();
+        ([vx * l1, vy * l1], [-vy * l2, vx * l2])
+    }
+
     /// Replaces the footprint by an isotropic Gaussian with a fixed standard
     /// deviation in pixels (point-cloud display mode). Center and depth are
     /// kept.
@@ -288,14 +334,26 @@ impl Projected {
     }
 }
 
-/// EWA projection of one Gaussian: steps 1–6 of the module documentation.
+/// EWA projection of one Gaussian: steps 1–7 of the module documentation.
 ///
 /// `cov6` is the world-space covariance from [`cov6`]. Returns `None` when the
 /// center is closer than `vp.near` (or behind the camera), or when the result
-/// is degenerate or not finite. Splats outside the image are *not* culled
-/// here; compare `px, py, radius` with the viewport for that.
+/// is not finite. Splats outside the image are *not* culled here; compare
+/// `px, py, radius` with the viewport for that.
+///
+/// Both eigenvalues of the returned footprint are at least [`LOW_PASS_PX2`]
+/// (up to rounding), and `conic` is assembled from them, so a visible splat
+/// never degenerates, however anisotropic it is.
 #[inline]
 pub fn project_splat(pos: Vec3, cov6: &[f32; 6], vp: &ViewParams) -> Option<Projected> {
+    project_splat_with_axes(pos, cov6, vp).map(|(projected, _, _)| projected)
+}
+
+/// [`project_splat`] together with the half-axes `(major, minor)` of the 3σ
+/// ellipse — the same values as [`Projected::ellipse_axes`], straight from
+/// the decomposition instead of recomputed.
+#[inline]
+pub fn project_splat_with_axes(pos: Vec3, cov6: &[f32; 6], vp: &ViewParams) -> Option<(Projected, [f32; 2], [f32; 2])> {
     let m = &vp.view;
     // Rows of the upper-left 3×3 of `view`.
     let r0 = Vec3::new(m.x_axis.x, m.y_axis.x, m.z_axis.x);
@@ -343,27 +401,66 @@ pub fn project_splat(pos: Vec3, cov6: &[f32; 6], vp: &ViewParams) -> Option<Proj
         xy * t1.x + yy * t1.y + yz * t1.z,
         xz * t1.x + yz * t1.y + zz * t1.z,
     );
+    // 5. M = k²·T·Σ·Tᵀ is positive semi-definite: the clamps only remove
+    //    rounding noise (and let NaN through to the check below).
     let k2 = vp.splat_scale * vp.splat_scale;
-    let a = k2 * t0.dot(s0) + LOW_PASS_PX2;
-    let b = k2 * t0.dot(s1);
-    let c = k2 * t1.dot(s1) + LOW_PASS_PX2;
+    let ma = clamp_non_negative(k2 * t0.dot(s0));
+    let mb = k2 * t0.dot(s1);
+    let mc = clamp_non_negative(k2 * t1.dot(s1));
+    let a = ma + LOW_PASS_PX2;
+    let b = mb;
+    let c = mc + LOW_PASS_PX2;
 
-    // 6. Inverse.
-    let det = a * c - b * b;
+    // 6. det(M + 0.3·I) = det(M) + 0.3·tr(M) + 0.09, with det(M) ≥ 0. In this
+    //    form cancellation in det(M) cannot produce a negative determinant.
+    let det = clamp_non_negative(ma * mc - mb * mb) + LOW_PASS_PX2 * (ma + mc) + LOW_PASS_PX2 * LOW_PASS_PX2;
     if !(det > 0.0 && det.is_finite() && px.is_finite() && py.is_finite()) {
         return None;
     }
-    let inv_det = 1.0 / det;
-    let mid = 0.5 * (a + c);
-    let lambda1 = mid + (0.5 * (a - c)).hypot(b);
-    Some(Projected {
+
+    // 7. Eigen-decomposition; the conic is assembled from it so that it is
+    //    positive definite by construction.
+    let (lambda1, (vx, vy)) = major_eigenpair([a, b, c]);
+    let lambda2 = det / lambda1;
+    let inv1 = 1.0 / lambda1;
+    let inv2 = 1.0 / lambda2;
+    let l1 = CUTOFF_SIGMA * lambda1.sqrt();
+    let l2 = CUTOFF_SIGMA * lambda2.sqrt();
+    let projected = Projected {
         px,
         py,
         depth,
         cov: [a, b, c],
-        conic: [c * inv_det, -b * inv_det, a * inv_det],
-        radius: CUTOFF_SIGMA * lambda1.sqrt(),
-    })
+        conic: [vx * vx * inv1 + vy * vy * inv2, vx * vy * (inv1 - inv2), vy * vy * inv1 + vx * vx * inv2],
+        radius: l1,
+    };
+    Some((projected, [vx * l1, vy * l1], [-vy * l2, vx * l2]))
+}
+
+/// `max(x, 0)` that keeps NaN (unlike `f32::max`), so that broken input is
+/// still rejected by the finiteness checks.
+#[inline(always)]
+fn clamp_non_negative(x: f32) -> f32 {
+    if x < 0.0 {
+        0.0
+    } else {
+        x
+    }
+}
+
+/// Larger eigenvalue `λ1` of the symmetric matrix `[[a, b], [b, c]]` and its
+/// unit eigenvector (`(1, 0)` for a multiple of the identity).
+#[inline]
+fn major_eigenpair([a, b, c]: [f32; 3]) -> (f32, (f32, f32)) {
+    let half_diff = 0.5 * (a - c);
+    let rad = half_diff.hypot(b);
+    let lambda1 = 0.5 * (a + c) + rad;
+    // (λ1 − c, b) and (b, λ1 − a) are both eigenvectors of λ1; take the one
+    // whose first/second entry is a sum of non-negative terms (no cancellation).
+    let (ex, ey) = if a >= c { (half_diff + rad, b) } else { (b, rad - half_diff) };
+    let len = ex.hypot(ey);
+    let v = if len > 1e-12 { (ex / len, ey / len) } else { (1.0, 0.0) };
+    (lambda1, v)
 }
 
 /// Half-axes of the 3σ ellipse of a 2D covariance `[xx, xy, yy]`, in pixels:
@@ -371,19 +468,18 @@ pub fn project_splat(pos: Vec3, cov6: &[f32; 6], vp: &ViewParams) -> Option<Proj
 ///
 /// The quad corner `q ∈ {−1, +1}²` sits at `q.x·major + q.y·minor` from the
 /// center; `minor` is `major` rotated by +90° and shortened.
+///
+/// This works from the covariance alone, so the minor axis is only as
+/// accurate as `a·c − b²` is in 32-bit floats: fine up to an axis ratio of a
+/// few hundred. For a projected splat prefer [`Projected::ellipse_axes`].
 #[inline]
 pub fn ellipse_axes(cov: [f32; 3]) -> ([f32; 2], [f32; 2]) {
     let [a, b, c] = cov;
     let det = a * c - b * b;
-    let mid = 0.5 * (a + c);
-    let rad = (0.5 * (a - c)).hypot(b);
-    let lambda1 = (mid + rad).max(0.0);
-    // det/λ1 instead of mid − rad: no cancellation for needle-like splats.
+    let (lambda1, (vx, vy)) = major_eigenpair(cov);
+    let lambda1 = lambda1.max(0.0);
+    // det/λ1 instead of mid − rad: less cancellation for needle-like splats.
     let lambda2 = if lambda1 > 0.0 { (det / lambda1).max(0.0) } else { 0.0 };
-    // Both candidates are eigenvectors of λ1; pick the one that cannot cancel.
-    let (ex, ey) = if a >= c { (lambda1 - c, b) } else { (b, lambda1 - a) };
-    let len = ex.hypot(ey);
-    let (vx, vy) = if len > 1e-12 { (ex / len, ey / len) } else { (1.0, 0.0) };
     let l1 = CUTOFF_SIGMA * lambda1.sqrt();
     let l2 = CUTOFF_SIGMA * lambda2.sqrt();
     ([vx * l1, vy * l1], [-vy * l2, vx * l2])
@@ -397,7 +493,9 @@ pub fn eval_alpha(opacity: f32, conic: [f32; 3], dx: f32, dy: f32) -> f32 {
     let m = conic[0] * dx * dx + 2.0 * conic[1] * dx * dy + conic[2] * dy * dy;
     // Both comparisons are false for NaN, which is discarded as well.
     if m <= CUTOFF_MAHALANOBIS2 {
-        let alpha = opacity * (-0.5 * m).exp();
+        // `min(1)`: m ≥ 0 mathematically, but the three terms can cancel to a
+        // negative number for extreme needles; alpha must never exceed opacity.
+        let alpha = opacity * (-0.5 * m).exp().min(1.0);
         if alpha >= MIN_ALPHA {
             return alpha;
         }
@@ -408,9 +506,51 @@ pub fn eval_alpha(opacity: f32, conic: [f32; 3], dx: f32, dy: f32) -> f32 {
 /// Deterministic pseudo-random helpers shared by the unit tests of this crate.
 #[cfg(test)]
 pub(crate) mod test_util {
-    use glam::{Quat, Vec3};
+    use glam::{DMat3, DQuat, DVec3, Mat4, Quat, Vec3};
 
     use crate::types::Splat;
+
+    /// Independent reference for the projection of a splat, in `f64`: the
+    /// pinhole model of `docs/ARCHITECTURE.md` (`px = cx + fx·x/d`,
+    /// `py = cy − fy·y/d`, `d = −z`) differentiated *numerically*, so it shares
+    /// no formula with `project_splat`. No frustum clamp, no low-pass.
+    ///
+    /// Returns `(center [px, py], covariance [xx, xy, yy], depth)`, or `None`
+    /// behind the camera.
+    pub fn reference_projection(
+        splat: &Splat,
+        view: &Mat4,
+        [fx, fy, cx, cy]: [f32; 4],
+    ) -> Option<([f64; 2], [f64; 3], f64)> {
+        let (fx, fy, cx, cy) = (fx as f64, fy as f64, cx as f64, cy as f64);
+        let view = view.as_dmat4();
+        let project = |world: DVec3| {
+            let c = view.transform_point3(world);
+            let d = -c.z;
+            (cx + fx * c.x / d, cy - fy * c.y / d, d)
+        };
+        let center = Vec3::from_array(splat.pos).as_dvec3();
+        let (px, py, depth) = project(center);
+        if depth <= 0.0 {
+            return None;
+        }
+        let h = 1e-6 * depth.max(1.0);
+        let mut jx = DVec3::ZERO;
+        let mut jy = DVec3::ZERO;
+        for k in 0..3 {
+            let mut e = DVec3::ZERO;
+            e[k] = h;
+            let (ax, ay, _) = project(center + e);
+            let (bx, by, _) = project(center - e);
+            jx[k] = (ax - bx) / (2.0 * h);
+            jy[k] = (ay - by) / (2.0 * h);
+        }
+        let r = DMat3::from_quat(DQuat::from_array(splat.rot.map(f64::from)).normalize());
+        let s = splat.scale.map(f64::from);
+        let m = DMat3::from_cols(r.x_axis * s[0], r.y_axis * s[1], r.z_axis * s[2]);
+        let sigma = m * m.transpose();
+        Some(([px, py], [jx.dot(sigma * jx), jx.dot(sigma * jy), jy.dot(sigma * jy)], depth))
+    }
 
     /// SplitMix64: tiny, seedable, good enough for tests.
     pub struct Rng(u64);
@@ -478,7 +618,7 @@ pub(crate) mod test_util {
 mod tests {
     use glam::{Affine3A, Vec2};
 
-    use super::test_util::Rng;
+    use super::test_util::{self, Rng};
     use super::*;
 
     fn camera() -> Camera {
@@ -794,6 +934,196 @@ mod tests {
             assert!((p.radius - major_len).abs() < 1e-3 * major_len + 1e-3, "{p:?}");
             assert!(Vec2::from(minor).length() <= p.radius * 1.001);
         }
+    }
+
+    #[test]
+    fn projection_matches_numeric_jacobian_for_general_cameras() {
+        // Second, independent derivation: numeric differentiation of the
+        // pinhole model in f64. Cameras have roll, non-square pixels and an
+        // off-center principal point (VR eyes); every other view also carries
+        // a uniform scale.
+        let mut rng = Rng::new(40);
+        let mut compared = 0;
+        for i in 0..3000 {
+            let eye = Vec3::new(rng.range(-3.0, 3.0), rng.range(0.2, 2.5), rng.range(-3.0, 3.0));
+            let target = Vec3::new(rng.range(-0.5, 0.5), rng.range(0.3, 1.2), rng.range(-0.5, 0.5));
+            let mut cam = Camera::look_at(eye, target, Vec3::Y, rng.range(0.5, 1.6), 640, 480);
+            cam.world_from_cam *= Affine3A::from_rotation_z(rng.range(-1.0, 1.0));
+            cam.fx *= rng.range(0.7, 1.4);
+            cam.cx += rng.range(-150.0, 150.0);
+            cam.cy += rng.range(-100.0, 100.0);
+            let k = if i % 2 == 0 { 1.0 } else { rng.range(0.05, 5.0) };
+            let mut vp = ViewParams::from_camera(&cam);
+            vp.view = cam.view_matrix() * Mat4::from_scale(Vec3::splat(k));
+            let mut s = rng.splat(1.0, 0.002, 0.08);
+            s.pos[1] += 0.7;
+            for v in s.pos.iter_mut().chain(&mut s.scale) {
+                *v /= k;
+            }
+            let Some(p) = project_splat(s.position(), &cov6(&s), &vp) else { continue };
+            // Outside the image the Jacobian is clamped on purpose.
+            if !(0.0..=vp.width).contains(&p.px) || !(0.0..=vp.height).contains(&p.py) {
+                continue;
+            }
+            let (center, cov, depth) =
+                test_util::reference_projection(&s, &vp.view, [vp.fx, vp.fy, vp.cx, vp.cy]).expect("in front");
+            compared += 1;
+            assert!((p.px as f64 - center[0]).abs() < 0.02 && (p.py as f64 - center[1]).abs() < 0.02, "{p:?}");
+            assert!((p.depth as f64 - depth).abs() < 1e-4 * (1.0 + depth));
+            let tol = 2e-3 * (cov[0] + cov[2]) + 1e-3;
+            let lp = LOW_PASS_PX2 as f64;
+            for (got, want) in p.cov.iter().zip([cov[0] + lp, cov[1], cov[2] + lp]) {
+                assert!((*got as f64 - want).abs() < tol, "{p:?} vs {cov:?}");
+            }
+        }
+        assert!(compared > 1000, "{compared}");
+    }
+
+    /// Literal transcription of the GLSL sketch in the module documentation.
+    /// Returns `(px, [a, b, c], major, minor)`.
+    fn glsl_sketch(p: Vec3, c: &[f32; 6], vp: &ViewParams) -> Option<(Vec2, [f32; 3], Vec2, Vec2)> {
+        let (fx, fy, cx, cy, w, h, k) = (vp.fx, vp.fy, vp.cx, vp.cy, vp.width, vp.height, vp.splat_scale);
+        let t = vp.view * p.extend(1.0);
+        let d = -t.z;
+        if d < vp.near {
+            return None;
+        }
+        let mut uv = Vec2::new(t.x, t.y) / d;
+        let px = Vec2::new(cx + fx * uv.x, cy - fy * uv.y);
+        uv = uv.clamp(
+            Vec2::new((-cx - 0.15 * w) / fx, (cy - 1.15 * h) / fy),
+            Vec2::new((w - cx + 0.15 * w) / fx, (cy + 0.15 * h) / fy),
+        );
+        let wt = Mat3::from_mat4(vp.view).transpose();
+        let t0 = (fx / d) * (wt.x_axis + uv.x * wt.z_axis);
+        let t1 = -(fy / d) * (wt.y_axis + uv.y * wt.z_axis);
+        let s = Mat3::from_cols_array(&[c[0], c[1], c[2], c[1], c[3], c[4], c[2], c[4], c[5]]);
+        let ma = (k * k * t0.dot(s * t0)).max(0.0);
+        let mb = k * k * t0.dot(s * t1);
+        let mc = (k * k * t1.dot(s * t1)).max(0.0);
+        let (a, b, c) = (ma + 0.3, mb, mc + 0.3);
+        let det = (ma * mc - mb * mb).max(0.0) + 0.3 * (ma + mc) + 0.09;
+        let mid = 0.5 * (a + c);
+        let rad = Vec2::new(0.5 * (a - c), b).length();
+        let l1 = mid + rad;
+        let l2 = det / l1;
+        let mut v1 = if a >= c { Vec2::new(0.5 * (a - c) + rad, b) } else { Vec2::new(b, 0.5 * (c - a) + rad) };
+        let len = v1.length();
+        v1 = if len > 1e-12 { v1 / len } else { Vec2::X };
+        Some((px, [a, b, c], 3.0 * l1.sqrt() * v1, 3.0 * l2.sqrt() * Vec2::new(-v1.y, v1.x)))
+    }
+
+    #[test]
+    fn documented_glsl_sketch_computes_the_same_quad() {
+        let mut rng = Rng::new(41);
+        let mut compared = 0;
+        for _ in 0..2000 {
+            let eye = Vec3::new(rng.range(-3.0, 3.0), rng.range(0.2, 2.5), rng.range(-3.0, 3.0));
+            let mut cam = Camera::look_at(eye, Vec3::new(0.0, 0.8, 0.0), Vec3::Y, rng.range(0.6, 1.4), 640, 480);
+            cam.cx += rng.range(-80.0, 80.0);
+            cam.cy += rng.range(-80.0, 80.0);
+            let mut vp = ViewParams::from_camera(&cam);
+            vp.splat_scale = rng.range(0.3, 1.5);
+            let mut s = rng.splat(1.0, 0.002, 0.2);
+            s.pos[1] += 0.7;
+            let cov = cov6(&s);
+            let reference = project_splat_with_axes(s.position(), &cov, &vp);
+            let sketch = glsl_sketch(s.position(), &cov, &vp);
+            assert_eq!(reference.is_some(), sketch.is_some());
+            let (Some((p, major, minor)), Some((px, abc, g_major, g_minor))) = (reference, sketch) else { continue };
+            compared += 1;
+            assert!((p.px - px.x).abs() < 1e-2 && (p.py - px.y).abs() < 1e-2);
+            let size = abc[0] + abc[2];
+            for i in 0..3 {
+                assert!((p.cov[i] - abc[i]).abs() < 1e-4 * size, "{p:?} vs {abc:?}");
+            }
+            let tol = 1e-3 * g_major.length() + 1e-3;
+            assert!((Vec2::from(major) - g_major).length() < tol, "{major:?} vs {g_major:?}");
+            assert!((Vec2::from(minor) - g_minor).length() < tol, "{minor:?} vs {g_minor:?}");
+            // Fragment stage: alpha from the quad coordinate equals alpha
+            // from the conic at the same pixel offset.
+            let q = Vec2::new(rng.range(-0.7, 0.7), rng.range(-0.7, 0.7));
+            let offset = q.x * g_major + q.y * g_minor;
+            let alpha_quad = 0.8 * (-4.5 * q.dot(q)).exp();
+            let alpha_conic = eval_alpha(0.8, p.conic, offset.x, offset.y);
+            if alpha_quad > 0.02 && size * (p.conic[0] + p.conic[2]) < 1e4 {
+                assert!((alpha_quad - alpha_conic).abs() < 0.01, "{alpha_quad} vs {alpha_conic}");
+            }
+        }
+        assert!(compared > 1500);
+    }
+
+    #[test]
+    fn axes_from_projection_method_and_free_function_agree() {
+        let cam = camera();
+        let vp = ViewParams::from_camera(&cam);
+        let mut rng = Rng::new(42);
+        for _ in 0..300 {
+            let s = rng.splat(0.8, 0.003, 0.3);
+            let Some((p, major, minor)) = project_splat_with_axes(s.position(), &cov6(&s), &vp) else { continue };
+            assert_eq!(project_splat(s.position(), &cov6(&s), &vp), Some(p));
+            let (major, minor) = (Vec2::from(major), Vec2::from(minor));
+            let tol = 2e-3 * major.length() + 1e-3;
+            let (m1, m2) = p.ellipse_axes();
+            assert!((Vec2::from(m1) - major).length() < tol && (Vec2::from(m2) - minor).length() < tol, "{p:?}");
+            let (f1, f2) = ellipse_axes(p.cov);
+            assert!((Vec2::from(f1) - major).length() < tol, "{p:?}");
+            // The free function only sees the covariance: looser on the minor axis.
+            assert!((Vec2::from(f2) - minor).length() < 0.05 * minor.length() + tol, "{p:?}");
+        }
+        // Point footprints go through the method too.
+        let s = splat(Vec3::new(0.0, 0.8, 0.0), [0.3, 0.01, 0.05], Quat::IDENTITY);
+        let q = project_splat(s.position(), &cov6(&s), &vp).unwrap().with_point_footprint(2.0);
+        assert_eq!(q.ellipse_axes(), ([6.0, 0.0], [0.0, 6.0]));
+    }
+
+    #[test]
+    fn extreme_needles_are_never_culled_thinned_or_indefinite() {
+        // Meters long, microns thin, a few decimeters from the camera: the
+        // thin axis is far below f32 resolution of the world covariance.
+        // Regression: `a·c − b²` used to cancel to ≤ 0 (splat culled) or to a
+        // minor axis below the low-pass, and the conic could be indefinite.
+        let cam = Camera::look_at(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y, 1.0, 640, 480);
+        let vp = ViewParams::from_camera(&cam);
+        let floor = CUTOFF_SIGMA * LOW_PASS_PX2.sqrt();
+        let mut rng = Rng::new(43);
+        for _ in 0..20_000 {
+            let long = rng.range(0.1, 5.0);
+            let thin = 10f32.powf(rng.range(-7.0, -2.0));
+            let s = Splat {
+                pos: [rng.range(-1.0, 1.0), rng.range(-1.0, 1.0), -rng.range(0.06, 3.0)],
+                scale: [long, thin, thin * rng.range(0.5, 2.0)],
+                rot: rng.quat().to_array(),
+                rgba: [255; 4],
+            };
+            let (p, major, minor) =
+                project_splat_with_axes(s.position(), &cov6(&s), &vp).unwrap_or_else(|| panic!("culled: {s:?}"));
+            let (major, minor) = (Vec2::from(major), Vec2::from(minor));
+            assert!(major.is_finite() && minor.is_finite(), "{p:?}");
+            assert!(minor.length() >= 0.999 * floor, "minor axis {} below the low-pass: {p:?}", minor.length());
+            assert!(minor.length() <= major.length() * 1.0001 && (p.radius - major.length()).abs() < 1e-3 * p.radius);
+            assert!(p.conic[0] > 0.0 && p.conic[2] > 0.0 && p.conic.iter().all(|q| q.is_finite()), "{p:?}");
+            let (m1, m2) = p.ellipse_axes();
+            assert!((Vec2::from(m1) - major).length() <= 1e-3 * major.length(), "{p:?}");
+            assert!((Vec2::from(m2).length() / minor.length() - 1.0).abs() < 0.05, "{p:?}: {m2:?} vs {minor:?}");
+            // Alpha never exceeds the opacity, wherever it is sampled.
+            for i in -10..=10 {
+                let d = major * (i as f32 / 10.0);
+                let alpha = eval_alpha(0.5, p.conic, d.x.round(), d.y.round());
+                assert!((0.0..=0.5).contains(&alpha), "alpha {alpha} for {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn eval_alpha_is_bounded_by_the_opacity_when_the_conic_form_cancels() {
+        // Conic of a 4 m × 15 µm needle seen from 0.5 m. It is (barely)
+        // positive definite, but at this offset along the needle the three
+        // terms of δᵀ·conic·δ cancel to a negative f32.
+        let conic = [4.144_829_8, -2.821_335_3, 1.920_448_8];
+        let (dx, dy) = (371.0, 545.0);
+        assert!(conic[0] * dx * dx + 2.0 * conic[1] * dx * dy + conic[2] * dy * dy < 0.0);
+        assert_eq!(eval_alpha(0.5, conic, dx, dy), 0.5);
     }
 
     #[test]

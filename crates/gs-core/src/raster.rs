@@ -1,11 +1,16 @@
 //! CPU reference Gaussian splat rasterizer.
 //!
 //! Implements exactly the algorithm documented in [`crate::splat`]: every
-//! splat is projected with [`project_splat`], the visible ones are sorted back
-//! to front with [`DepthSorter`], and composited with "over" directly on sRGB
-//! values. It is the ground truth the WebGL renderer is compared against, and
-//! it produces the images for the tests (PSNR against the ray-cast scene) —
-//! CI has no GPU.
+//! splat is projected with [`crate::splat::project_splat_with_axes`], the
+//! visible ones are sorted back to front with [`DepthSorter`], and composited
+//! with "over" directly on sRGB values. It is the ground truth the WebGL
+//! renderer is compared against, and it produces the images for the tests
+//! (PSNR against the ray-cast scene) — CI has no GPU.
+//!
+//! Like the shader, it evaluates the Gaussian exponent from the quad
+//! coordinate (`m = 9·|q|²`, steps 8–9) rather than from the conic: the two
+//! are the same number, but the quad form is a sum of squares and stays
+//! accurate for needle-like splats of any size.
 //!
 //! With the `par` feature the work is spread over image bands with rayon; the
 //! output is bit-identical to the single-threaded path.
@@ -14,7 +19,7 @@
 use rayon::prelude::*;
 
 use crate::sort::DepthSorter;
-use crate::splat::{cov6, project_splat, ViewParams, CUTOFF_MAHALANOBIS2, DEFAULT_NEAR, MIN_ALPHA};
+use crate::splat::{cov6, project_splat_with_axes, ViewParams, CUTOFF_MAHALANOBIS2, DEFAULT_NEAR, MIN_ALPHA};
 use crate::types::{Camera, RgbdFrame, Splat};
 
 /// 8-bit sRGB image, row-major, top row first.
@@ -127,7 +132,11 @@ impl Default for RasterOptions {
 struct Draw {
     px: f32,
     py: f32,
-    conic: [f32; 3],
+    /// Rows of the pixel-offset → quad-coordinate map: `q = (u1·δ, u2·δ)`,
+    /// with `u = axis / |axis|²` for the major and minor half-axes. `|q| = 1`
+    /// is the 3σ contour (step 8 of the algorithm in `crate::splat`).
+    u1: [f32; 2],
+    u2: [f32; 2],
     /// sRGB color in `0..=255`.
     color: [f32; 3],
     opacity: f32,
@@ -145,16 +154,20 @@ fn prepare(splat: &Splat, vp: &ViewParams, opts: &RasterOptions) -> Option<Draw>
     if opacity < MIN_ALPHA {
         return None;
     }
-    let mut p = project_splat(splat.position(), &cov6(splat), vp)?;
+    let (p, mut major, mut minor) = project_splat_with_axes(splat.position(), &cov6(splat), vp)?;
     if opts.point_mode {
-        p = p.with_point_footprint(opts.point_sigma_px);
+        let r = p.with_point_footprint(opts.point_sigma_px).radius;
+        major = [r, 0.0];
+        minor = [0.0, r];
     }
     // Alpha drops below 1/255 where the Mahalanobis distance² exceeds
-    // 2·ln(255·opacity), so faint splats need less than the full 3σ box.
-    let reach2 = (2.0 * (opacity / MIN_ALPHA).ln()).min(CUTOFF_MAHALANOBIS2);
-    // Axis-aligned bounds of the ellipse δᵀ·conic·δ ≤ reach²: ±√(reach²·Σ'ₖₖ).
-    let ex = (reach2 * p.cov[0]).sqrt();
-    let ey = (reach2 * p.cov[2]).sqrt();
+    // 2·ln(255·opacity), so faint splats need less than the full 3σ box:
+    // `shrink2` is the squared fraction of it that can contribute.
+    let shrink2 = (2.0 * (opacity / MIN_ALPHA).ln()).min(CUTOFF_MAHALANOBIS2) / CUTOFF_MAHALANOBIS2;
+    // Axis-aligned half-extents of the 3σ ellipse: √(9·Σ'ₖₖ) with
+    // 9·Σ'ₖₖ = majorₖ² + minorₖ².
+    let ex = (shrink2 * (major[0] * major[0] + minor[0] * minor[0])).sqrt();
+    let ey = (shrink2 * (major[1] * major[1] + minor[1] * minor[1])).sqrt();
     // Pixel i has its center at i + 0.5. Saturating float → int casts clip
     // the rectangle to the image (and send NaN to an empty one).
     let x0 = (p.px - ex - 0.5).ceil().max(0.0) as u32;
@@ -164,10 +177,15 @@ fn prepare(splat: &Splat, vp: &ViewParams, opts: &RasterOptions) -> Option<Draw>
     if x0 >= x1 || y0 >= y1 {
         return None;
     }
+    let reciprocal = |axis: [f32; 2]| {
+        let inv = 1.0 / (axis[0] * axis[0] + axis[1] * axis[1]);
+        [axis[0] * inv, axis[1] * inv]
+    };
     Some(Draw {
         px: p.px,
         py: p.py,
-        conic: p.conic,
+        u1: reciprocal(major),
+        u2: reciprocal(minor),
         color: [splat.rgba[0] as f32, splat.rgba[1] as f32, splat.rgba[2] as f32],
         opacity,
         depth: p.depth,
@@ -185,19 +203,23 @@ fn composite_rows(acc: &mut [f32], row0: u32, width: u32, draws: &[Draw], order:
     let row_end = row0 + (acc.len() / stride.max(1)) as u32;
     for &index in order {
         let d = &draws[index as usize];
-        let [qa, qb, qc] = d.conic;
         for y in d.y0.max(row0)..d.y1.min(row_end) {
             let dy = y as f32 + 0.5 - d.py;
+            let (row_q1, row_q2) = (dy * d.u1[1], dy * d.u2[1]);
             let start = (y - row0) as usize * stride;
             let row = &mut acc[start + d.x0 as usize * 3..start + d.x1 as usize * 3];
             for (i, dst) in row.chunks_exact_mut(3).enumerate() {
                 let dx = (d.x0 as usize + i) as f32 + 0.5 - d.px;
-                // Steps 9–11 of the algorithm in `crate::splat`
-                // (`splat::eval_alpha`, spelled out for the inner loop).
-                let m = qa * dx * dx + 2.0 * qb * dx * dy + qc * dy * dy;
+                // Steps 9–11 of the algorithm in `crate::splat`, with the
+                // exponent in its quad form m = 9·|q|². It is the same number
+                // as δᵀ·conic·δ (`splat::eval_alpha`) but a sum of squares,
+                // so it cannot cancel for needle-like splats.
+                let q1 = dx * d.u1[0] + row_q1;
+                let q2 = dx * d.u2[0] + row_q2;
+                let r2 = q1 * q1 + q2 * q2;
                 // False for NaN too.
-                if m <= CUTOFF_MAHALANOBIS2 {
-                    let alpha = d.opacity * (-0.5 * m).exp();
+                if r2 <= 1.0 {
+                    let alpha = d.opacity * (-0.5 * CUTOFF_MAHALANOBIS2 * r2).exp();
                     if alpha >= MIN_ALPHA {
                         let keep = 1.0 - alpha;
                         dst[0] = d.color[0] * alpha + dst[0] * keep;
@@ -280,7 +302,7 @@ mod tests {
     use glam::{Quat, Vec3};
 
     use super::*;
-    use crate::splat::test_util::Rng;
+    use crate::splat::test_util::{reference_projection, Rng};
     use crate::splat::LOW_PASS_PX2;
 
     /// Camera at the origin looking down −Z, 200×160, fx = fy = 200.
@@ -522,6 +544,216 @@ mod tests {
         assert_eq!((img.width, img.height), (3, 2));
         assert_eq!(img.pixel(1, 1), [1, 2, 3]);
         assert_eq!(img.pixel(0, 0), [0, 0, 0]);
+    }
+
+    /// Intensity-weighted centroid of one channel, in pixel coordinates.
+    fn centroid(img: &Image, channel: usize) -> (f32, f32) {
+        let (mut sx, mut sy, mut sw) = (0.0f64, 0.0f64, 0.0f64);
+        for y in 0..img.height {
+            for x in 0..img.width {
+                let v = img.pixel(x, y)[channel] as f64;
+                sx += v * (x as f64 + 0.5);
+                sy += v * (y as f64 + 0.5);
+                sw += v;
+            }
+        }
+        ((sx / sw) as f32, (sy / sw) as f32)
+    }
+
+    #[test]
+    fn image_is_neither_mirrored_nor_upside_down() {
+        // World +X is right of the camera, world +Y is up: red must land on
+        // the right half, green on the top half (small v).
+        let cam = camera();
+        let red = ball(Vec3::new(0.5, 0.0, -2.0), 0.03, [255, 0, 0, 255]);
+        let green = ball(Vec3::new(0.0, 0.5, -2.0), 0.03, [0, 255, 0, 255]);
+        let img = rasterize(&[red, green], &cam, &RasterOptions::default());
+        let (rx, ry) = centroid(&img, 0);
+        let (gx, gy) = centroid(&img, 1);
+        assert!((rx - 150.0).abs() < 0.2 && (ry - 80.0).abs() < 0.2, "red at ({rx}, {ry})");
+        assert!((gx - 100.0).abs() < 0.2 && (gy - 30.0).abs() < 0.2, "green at ({gx}, {gy})");
+
+        // Any camera: a small splat is drawn where `Camera::project` says.
+        let mut rng = Rng::new(50);
+        let mut checked = 0;
+        for _ in 0..40 {
+            let eye = Vec3::new(rng.range(-3.0, 3.0), rng.range(0.2, 2.5), rng.range(-3.0, 3.0));
+            let cam = Camera::look_at(eye, Vec3::new(0.0, 0.8, 0.0), Vec3::Y, 1.0, 320, 240);
+            let p = Vec3::new(rng.range(-0.4, 0.4), rng.range(0.5, 1.1), rng.range(-0.4, 0.4));
+            let Some((px, py, _)) = cam.project(p) else { continue };
+            if !(20.0..300.0).contains(&px) || !(20.0..220.0).contains(&py) {
+                continue;
+            }
+            checked += 1;
+            let img = rasterize(&[ball(p, 0.01, [255; 4])], &cam, &RasterOptions::default());
+            let (cx, cy) = centroid(&img, 0);
+            assert!((cx - px).abs() < 0.25 && (cy - py).abs() < 0.25, "({cx}, {cy}) vs ({px}, {py})");
+        }
+        assert!(checked > 20);
+    }
+
+    #[test]
+    fn needle_keeps_its_orientation_on_screen() {
+        // A needle along world (1, 1, 0) runs from bottom-left to top-right.
+        let cam = camera();
+        let needle = Splat {
+            pos: [0.0, 0.0, -2.0],
+            scale: [0.3, 0.005, 0.005],
+            rot: Quat::from_rotation_z(45f32.to_radians()).to_array(),
+            rgba: [255; 4],
+        };
+        let img = rasterize(&[needle], &cam, &RasterOptions::default());
+        assert!(img.pixel(100 + 15, 80 - 16)[0] > 150, "{:?}", img.pixel(115, 64));
+        assert!(img.pixel(100 - 16, 80 + 15)[0] > 150, "{:?}", img.pixel(84, 95));
+        assert_eq!(img.pixel(100 + 15, 80 + 15), [0, 0, 0]);
+        assert_eq!(img.pixel(100 - 15, 80 - 15), [0, 0, 0]);
+    }
+
+    /// Completely independent renderer: f64, exact depth sort, numeric
+    /// Jacobian (`reference_projection`), conic form of the exponent.
+    fn brute_force(splats: &[Splat], cam: &Camera, background: [u8; 3]) -> Vec<f64> {
+        let view = cam.view_matrix();
+        let mut items = Vec::new();
+        for s in splats {
+            let Some((center, cov, depth)) = reference_projection(s, &view, [cam.fx, cam.fy, cam.cx, cam.cy]) else {
+                continue;
+            };
+            if depth >= DEFAULT_NEAR as f64 {
+                let lp = LOW_PASS_PX2 as f64;
+                items.push((depth, center, [cov[0] + lp, cov[1], cov[2] + lp], s.rgba.map(f64::from)));
+            }
+        }
+        items.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut out = Vec::with_capacity(cam.width as usize * cam.height as usize * 3);
+        for y in 0..cam.height {
+            for x in 0..cam.width {
+                let mut pixel = background.map(f64::from);
+                for (_, center, [a, b, c], rgba) in &items {
+                    let (dx, dy) = (x as f64 + 0.5 - center[0], y as f64 + 0.5 - center[1]);
+                    let m = (c * dx * dx - 2.0 * b * dx * dy + a * dy * dy) / (a * c - b * b);
+                    let alpha = rgba[3] / 255.0 * (-0.5 * m).exp();
+                    if m <= 9.0 && alpha >= 1.0 / 255.0 {
+                        for k in 0..3 {
+                            pixel[k] = rgba[k] * alpha + pixel[k] * (1.0 - alpha);
+                        }
+                    }
+                }
+                out.extend(pixel);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn matches_an_independent_brute_force_renderer() {
+        let mut rng = Rng::new(51);
+        for round in 0..4 {
+            let eye = Vec3::new(rng.range(-2.0, 2.0), rng.range(0.5, 2.0), rng.range(2.0, 3.0));
+            let cam = Camera::look_at(eye, Vec3::new(0.0, 0.5, 0.0), Vec3::Y, rng.range(0.7, 1.2), 96, 72);
+            // Anisotropic, rotated, translucent splats in front of the camera.
+            let splats: Vec<Splat> = (0..150)
+                .map(|_| {
+                    let mut s = rng.splat(1.0, 0.005, 0.15);
+                    s.pos[1] = 0.5 * s.pos[1] + 0.5;
+                    s
+                })
+                .collect();
+            let opts = RasterOptions { background: [10, 20, 30], ..Default::default() };
+            let img = rasterize(&splats, &cam, &opts);
+            let reference = brute_force(&splats, &cam, opts.background);
+            // A pixel sitting exactly on a cut-off (3σ or 1/255) may fall on
+            // either side; everything else agrees to rounding.
+            let off = img.rgb.iter().zip(&reference).filter(|(&a, &b)| (a as f64 - b).abs() > 1.0).count();
+            assert!(off <= 6, "round {round}: {off} channels differ from the reference");
+            assert!(img.rgb.chunks_exact(3).filter(|p| *p != [10, 20, 30]).count() > 500, "round {round}: empty");
+        }
+    }
+
+    #[test]
+    fn extreme_needle_stays_within_the_legal_color_range() {
+        // Regression: for this 1.2 m × 15 µm needle 25 cm from the camera the
+        // conic form of the exponent cancelled to negative values, giving
+        // alpha > opacity (pixels brighter than any legal blend).
+        let mut cam = Camera::look_at(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y, 1.0, 320, 240);
+        cam.fx = 400.0;
+        cam.fy = 400.0;
+        let needle = Splat {
+            pos: [-0.139_320_61, -0.280_621_4, -0.252_231_84],
+            scale: [1.194_127_1, 1.439_553_9e-5, 2.067_921_6e-5],
+            rot: [0.513_172, -0.087_027_34, -0.589_052_4, -0.618_140_8],
+            rgba: [255, 255, 255, 128],
+        };
+        let opts = RasterOptions { background: [100, 100, 100], ..Default::default() };
+        let img = rasterize(&[needle], &cam, &opts);
+        // White at opacity 128/255 over grey 100: at most 100 + 155·0.502 = 177.8.
+        let (min, max) = img.rgb.iter().fold((255u8, 0u8), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(min == 100 && max <= 178, "range {min}..={max}");
+        // And it is drawn: a thin line crossing the image, not a blob.
+        let lit = img.rgb.chunks_exact(3).filter(|p| p[0] > 110).count();
+        assert!((100..4000).contains(&lit), "{lit} lit pixels");
+    }
+
+    #[test]
+    fn degenerate_inputs_do_not_panic() {
+        let one = [ball(Vec3::new(0.0, 0.0, -1.0), 0.5, [255; 4])];
+        for (w, h) in [(0, 0), (0, 5), (5, 0), (1, 1), (1, 7), (7, 1)] {
+            let mut cam = camera();
+            (cam.width, cam.height) = (w, h);
+            assert_eq!(rasterize(&one, &cam, &RasterOptions::default()).rgb.len(), (w * h * 3) as usize);
+        }
+        let unit = [0.0, 0.0, 0.0, 1.0];
+        let odd = [
+            Splat { pos: [0.0, 0.0, -1.0], scale: [0.0; 3], rot: [0.0; 4], rgba: [255; 4] },
+            Splat { pos: [0.0, 0.0, -1.0], scale: [-0.1, 0.1, 0.1], rot: unit, rgba: [255; 4] },
+            Splat { pos: [0.0, 0.0, -1.0], scale: [f32::MAX; 3], rot: unit, rgba: [255; 4] },
+            Splat { pos: [f32::MAX, f32::MAX, -f32::MAX], scale: [1.0; 3], rot: unit, rgba: [255; 4] },
+            Splat { pos: [1e20, 0.0, -1.0], scale: [1e19; 3], rot: unit, rgba: [255; 4] },
+            Splat { pos: [0.0, 0.0, -1.0], scale: [1e-30; 3], rot: [1e-30, 0.0, 0.0, 1e-30], rgba: [255; 4] },
+        ];
+        let d = RasterOptions::default();
+        for opts in [
+            d,
+            RasterOptions { splat_scale: 0.0, ..d },
+            RasterOptions { splat_scale: f32::NAN, ..d },
+            RasterOptions { splat_scale: f32::INFINITY, ..d },
+            RasterOptions { splat_scale: -1.0, ..d },
+            RasterOptions { point_mode: true, point_sigma_px: 0.0, ..d },
+            RasterOptions { point_mode: true, point_sigma_px: f32::NAN, ..d },
+            RasterOptions { point_mode: true, point_sigma_px: -2.0, ..d },
+            RasterOptions { point_mode: true, point_sigma_px: 1e9, ..d },
+            RasterOptions { near: -1.0, ..d },
+            RasterOptions { near: f32::NAN, ..d },
+        ] {
+            assert_eq!(rasterize(&odd, &camera(), &opts).rgb.len(), 200 * 160 * 3, "{opts:?}");
+        }
+        // A zero-scale splat is still a (low-pass sized) dot of its color.
+        let img = rasterize(&[Splat { pos: [0.0, 0.0, -1.0], ..odd[0] }], &camera(), &d);
+        assert!(img.pixel(100, 80)[0] > 100 && img.pixel(104, 80) == [0; 3]);
+        // Nonsensical intrinsics.
+        for (fx, cx) in [(0.0, 100.0), (f32::NAN, f32::INFINITY), (-200.0, 100.0)] {
+            let mut cam = camera();
+            (cam.fx, cam.cx) = (fx, cx);
+            assert_eq!(rasterize(&odd, &cam, &d).rgb.len(), 200 * 160 * 3);
+        }
+    }
+
+    #[test]
+    fn surfel_wall_hides_what_is_behind_it_at_oblique_angles() {
+        let step = 0.02;
+        let mut splats = Vec::new();
+        for iy in -40..=40 {
+            for ix in -40..=40 {
+                let pos = Vec3::new(ix as f32 * step, iy as f32 * step, 0.0);
+                splats.push(Splat::surfel(pos, Vec3::Z, 0.75 * step, 0.1 * step, [100, 100, 100, 255]));
+            }
+        }
+        splats.push(ball(Vec3::new(0.0, 0.0, -0.3), 0.1, [255, 0, 0, 255]));
+        for angle in [0.0f32, 0.5, 1.0, 1.3] {
+            let eye = Vec3::new(angle.sin() * 2.0, 0.0, angle.cos() * 2.0);
+            let cam = Camera::look_at(eye, Vec3::ZERO, Vec3::Y, 0.5, 160, 120);
+            let p = rasterize(&splats, &cam, &RasterOptions::default()).pixel(80, 60);
+            assert!(p[0] <= 102 && p[1] >= 98, "angle {angle}: the red ball shows through: {p:?}");
+        }
     }
 
     fn random_cloud(n: usize, seed: u64) -> Vec<Splat> {

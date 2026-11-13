@@ -95,7 +95,9 @@ fn cell_index(v: f32, size: f32) -> i32 {
 
 #[inline]
 fn hash3(x: i32, y: i32, z: i32) -> u32 {
-    let mut h = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77) ^ (z as u32).wrapping_mul(0xC2B2_AE3D);
+    let mut h = (x as u32).wrapping_mul(0x9E37_79B1)
+        ^ (y as u32).wrapping_mul(0x85EB_CA77)
+        ^ (z as u32).wrapping_mul(0xC2B2_AE3D);
     h ^= h >> 15;
     h = h.wrapping_mul(0x2C1B_3C6D);
     h ^= h >> 12;
@@ -106,22 +108,44 @@ fn hash3(x: i32, y: i32, z: i32) -> u32 {
 impl Material {
     /// Single-color material.
     pub const fn solid(color: Vec3) -> Self {
-        Self { a: color, b: color, pattern: Pattern::Solid, emissive: 0.0 }
+        Self {
+            a: color,
+            b: color,
+            pattern: Pattern::Solid,
+            emissive: 0.0,
+        }
     }
 
     /// Two-color material with an arbitrary pattern.
     pub const fn new(a: Vec3, b: Vec3, pattern: Pattern) -> Self {
-        Self { a, b, pattern, emissive: 0.0 }
+        Self {
+            a,
+            b,
+            pattern,
+            emissive: 0.0,
+        }
     }
 
     /// 3D checkerboard with cubic cells.
     pub fn checker(a: Vec3, b: Vec3, size: f32) -> Self {
-        Self::new(a, b, Pattern::Checker { cell: Vec3::splat(size) })
+        Self::new(
+            a,
+            b,
+            Pattern::Checker {
+                cell: Vec3::splat(size),
+            },
+        )
     }
 
     /// Square tiles in the object-space XZ plane (floors).
     pub fn tiles(a: Vec3, b: Vec3, size: f32) -> Self {
-        Self::new(a, b, Pattern::Checker { cell: Vec3::new(size, f32::INFINITY, size) })
+        Self::new(
+            a,
+            b,
+            Pattern::Checker {
+                cell: Vec3::new(size, f32::INFINITY, size),
+            },
+        )
     }
 
     /// Alternating bands along `axis`.
@@ -136,7 +160,15 @@ impl Material {
 
     /// Polar checkerboard around `axis`.
     pub fn polar(a: Vec3, b: Vec3, axis: Axis, ring_width: f32, sectors: u32) -> Self {
-        Self::new(a, b, Pattern::Polar { axis, ring_width, sectors })
+        Self::new(
+            a,
+            b,
+            Pattern::Polar {
+                axis,
+                ring_width,
+                sectors,
+            },
+        )
     }
 
     /// Polka dots of color `b` on `a`.
@@ -170,7 +202,11 @@ impl Material {
             }
             Pattern::Stripes { axis, width } => self.pick(cell_index(axis.split(p).0, width)),
             Pattern::Rings { axis, width } => self.pick(cell_index(axis.split(p).1, width)),
-            Pattern::Polar { axis, ring_width, sectors } => {
+            Pattern::Polar {
+                axis,
+                ring_width,
+                sectors,
+            } => {
                 let ring = cell_index(axis.split(p).1, ring_width);
                 let turn = axis.angle(p) / core::f32::consts::TAU + 0.5;
                 let sector = (turn * sectors as f32).floor() as i32;
@@ -190,7 +226,11 @@ impl Material {
                 self.a.lerp(self.b, s)
             }
             Pattern::Cells { cell } => {
-                let h = hash3(cell_index(p.x, cell.x), cell_index(p.y, cell.y), cell_index(p.z, cell.z));
+                let h = hash3(
+                    cell_index(p.x, cell.x),
+                    cell_index(p.y, cell.y),
+                    cell_index(p.z, cell.z),
+                );
                 self.a.lerp(self.b, (h >> 8) as f32 / (1u32 << 24) as f32)
             }
         }
@@ -273,12 +313,20 @@ mod tests {
         let g = Material::gradient(A, B, Axis::Y, 1.0, 3.0);
         assert_eq!(g.albedo(Vec3::new(0.0, 0.0, 0.0)), A);
         assert_eq!(g.albedo(Vec3::new(0.0, 4.0, 0.0)), B);
-        assert!((g.albedo(Vec3::new(0.0, 2.0, 0.0)) - Vec3::new(0.5, 0.0, 0.5)).abs().max_element() < 1e-6);
+        assert!(
+            (g.albedo(Vec3::new(0.0, 2.0, 0.0)) - Vec3::new(0.5, 0.0, 0.5))
+                .abs()
+                .max_element()
+                < 1e-6
+        );
 
         let c = Material::cells(A, B, Vec3::new(0.1, f32::INFINITY, 1.0));
         let v0 = c.albedo(Vec3::new(0.05, 0.0, 0.5));
         assert_eq!(v0, c.albedo(Vec3::new(0.07, 3.0, 0.9)), "constant inside a cell");
-        let distinct = (0..32).map(|i| c.albedo(Vec3::new(0.05 + 0.1 * i as f32, 0.0, 0.5)).x).filter(|x| (x - v0.x).abs() > 1e-3).count();
+        let distinct = (0..32)
+            .map(|i| c.albedo(Vec3::new(0.05 + 0.1 * i as f32, 0.0, 0.5)).x)
+            .filter(|x| (x - v0.x).abs() > 1e-3)
+            .count();
         assert!(distinct > 20, "cells vary");
     }
 }

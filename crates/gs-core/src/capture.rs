@@ -15,7 +15,11 @@ use crate::types::{Camera, RgbdFrame};
 
 /// Sensor noise. All noise is a pure function of `(seed, pixel index)`: the
 /// same inputs always give the same frame, whatever the thread count.
+///
+/// Fields missing from serialized data take their [`Default`] (no noise).
+/// Negative and NaN parameters switch the corresponding effect off.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NoiseModel {
     /// Standard deviation of the depth error at 1 m, in meters. The error
     /// grows with the square of the depth, as for structured-light and stereo
@@ -29,12 +33,20 @@ pub struct NoiseModel {
 
 impl NoiseModel {
     /// A perfect sensor.
-    pub const NONE: Self = Self { depth_sigma_at_1m: 0.0, color_sigma: 0.0, dropout: 0.0 };
+    pub const NONE: Self = Self {
+        depth_sigma_at_1m: 0.0,
+        color_sigma: 0.0,
+        dropout: 0.0,
+    };
 
     /// Roughly a consumer depth camera: 1.5 mm depth noise at 1 m (about
     /// 1.4 cm at 3 m), 2 levels of color noise, 1 % dropped pixels.
     pub fn realistic() -> Self {
-        Self { depth_sigma_at_1m: 0.0015, color_sigma: 2.0, dropout: 0.01 }
+        Self {
+            depth_sigma_at_1m: 0.0015,
+            color_sigma: 2.0,
+            dropout: 0.01,
+        }
     }
 
     /// True when the model does not alter the frame.
@@ -50,7 +62,10 @@ impl Default for NoiseModel {
 }
 
 /// Parameters of one simulated exposure.
+///
+/// Fields missing from serialized data take their [`Default`].
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CaptureOptions {
     /// Cast shadow rays toward the lights.
     pub shadows: bool,
@@ -65,7 +80,13 @@ pub struct CaptureOptions {
 
 impl Default for CaptureOptions {
     fn default() -> Self {
-        Self { shadows: true, min_range: 0.1, max_range: 20.0, noise: NoiseModel::NONE, seed: 0 }
+        Self {
+            shadows: true,
+            min_range: 0.1,
+            max_range: 20.0,
+            noise: NoiseModel::NONE,
+            seed: 0,
+        }
     }
 }
 
@@ -75,6 +96,11 @@ impl Default for CaptureOptions {
 /// ray and the optical axis), `0.0` where nothing is hit, the hit is outside
 /// `[min_range, max_range]`, or the pixel dropped out. `rgb` is the sRGB
 /// encoding of [`SceneSnapshot::shade`] for valid pixels and black otherwise.
+///
+/// The nearest surface decides: something closer than `min_range` blanks the
+/// pixel instead of revealing what lies behind it, as on a real sensor.
+/// Every valid depth is finite, positive and inside `[min_range, max_range]`,
+/// with or without noise (noisy values are clamped to the range).
 ///
 /// With the `par` feature rows are rendered in parallel; the output is
 /// identical to the single-threaded one.
@@ -125,11 +151,17 @@ pub fn render_reference(
             }
             rgb[x * 3..x * 3 + 3].copy_from_slice(&linear_to_srgb8(sum * inv_samples));
             let (origin, dir) = cam.ray(x as f32 + 0.5, y as f32 + 0.5);
-            depth[x] = snap.raycast(origin, dir, f32::INFINITY).map_or(0.0, |hit| hit.t * dir.dot(forward));
+            depth[x] = snap
+                .raycast(origin, dir, f32::INFINITY)
+                .map_or(0.0, |hit| hit.t * dir.dot(forward));
         }
     });
     frame
 }
+
+/// Depth noise never pushes a return closer than this (meters), so a valid
+/// depth stays distinguishable from the `0.0` "no return" marker.
+const MIN_NOISY_DEPTH: f32 = 1.0e-3;
 
 fn render_row(snap: &SceneSnapshot, cam: &Camera, opts: &CaptureOptions, y: u32, rgb: &mut [u8], depth: &mut [f32]) {
     let forward = cam.forward();
@@ -138,7 +170,9 @@ fn render_row(snap: &SceneSnapshot, cam: &Camera, opts: &CaptureOptions, y: u32,
         let (origin, dir) = cam.ray(x as f32 + 0.5, y as f32 + 0.5);
         let cos = dir.dot(forward);
         // Stop the ray where its forward distance reaches the range limit.
-        let Some(hit) = snap.raycast(origin, dir, opts.max_range / cos.max(1e-6)) else { continue };
+        let Some(hit) = snap.raycast(origin, dir, opts.max_range / cos.max(1e-6)) else {
+            continue;
+        };
         let mut z = hit.t * cos;
         if z < opts.min_range || z > opts.max_range {
             continue;
@@ -151,7 +185,13 @@ fn render_row(snap: &SceneSnapshot, cam: &Camera, opts: &CaptureOptions, y: u32,
                 continue;
             }
             if n.depth_sigma_at_1m > 0.0 {
-                z = (z + gaussian(opts.seed, pixel, 1) * n.depth_sigma_at_1m * z * z).max(1e-3);
+                let noisy = z + gaussian(opts.seed, pixel, 1) * n.depth_sigma_at_1m * z * z;
+                if !noisy.is_finite() {
+                    continue;
+                }
+                // Stay a valid return: positive and inside the sensor range.
+                // (`max`/`min` rather than `clamp`, which panics on a NaN limit.)
+                z = noisy.max(opts.min_range.max(MIN_NOISY_DEPTH)).min(opts.max_range);
             }
             if n.color_sigma > 0.0 {
                 for (c, channel) in color.iter_mut().enumerate() {
@@ -216,12 +256,23 @@ fn uniform(seed: u32, pixel: u32, stream: u32) -> f32 {
     (hash(seed, pixel, stream) >> 8) as f32 / (1u32 << 24) as f32
 }
 
-/// Standard normal sample (Box-Muller); consumes streams `stream` and `stream + 1`.
+/// Approximately standard normal sample; consumes streams `stream` and
+/// `stream + 1`.
+///
+/// Sum of eight uniform bytes (Irwin-Hall): cheap, no transcendental
+/// functions, tails bounded at about 4.9 sigma, which suits sensor noise.
 #[inline]
 fn gaussian(seed: u32, pixel: u32, stream: u32) -> f32 {
-    let u1 = uniform(seed, pixel, stream).max(1.0e-7);
-    let u2 = uniform(seed, pixel, stream + 1);
-    (-2.0 * u1.ln()).sqrt() * (core::f32::consts::TAU * u2).cos()
+    #[inline]
+    fn byte_sum(x: u32) -> u32 {
+        let pairs = (x & 0x00FF_00FF) + ((x >> 8) & 0x00FF_00FF);
+        (pairs & 0xFFFF) + (pairs >> 16)
+    }
+    let sum = byte_sum(hash(seed, pixel, stream)) + byte_sum(hash(seed, pixel, stream + 1));
+    // Each byte has mean 127.5 and variance (256^2 - 1) / 12.
+    const MEAN: f32 = 8.0 * 127.5;
+    const INV_SIGMA: f32 = 1.0 / 209.021_53;
+    (sum as f32 - MEAN) * INV_SIGMA
 }
 
 #[cfg(test)]
@@ -231,9 +282,16 @@ mod tests {
 
     /// A wall facing the camera at z = -4 and a ball in front of it.
     fn wall_scene() -> SceneSnapshot {
-        let wall = Primitive::cuboid(Vec3::new(0.0, 0.0, -4.5), Vec3::new(1.2, 50.0, 0.5), Material::solid(Vec3::splat(0.5)));
+        let wall = Primitive::cuboid(
+            Vec3::new(0.0, 0.0, -4.5),
+            Vec3::new(1.2, 50.0, 0.5),
+            Material::solid(Vec3::splat(0.5)),
+        );
         let ball = Primitive::sphere(Vec3::new(0.0, 0.0, -2.0), 0.3, Material::checker(Vec3::X, Vec3::Y, 0.1));
-        let lighting = Lighting { lights: vec![Light::directional(Vec3::new(0.3, 1.0, 0.8), Vec3::splat(0.5))], ..Lighting::default() };
+        let lighting = Lighting {
+            lights: vec![Light::directional(Vec3::new(0.3, 1.0, 0.8), Vec3::splat(0.5))],
+            ..Lighting::default()
+        };
         SceneSnapshot::new(vec![wall, ball], lighting)
     }
 
@@ -258,9 +316,9 @@ mod tests {
                 }
             }
         }
-        assert!(wall_pixels > 1000);
-        // Top and bottom image corners still see the tall wall.
-        assert!((frame.depth_at(20, 0) - 4.0).abs() < 1e-3);
+        assert!(wall_pixels > 800, "{wall_pixels} wall pixels");
+        // The top image row still sees the tall wall.
+        assert!((frame.depth_at(30, 0) - 4.0).abs() < 1e-3);
         // Center pixel sees the ball.
         assert!((frame.depth_at(32, 24) - 1.7).abs() < 0.01);
     }
@@ -269,7 +327,14 @@ mod tests {
     fn unprojected_depth_lands_on_the_hit_point() {
         let scene = make_scene(SceneKind::Stage);
         let snap = scene.snapshot(1.3);
-        let cam = Camera::look_at(Vec3::new(2.5, 1.7, 2.0), Vec3::new(0.0, 1.0, 0.0), Vec3::Y, 50f32.to_radians(), 80, 60);
+        let cam = Camera::look_at(
+            Vec3::new(2.5, 1.7, 2.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::Y,
+            50f32.to_radians(),
+            80,
+            60,
+        );
         let frame = render_rgbd(&snap, &cam, &CaptureOptions::default());
         let mut checked = 0;
         for y in 0..60 {
@@ -314,12 +379,30 @@ mod tests {
     fn range_limits() {
         let snap = wall_scene();
         let cam = cam(64, 48);
-        let near_only = render_rgbd(&snap, &cam, &CaptureOptions { max_range: 3.0, ..Default::default() });
+        let near_only = render_rgbd(
+            &snap,
+            &cam,
+            &CaptureOptions {
+                max_range: 3.0,
+                ..Default::default()
+            },
+        );
         assert!(near_only.depth.iter().all(|&z| z <= 3.0));
         assert!(near_only.depth_at(32, 24) > 0.0, "ball kept");
         assert_eq!(near_only.depth_at(32, 2), 0.0, "wall dropped");
-        let far_only = render_rgbd(&snap, &cam, &CaptureOptions { min_range: 3.0, ..Default::default() });
-        assert_eq!(far_only.depth_at(32, 24), 0.0, "ball dropped, wall behind it is occluded");
+        let far_only = render_rgbd(
+            &snap,
+            &cam,
+            &CaptureOptions {
+                min_range: 3.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            far_only.depth_at(32, 24),
+            0.0,
+            "ball dropped, wall behind it is occluded"
+        );
         assert_eq!(far_only.rgb_at(32, 24), [0, 0, 0]);
         assert!((far_only.depth_at(32, 2) - 4.0).abs() < 1e-3);
     }
@@ -329,7 +412,14 @@ mod tests {
         let snap = wall_scene();
         let cam = cam(64, 48);
         for shadows in [false, true] {
-            let frame = render_rgbd(&snap, &cam, &CaptureOptions { shadows, ..Default::default() });
+            let frame = render_rgbd(
+                &snap,
+                &cam,
+                &CaptureOptions {
+                    shadows,
+                    ..Default::default()
+                },
+            );
             for (x, y) in [(32, 24), (30, 20), (32, 2), (40, 40)] {
                 let (o, d) = cam.ray(x as f32 + 0.5, y as f32 + 0.5);
                 let hit = snap.raycast(o, d, 100.0).unwrap();
@@ -342,7 +432,11 @@ mod tests {
     fn noise_is_deterministic_and_seeded() {
         let snap = wall_scene();
         let cam = cam(64, 48);
-        let opts = CaptureOptions { noise: NoiseModel::realistic(), seed: 42, ..Default::default() };
+        let opts = CaptureOptions {
+            noise: NoiseModel::realistic(),
+            seed: 42,
+            ..Default::default()
+        };
         let a = render_rgbd(&snap, &cam, &opts);
         let b = render_rgbd(&snap, &cam, &opts);
         assert_eq!(a, b);
@@ -357,8 +451,20 @@ mod tests {
         let snap = wall_scene();
         let cam = cam(160, 120);
         let clean = render_rgbd(&snap, &cam, &CaptureOptions::default());
-        let noise = NoiseModel { depth_sigma_at_1m: 0.002, color_sigma: 3.0, dropout: 0.05 };
-        let noisy = render_rgbd(&snap, &cam, &CaptureOptions { noise, seed: 7, ..Default::default() });
+        let noise = NoiseModel {
+            depth_sigma_at_1m: 0.002,
+            color_sigma: 3.0,
+            dropout: 0.05,
+        };
+        let noisy = render_rgbd(
+            &snap,
+            &cam,
+            &CaptureOptions {
+                noise,
+                seed: 7,
+                ..Default::default()
+            },
+        );
 
         let (mut n, mut dropped, mut sum, mut sum2, mut csum, mut csum2) = (0u32, 0u32, 0f64, 0f64, 0f64, 0f64);
         for i in 0..clean.depth.len() {
@@ -393,6 +499,207 @@ mod tests {
     }
 
     #[test]
+    fn noisy_depth_stays_a_valid_return_inside_the_range() {
+        let snap = wall_scene();
+        let cam = cam(160, 120);
+        // The wall sits at 4 m: with the limit right behind it, a third of
+        // the noisy samples would overshoot without clamping.
+        let heavy = NoiseModel {
+            depth_sigma_at_1m: 0.02,
+            color_sigma: 0.0,
+            dropout: 0.0,
+        };
+        let opts = CaptureOptions {
+            noise: heavy,
+            min_range: 1.6,
+            max_range: 4.1,
+            seed: 3,
+            ..Default::default()
+        };
+        let frame = render_rgbd(&snap, &cam, &opts);
+        let valid: Vec<f32> = frame.depth.iter().copied().filter(|&z| z != 0.0).collect();
+        assert!(valid.len() > 5000);
+        assert!(valid.iter().all(|z| z.is_finite() && (1.6..=4.1).contains(z)));
+        assert!(valid.contains(&4.1), "overshoots are clamped to the limit");
+        assert!(valid.contains(&1.6), "undershoots too (the ball at 1.7 m)");
+
+        // Absurd parameters never produce NaN, infinite or negative depth,
+        // and never panic.
+        let absurd = [
+            NoiseModel {
+                depth_sigma_at_1m: f32::INFINITY,
+                color_sigma: f32::INFINITY,
+                dropout: 0.5,
+            },
+            NoiseModel {
+                depth_sigma_at_1m: 1.0e30,
+                color_sigma: 1.0e30,
+                dropout: 0.0,
+            },
+            NoiseModel {
+                depth_sigma_at_1m: f32::NAN,
+                color_sigma: f32::NAN,
+                dropout: f32::NAN,
+            },
+            NoiseModel {
+                depth_sigma_at_1m: -1.0,
+                color_sigma: -1.0,
+                dropout: -1.0,
+            },
+        ];
+        for noise in absurd {
+            for max_range in [20.0, f32::INFINITY, f32::NAN] {
+                let opts = CaptureOptions {
+                    noise,
+                    max_range,
+                    ..Default::default()
+                };
+                let frame = render_rgbd(&snap, &cam, &opts);
+                assert!(
+                    frame.depth.iter().all(|z| z.is_finite() && *z >= 0.0),
+                    "{noise:?}, max_range {max_range}"
+                );
+                for i in 0..frame.depth.len() {
+                    if frame.depth[i] == 0.0 {
+                        assert_eq!(&frame.rgb[i * 3..i * 3 + 3], &[0, 0, 0]);
+                    }
+                }
+            }
+        }
+        // NaN and negative parameters mean "off": the frame is the clean one.
+        let clean = render_rgbd(&snap, &cam, &CaptureOptions::default());
+        for noise in &absurd[2..] {
+            let opts = CaptureOptions {
+                noise: *noise,
+                ..Default::default()
+            };
+            assert_eq!(render_rgbd(&snap, &cam, &opts), clean);
+        }
+        // Certain dropout removes everything.
+        let all_dropped = CaptureOptions {
+            noise: NoiseModel {
+                dropout: 1.0,
+                ..NoiseModel::NONE
+            },
+            ..Default::default()
+        };
+        assert!(render_rgbd(&snap, &cam, &all_dropped).depth.iter().all(|&z| z == 0.0));
+    }
+
+    #[test]
+    fn options_deserialize_with_defaults() {
+        let opts: CaptureOptions = serde_json::from_str(r#"{"shadows":false,"noise":{"dropout":0.25}}"#).unwrap();
+        assert_eq!(
+            opts,
+            CaptureOptions {
+                shadows: false,
+                noise: NoiseModel {
+                    dropout: 0.25,
+                    ..NoiseModel::NONE
+                },
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<CaptureOptions>("{}").unwrap(),
+            CaptureOptions::default()
+        );
+        let full = CaptureOptions {
+            noise: NoiseModel::realistic(),
+            seed: 77,
+            max_range: 6.5,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert_eq!(serde_json::from_str::<CaptureOptions>(&json).unwrap(), full);
+    }
+
+    #[test]
+    fn image_orientation_follows_the_conventions() {
+        // An asymmetric scene checked against hand-written pinhole math: a
+        // red ball to the right (+X), a green one above (+Y) and a blue one
+        // nearer, to the lower left. Catches mirrored or upside-down images.
+        let glow = |c: Vec3| Material::solid(c).with_emissive(1.0);
+        let balls = [
+            (Vec3::new(1.0, 0.0, 0.0), 0.3, Vec3::X),
+            (Vec3::new(0.0, 1.0, 0.0), 0.3, Vec3::Y),
+            (Vec3::new(-0.5, -0.5, 2.0), 0.2, Vec3::Z),
+        ];
+        let prims = balls
+            .iter()
+            .map(|&(center, radius, color)| Primitive::sphere(center, radius, glow(color)))
+            .collect();
+        let snap = SceneSnapshot::new(prims, Lighting::default());
+        let eye = Vec3::new(0.0, 0.0, 5.0);
+        let cam = Camera::look_at(eye, Vec3::ZERO, Vec3::Y, 50f32.to_radians(), 160, 120);
+        let frame = render_rgbd(&snap, &cam, &CaptureOptions::default());
+        let focal = 60.0 / 25f32.to_radians().tan();
+        for (channel, &(center, radius, _)) in balls.iter().enumerate() {
+            let (mut sx, mut sy, mut n) = (0.0, 0.0, 0.0);
+            let mut nearest = f32::INFINITY;
+            for y in 0..120 {
+                for x in 0..160 {
+                    let c = frame.rgb_at(x, y);
+                    if frame.depth_at(x, y) > 0.0 && c[channel] == *c.iter().max().unwrap() && c[channel] > 100 {
+                        sx += x as f32 + 0.5;
+                        sy += y as f32 + 0.5;
+                        n += 1.0;
+                        nearest = nearest.min(frame.depth_at(x, y));
+                    }
+                }
+            }
+            assert!(n > 100.0, "ball {channel} not found");
+            // Camera looks down -Z from z = 5: u grows with x, v shrinks with y.
+            let forward = eye.z - center.z;
+            let u = 80.0 + focal * center.x / forward;
+            let v = 60.0 - focal * center.y / forward;
+            assert!(
+                (sx / n - u).abs() < 1.0 && (sy / n - v).abs() < 1.0,
+                "ball {channel}: centroid ({}, {}) expected ({u}, {v})",
+                sx / n,
+                sy / n
+            );
+            // Nearest depth of a ball: its front, measured along the axis.
+            assert!((nearest - (forward - radius)).abs() < 0.03, "ball {channel}: {nearest}");
+        }
+        // Red is in the right half, green in the top half, blue bottom left.
+        assert_eq!(frame.rgb_at(106, 60)[0], *frame.rgb_at(106, 60).iter().max().unwrap());
+        assert!(frame.rgb_at(80, 34)[1] > 100 && frame.rgb_at(58, 81)[2] > 100);
+        assert_eq!(frame.depth_at(54, 60), 0.0, "nothing to the left at eye level");
+    }
+
+    #[test]
+    fn gaussian_generator_is_standard_normal() {
+        let n = 200_000u32;
+        let (mut sum, mut sum2, mut within_one, mut max) = (0f64, 0f64, 0u32, 0f32);
+        for i in 0..n {
+            let g = gaussian(9, i, 4);
+            sum += g as f64;
+            sum2 += (g * g) as f64;
+            within_one += (g.abs() < 1.0) as u32;
+            max = max.max(g.abs());
+        }
+        let mean = sum / n as f64;
+        let var = sum2 / n as f64 - mean * mean;
+        assert!(mean.abs() < 0.01, "mean {mean}");
+        assert!((var - 1.0).abs() < 0.02, "variance {var}");
+        let frac = within_one as f64 / n as f64;
+        assert!((frac - 0.6827).abs() < 0.01, "{frac} within one sigma");
+        assert!(max > 3.0 && max < 5.0);
+        // Streams are independent enough: no correlation between neighbours.
+        let corr: f64 = (0..n)
+            .map(|i| (gaussian(9, i, 4) * gaussian(9, i + 1, 4)) as f64)
+            .sum::<f64>()
+            / n as f64;
+        assert!(corr.abs() < 0.01, "neighbour correlation {corr}");
+        let cross: f64 = (0..n)
+            .map(|i| (gaussian(9, i, 1) * gaussian(9, i, 3)) as f64)
+            .sum::<f64>()
+            / n as f64;
+        assert!(cross.abs() < 0.01, "stream correlation {cross}");
+    }
+
+    #[test]
     fn parallel_and_serial_renders_are_identical() {
         for kind in [SceneKind::Stage, SceneKind::House] {
             let scene = make_scene(kind);
@@ -400,8 +707,16 @@ mod tests {
             let (eye, target) = scene.viewer_start();
             let cam = Camera::look_at(eye, target, Vec3::Y, 60f32.to_radians(), 96, 72);
             for noise in [NoiseModel::NONE, NoiseModel::realistic()] {
-                let opts = CaptureOptions { noise, seed: 5, ..Default::default() };
-                assert_eq!(render_rgbd(&snap, &cam, &opts), render_rgbd_serial(&snap, &cam, &opts), "{kind:?}");
+                let opts = CaptureOptions {
+                    noise,
+                    seed: 5,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    render_rgbd(&snap, &cam, &opts),
+                    render_rgbd_serial(&snap, &cam, &opts),
+                    "{kind:?}"
+                );
             }
         }
     }

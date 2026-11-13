@@ -32,11 +32,19 @@ struct Canvas {
 
 impl Canvas {
     fn new(width: u32, height: u32) -> Self {
-        Self { width, height, rgb: vec![24; (width * height * 3) as usize] }
+        Self {
+            width,
+            height,
+            rgb: vec![24; (width * height * 3) as usize],
+        }
     }
 
     fn from_frame(frame: &RgbdFrame) -> Self {
-        Self { width: frame.width, height: frame.height, rgb: frame.rgb.clone() }
+        Self {
+            width: frame.width,
+            height: frame.height,
+            rgb: frame.rgb.clone(),
+        }
     }
 
     fn put(&mut self, x: i32, y: i32, c: [u8; 3]) {
@@ -124,22 +132,45 @@ fn stage(out: &Path) {
     for (eye, target) in views {
         let cam = Camera::look_at(eye, target, Vec3::Y, 36f32.to_radians(), 230, 300);
         for k in 0..columns {
-            let snap = scene.snapshot(period * k as f32 / columns as f32);
+            let snap = scene.snapshot(period * (k as f32 + 0.3) / columns as f32);
             frames.push(render_reference(&snap, &cam, true, 2, BACKDROP));
         }
     }
     contact_sheet(&frames, columns).save(&out.join("stage_sheet.png"));
 
     // Larger renders.
-    let cam = Camera::look_at(Vec3::new(1.2, 1.5, 3.3), Vec3::new(0.0, 0.95, 0.0), Vec3::Y, 38f32.to_radians(), 440, 560);
-    let closeups: Vec<RgbdFrame> =
-        [0.07, 0.3, 0.6, 0.86].iter().map(|u| render_reference(&scene.snapshot(period * u), &cam, true, 2, BACKDROP)).collect();
+    let cam = Camera::look_at(
+        Vec3::new(1.2, 1.5, 3.3),
+        Vec3::new(0.0, 0.95, 0.0),
+        Vec3::Y,
+        38f32.to_radians(),
+        440,
+        560,
+    );
+    let closeups: Vec<RgbdFrame> = [0.1, 0.36, 0.6, 0.86]
+        .iter()
+        .map(|u| render_reference(&scene.snapshot(period * u), &cam, true, 2, BACKDROP))
+        .collect();
     contact_sheet(&closeups, 4).save(&out.join("stage_closeup.png"));
 
     // The whole stage from the default viewer position.
     let (eye, target) = scene.viewer_start();
-    let cam = Camera::look_at(eye + Vec3::new(1.5, 1.2, 1.5), target, Vec3::Y, 55f32.to_radians(), 640, 420);
-    Canvas::from_frame(&render_reference(&scene.snapshot(period * 0.3), &cam, true, 2, BACKDROP)).save(&out.join("stage_wide.png"));
+    let cam = Camera::look_at(
+        eye + Vec3::new(1.5, 1.2, 1.5),
+        target,
+        Vec3::Y,
+        55f32.to_radians(),
+        640,
+        420,
+    );
+    Canvas::from_frame(&render_reference(
+        &scene.snapshot(period * 0.3),
+        &cam,
+        true,
+        2,
+        BACKDROP,
+    ))
+    .save(&out.join("stage_wide.png"));
 
     // What the ring cameras deliver: RGB on top, depth below, realistic noise.
     let rig = RingRig::default();
@@ -151,9 +182,16 @@ fn stage(out: &Path) {
     let rows = cams.len().div_ceil(per_row) as u32;
     let mut canvas = Canvas::new(per_row as u32 * (w + 4) + 4, rows * (2 * h + 12) + 4);
     for (i, cam) in cams.iter().enumerate() {
-        let opts = CaptureOptions { noise: NoiseModel::realistic(), seed: i as u32, ..Default::default() };
+        let opts = CaptureOptions {
+            noise: NoiseModel::realistic(),
+            seed: i as u32,
+            ..Default::default()
+        };
         let frame = render_rgbd(&snap, cam, &opts);
-        let (x, y) = (4 + (i % per_row) as u32 * (w + 4), 4 + (i / per_row) as u32 * (2 * h + 12));
+        let (x, y) = (
+            4 + (i % per_row) as u32 * (w + 4),
+            4 + (i / per_row) as u32 * (2 * h + 12),
+        );
         canvas.paste(x, y, rig.width, rig.height, &frame.rgb, zoom);
         canvas.paste(x, y + h + 4, rig.width, rig.height, &depth_image(&frame), zoom);
     }
@@ -176,7 +214,14 @@ fn house(out: &Path) {
     let frames: Vec<RgbdFrame> = views
         .iter()
         .map(|(_, eye, target)| {
-            let cam = Camera::look_at(Vec3::from(*eye), Vec3::from(*target), Vec3::Y, 72f32.to_radians(), 480, 360);
+            let cam = Camera::look_at(
+                Vec3::from(*eye),
+                Vec3::from(*target),
+                Vec3::Y,
+                72f32.to_radians(),
+                480,
+                360,
+            );
             render_reference(&snap, &cam, true, 2, [255, 0, 255])
         })
         .collect();
@@ -194,7 +239,14 @@ fn house(out: &Path) {
     let frames: Vec<RgbdFrame> = views2
         .iter()
         .map(|(eye, target)| {
-            let cam = Camera::look_at(Vec3::from(*eye), Vec3::from(*target), Vec3::Y, 72f32.to_radians(), 480, 360);
+            let cam = Camera::look_at(
+                Vec3::from(*eye),
+                Vec3::from(*target),
+                Vec3::Y,
+                72f32.to_radians(),
+                480,
+                360,
+            );
             render_reference(&snap, &cam, true, 2, [255, 0, 255])
         })
         .collect();
@@ -211,11 +263,23 @@ fn house(out: &Path) {
         })
         .collect();
     contact_sheet(&frames, 6).save(&out.join("house_tour.png"));
-    println!("tour: {:.1} m, {:.1} s, {} waypoints", path.length(), path.duration(), path.waypoints().len());
+    println!(
+        "tour: {:.1} m, {:.1} s, {} waypoints",
+        path.length(),
+        path.duration(),
+        path.waypoints().len()
+    );
 
     // Floor plan: ceiling removed, seen from far above (nearly orthographic).
     let open = HouseScene::with_options(HouseOptions { ceiling: false }).snapshot(0.0);
-    let cam = Camera::look_at(Vec3::new(0.0, 60.0, 0.0), Vec3::ZERO, Vec3::NEG_Z, 12.2f32.to_radians(), 1200, 900);
+    let cam = Camera::look_at(
+        Vec3::new(0.0, 60.0, 0.0),
+        Vec3::ZERO,
+        Vec3::NEG_Z,
+        12.2f32.to_radians(),
+        1200,
+        900,
+    );
     let mut plan = Canvas::from_frame(&render_reference(&open, &cam, true, 2, [20, 20, 24]));
     for (i, p) in path.polyline(900).iter().enumerate() {
         if let Some((px, py, _)) = cam.project(*p) {

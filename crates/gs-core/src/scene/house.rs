@@ -65,12 +65,19 @@ impl Room {
 
     /// Center of the room at floor level.
     pub fn center(&self) -> Vec3 {
-        Vec3::new(0.5 * (self.min[0] + self.max[0]), 0.0, 0.5 * (self.min[1] + self.max[1]))
+        Vec3::new(
+            0.5 * (self.min[0] + self.max[0]),
+            0.0,
+            0.5 * (self.min[1] + self.max[1]),
+        )
     }
 
     /// The room volume from floor to ceiling.
     pub fn aabb(&self) -> Aabb {
-        Aabb::new(Vec3::new(self.min[0], 0.0, self.min[1]), Vec3::new(self.max[0], CEILING_HEIGHT, self.max[1]))
+        Aabb::new(
+            Vec3::new(self.min[0], 0.0, self.min[1]),
+            Vec3::new(self.max[0], CEILING_HEIGHT, self.max[1]),
+        )
     }
 
     /// True when the point lies inside the room rectangle (any height).
@@ -79,12 +86,36 @@ impl Room {
     }
 }
 
-const LIVING: Room = Room { name: "living", min: [-5.5, -4.0], max: [0.5, 0.2] };
-const KITCHEN: Room = Room { name: "kitchen", min: [0.5, -4.0], max: [5.5, 0.2] };
-const DINING: Room = Room { name: "dining", min: [3.0, 0.2], max: [5.5, 4.0] };
-const HALL: Room = Room { name: "hall", min: [-1.0, 0.2], max: [0.4, 4.0] };
-const BEDROOM: Room = Room { name: "bedroom", min: [-5.5, 0.2], max: [-1.0, 4.0] };
-const BATH: Room = Room { name: "bathroom", min: [0.4, 0.2], max: [3.0, 4.0] };
+const LIVING: Room = Room {
+    name: "living",
+    min: [-5.5, -4.0],
+    max: [0.5, 0.2],
+};
+const KITCHEN: Room = Room {
+    name: "kitchen",
+    min: [0.5, -4.0],
+    max: [5.5, 0.2],
+};
+const DINING: Room = Room {
+    name: "dining",
+    min: [3.0, 0.2],
+    max: [5.5, 4.0],
+};
+const HALL: Room = Room {
+    name: "hall",
+    min: [-1.0, 0.2],
+    max: [0.4, 4.0],
+};
+const BEDROOM: Room = Room {
+    name: "bedroom",
+    min: [-5.5, 0.2],
+    max: [-1.0, 4.0],
+};
+const BATH: Room = Room {
+    name: "bathroom",
+    min: [0.4, 0.2],
+    max: [3.0, 4.0],
+};
 
 /// All rooms. Together their rectangles tile the interior.
 pub const ROOMS: [Room; 6] = [LIVING, KITCHEN, DINING, HALL, BEDROOM, BATH];
@@ -106,11 +137,41 @@ pub struct Door {
 
 /// All passages between rooms: three doors and two wide open-plan openings.
 pub const DOORS: [Door; 5] = [
-    Door { rooms: ["hall", "living"], center: Vec3::new(-0.3, 0.0, 0.2), width: 0.94, through: Vec3::Z, height: DOOR_HEIGHT },
-    Door { rooms: ["hall", "bedroom"], center: Vec3::new(-1.0, 0.0, 2.0), width: 0.94, through: Vec3::X, height: DOOR_HEIGHT },
-    Door { rooms: ["hall", "bathroom"], center: Vec3::new(0.4, 0.0, 3.0), width: 0.94, through: Vec3::X, height: DOOR_HEIGHT },
-    Door { rooms: ["living", "kitchen"], center: Vec3::new(0.5, 0.0, -1.3), width: 2.84, through: Vec3::X, height: CEILING_HEIGHT },
-    Door { rooms: ["kitchen", "dining"], center: Vec3::new(4.25, 0.0, 0.2), width: 2.3, through: Vec3::Z, height: CEILING_HEIGHT },
+    Door {
+        rooms: ["hall", "living"],
+        center: Vec3::new(-0.3, 0.0, 0.2),
+        width: 0.94,
+        through: Vec3::Z,
+        height: DOOR_HEIGHT,
+    },
+    Door {
+        rooms: ["hall", "bedroom"],
+        center: Vec3::new(-1.0, 0.0, 2.0),
+        width: 0.94,
+        through: Vec3::X,
+        height: DOOR_HEIGHT,
+    },
+    Door {
+        rooms: ["hall", "bathroom"],
+        center: Vec3::new(0.4, 0.0, 3.0),
+        width: 0.94,
+        through: Vec3::X,
+        height: DOOR_HEIGHT,
+    },
+    Door {
+        rooms: ["living", "kitchen"],
+        center: Vec3::new(0.5, 0.0, -1.3),
+        width: 2.84,
+        through: Vec3::X,
+        height: CEILING_HEIGHT,
+    },
+    Door {
+        rooms: ["kitchen", "dining"],
+        center: Vec3::new(4.25, 0.0, 0.2),
+        width: 2.3,
+        through: Vec3::Z,
+        height: CEILING_HEIGHT,
+    },
 ];
 
 /// Control points (at [`EYE_HEIGHT`]) of the default walk-through.
@@ -120,18 +181,19 @@ pub const DOORS: [Door; 5] = [
 /// coffee table, crosses the kitchen behind the island and ends in the
 /// dining nook. Feed them to a smooth spline (see `rig::ScanPath`).
 pub fn tour_waypoints() -> Vec<Vec3> {
-    const XZ: [[f32; 2]; 44] = [
+    const XZ: &[[f32; 2]] = &[
         // Hallway, from the front door.
         [-0.30, 3.45],
         [-0.30, 2.85],
         [-0.52, 2.25],
         // Bedroom: in through the door, a loop between bed and wardrobe, out.
         [-1.00, 2.00],
-        [-1.65, 1.95],
-        [-2.35, 1.50],
-        [-2.90, 1.85],
-        [-2.60, 2.40],
-        [-1.75, 2.12],
+        [-1.70, 1.78],
+        [-2.35, 1.36],
+        [-2.92, 1.78],
+        [-2.80, 2.38],
+        [-2.25, 2.60],
+        [-1.68, 2.28],
         [-1.00, 2.00],
         // Across the hallway into the bathroom.
         [-0.42, 2.18],
@@ -139,12 +201,13 @@ pub fn tour_waypoints() -> Vec<Vec3> {
         [0.00, 2.98],
         [0.40, 3.00],
         [0.95, 2.92],
-        [1.50, 2.35],
-        [1.55, 1.65],
-        [1.10, 1.40],
-        [0.92, 1.92],
-        [0.93, 2.58],
-        [0.72, 2.96],
+        [1.60, 2.60],
+        [1.85, 2.00],
+        [1.60, 1.42],
+        [1.05, 1.38],
+        [0.85, 1.95],
+        [0.90, 2.50],
+        [0.72, 2.94],
         [0.40, 3.00],
         [0.00, 2.92],
         // Up the hallway into the living room.
@@ -171,7 +234,8 @@ pub fn tour_waypoints() -> Vec<Vec3> {
         [4.38, -0.70],
         // Into the dining nook.
         [4.30, 0.20],
-        [4.25, 0.80],
+        [4.22, 0.80],
+        [4.25, 1.30],
     ];
     XZ.iter().map(|p| Vec3::new(p[0], EYE_HEIGHT, p[1])).collect()
 }
@@ -210,7 +274,9 @@ impl HouseScene {
 
     /// The house with build options (for example without its ceiling).
     pub fn with_options(options: HouseOptions) -> Self {
-        Self { snapshot: SceneSnapshot::new(build(options), lighting()) }
+        Self {
+            snapshot: SceneSnapshot::new(build(options), lighting()),
+        }
     }
 
     /// The rooms of the house.
@@ -255,15 +321,17 @@ impl Scene for HouseScene {
 
 fn lighting() -> Lighting {
     let warm = Vec3::new(0.80, 0.76, 0.68);
-    let lamp = |room: &Room, x: f32, y: f32, z: f32| Light::point(Vec3::new(x, y, z), 3.0, warm).with_region(room.aabb());
+    let lamp =
+        |room: &Room, x: f32, y: f32, z: f32| Light::point(Vec3::new(x, y, z), 3.0, warm).with_region(room.aabb());
     Lighting {
         ambient_sky: Vec3::new(0.40, 0.40, 0.41),
         // Strong bounce from the floor keeps ceilings and undersides readable.
         ambient_ground: Vec3::new(0.50, 0.49, 0.47),
         lights: vec![
             lamp(&LIVING, -2.6, 2.25, -1.9),
-            lamp(&KITCHEN, 3.0, 2.25, -2.6),
-            lamp(&DINING, 4.25, 2.25, 1.2),
+            lamp(&KITCHEN, 3.0, 2.25, -1.5),
+            // The dining light is the pendant itself, just under its shade.
+            lamp(&DINING, 4.25, 1.56, 2.4),
             lamp(&HALL, -0.3, 2.25, 2.1),
             lamp(&BEDROOM, -2.6, 2.25, 2.0),
             lamp(&BATH, 1.5, 2.25, 2.2),
@@ -287,13 +355,18 @@ struct Builder {
 
 impl Builder {
     fn new() -> Self {
-        Self { prims: Vec::with_capacity(640), frame: Affine3A::IDENTITY, rng: 0x1234_5678 }
+        Self {
+            prims: Vec::with_capacity(640),
+            frame: Affine3A::IDENTITY,
+            rng: 0x1234_5678,
+        }
     }
 
     /// Places the local frame at floor point `(x, z)`, rotated by `yaw_deg`
     /// about Y (0 faces +Z, 90 faces +X, 180 faces -Z, -90 faces -X).
     fn at(&mut self, x: f32, z: f32, yaw_deg: f32) {
-        self.frame = Affine3A::from_rotation_translation(Quat::from_rotation_y(yaw_deg.to_radians()), Vec3::new(x, 0.0, z));
+        self.frame =
+            Affine3A::from_rotation_translation(Quat::from_rotation_y(yaw_deg.to_radians()), Vec3::new(x, 0.0, z));
     }
 
     /// Back to world coordinates.
@@ -323,13 +396,18 @@ impl Builder {
 
     /// Box rotated about its own center.
     fn bx_rot(&mut self, center: [f32; 3], half: [f32; 3], rot: Quat, material: Material) {
-        self.push(Shape::Box, Affine3A::from_scale_rotation_translation(half.into(), rot, center.into()), material);
+        self.push(
+            Shape::Box,
+            Affine3A::from_scale_rotation_translation(half.into(), rot, center.into()),
+            material,
+        );
     }
 
     /// Upright cylinder standing on `base`.
     fn cyl(&mut self, base: [f32; 3], radius: f32, height: f32, material: Material) {
         let center = Vec3::from(base) + Vec3::Y * (0.5 * height);
-        let local = Affine3A::from_scale_rotation_translation(Vec3::new(radius, 0.5 * height, radius), Quat::IDENTITY, center);
+        let local =
+            Affine3A::from_scale_rotation_translation(Vec3::new(radius, 0.5 * height, radius), Quat::IDENTITY, center);
         self.push(Shape::Cylinder, local, material);
     }
 
@@ -348,7 +426,14 @@ impl Builder {
         let r = r_bottom.max(r_top);
         let center = Vec3::from(base) + Vec3::Y * (0.5 * height);
         let local = Affine3A::from_scale_rotation_translation(Vec3::new(r, 0.5 * height, r), Quat::IDENTITY, center);
-        self.push(Shape::Cone { r0: r_bottom / r, r1: r_top / r }, local, material);
+        self.push(
+            Shape::Cone {
+                r0: r_bottom / r,
+                r1: r_top / r,
+            },
+            local,
+            material,
+        );
     }
 
     /// Ellipsoid.
@@ -357,7 +442,11 @@ impl Builder {
     }
 
     fn ell_rot(&mut self, center: [f32; 3], radii: [f32; 3], rot: Quat, material: Material) {
-        self.push(Shape::Sphere, Affine3A::from_scale_rotation_translation(radii.into(), rot, center.into()), material);
+        self.push(
+            Shape::Sphere,
+            Affine3A::from_scale_rotation_translation(radii.into(), rot, center.into()),
+            material,
+        );
     }
 }
 
@@ -388,11 +477,21 @@ struct Opening {
 }
 
 const fn door(side: Side, from: f32, to: f32) -> Opening {
-    Opening { side, from, to, top: DOOR_HEIGHT }
+    Opening {
+        side,
+        from,
+        to,
+        top: DOOR_HEIGHT,
+    }
 }
 
 const fn open(side: Side, from: f32, to: f32) -> Opening {
-    Opening { side, from, to, top: CEILING_HEIGHT }
+    Opening {
+        side,
+        from,
+        to,
+        top: CEILING_HEIGHT,
+    }
 }
 
 /// Floor, wall skins (with openings), lintels and baseboards of one room.
@@ -403,7 +502,11 @@ fn room_shell(b: &mut Builder, room: &Room, wall: Material, floor: Material, ope
     b.bx([x0, -0.1, z0], [x1, 0.0, z1], floor);
     let baseboard = solid(0xf4f1ea);
     for side in [Side::North, Side::South, Side::West, Side::East] {
-        let (lo, hi) = if matches!(side, Side::North | Side::South) { (x0, x1) } else { (z0, z1) };
+        let (lo, hi) = if matches!(side, Side::North | Side::South) {
+            (x0, x1)
+        } else {
+            (z0, z1)
+        };
         // Box along the wall between `s0` and `s1`, from `inner` to `outer`
         // distance off the room edge.
         let slab = |b: &mut Builder, s0: f32, s1: f32, depth: f32, y0: f32, y1: f32, m: Material| match side {
@@ -415,7 +518,12 @@ fn room_shell(b: &mut Builder, room: &Room, wall: Material, floor: Material, ope
         let mut gaps: Vec<&Opening> = openings.iter().filter(|o| o.side == side).collect();
         gaps.sort_by(|a, b| a.from.total_cmp(&b.from));
         let mut cursor = lo;
-        for gap in gaps.iter().copied().chain(core::iter::once(&Opening { side, from: hi, to: hi, top: CEILING_HEIGHT })) {
+        for gap in gaps.iter().copied().chain(core::iter::once(&Opening {
+            side,
+            from: hi,
+            to: hi,
+            top: CEILING_HEIGHT,
+        })) {
             if gap.from > cursor + 1e-4 {
                 slab(b, cursor, gap.from, SKIN, 0.0, CEILING_HEIGHT, wall);
                 slab(b, cursor, gap.from, SKIN + 0.012, 0.0, 0.09, baseboard);
@@ -433,7 +541,7 @@ fn room_shell(b: &mut Builder, room: &Room, wall: Material, floor: Material, ope
 fn door_lining(b: &mut Builder, along_x: bool, wall: f32, from: f32, to: f32) {
     let m = solid(0xf7f5f0);
     let (d, t) = (SKIN + 0.018, 0.03);
-    let mut piece = |b: &mut Builder, s0: f32, s1: f32, y0: f32, y1: f32| {
+    let piece = |b: &mut Builder, s0: f32, s1: f32, y0: f32, y1: f32| {
         if along_x {
             b.bx([s0, y0, wall - d], [s1, y1, wall + d], m);
         } else {
@@ -455,17 +563,23 @@ enum Facing {
     NegZ,
 }
 
+impl Facing {
+    /// Yaw that turns a local +Z front toward this direction.
+    fn yaw_deg(self) -> f32 {
+        match self {
+            Facing::PosZ => 0.0,
+            Facing::PosX => 90.0,
+            Facing::NegZ => 180.0,
+            Facing::NegX => -90.0,
+        }
+    }
+}
+
 /// Framed flat panel on a wall (window, picture, mirror, screen).
 ///
 /// `center` lies on the wall surface; `width` runs along the wall.
 fn panel(b: &mut Builder, facing: Facing, center: [f32; 3], width: f32, height: f32, frame: Material, inner: Material) {
-    let yaw = match facing {
-        Facing::PosZ => 0.0,
-        Facing::PosX => 90.0,
-        Facing::NegZ => 180.0,
-        Facing::NegX => -90.0,
-    };
-    b.at(center[0], center[2], yaw);
+    b.at(center[0], center[2], facing.yaw_deg());
     let (w, h, y) = (0.5 * width, 0.5 * height, center[1]);
     b.bx([-w, y - h, 0.0], [w, y + h, 0.03], frame);
     let rim = 0.045;
@@ -477,15 +591,10 @@ fn panel(b: &mut Builder, facing: Facing, center: [f32; 3], width: f32, height: 
 fn window(b: &mut Builder, facing: Facing, center: [f32; 3], width: f32, height: f32) {
     let white = solid(0xfbfaf6);
     // Sky gradient, brighter toward the top.
-    let pane = Material::gradient(srgb(0xd8ecff), srgb(0x9ccbff), Axis::Y, -0.5 * height, 0.5 * height).with_emissive(1.4);
+    let pane =
+        Material::gradient(srgb(0xd8ecff), srgb(0x9ccbff), Axis::Y, -0.5 * height, 0.5 * height).with_emissive(1.4);
     panel(b, facing, center, width, height, white, pane);
-    let yaw = match facing {
-        Facing::PosZ => 0.0,
-        Facing::PosX => 90.0,
-        Facing::NegZ => 180.0,
-        Facing::NegX => -90.0,
-    };
-    b.at(center[0], center[2], yaw);
+    b.at(center[0], center[2], facing.yaw_deg());
     let (w, h, y) = (0.5 * width, 0.5 * height, center[1]);
     b.bx([-0.02, y - h, 0.0], [0.02, y + h, 0.046], white);
     b.bx([-w, y - 0.02, 0.0], [w, y + 0.02, 0.046], white);
@@ -513,8 +622,18 @@ fn sofa(b: &mut Builder) {
         }
     }
     // Throw pillows.
-    b.ell_rot([-0.62, 0.66, -0.04], [0.2, 0.2, 0.075], Quat::from_rotation_x(-0.35), Material::stripes(srgb(0xe9b44c), srgb(0xf6e7c1), Axis::X, 0.05));
-    b.ell_rot([0.5, 0.66, -0.04], [0.19, 0.19, 0.075], Quat::from_rotation_x(-0.35) * Quat::from_rotation_z(0.5), Material::dots(srgb(0xc8553d), srgb(0xf6e7c1), 0.08, 0.025));
+    b.ell_rot(
+        [-0.62, 0.66, -0.04],
+        [0.2, 0.2, 0.075],
+        Quat::from_rotation_x(-0.35),
+        Material::stripes(srgb(0xe9b44c), srgb(0xf6e7c1), Axis::X, 0.05),
+    );
+    b.ell_rot(
+        [0.5, 0.66, -0.04],
+        [0.19, 0.19, 0.075],
+        Quat::from_rotation_x(-0.35) * Quat::from_rotation_z(0.5),
+        Material::dots(srgb(0xc8553d), srgb(0xf6e7c1), 0.08, 0.025),
+    );
 }
 
 fn armchair(b: &mut Builder) {
@@ -530,7 +649,12 @@ fn armchair(b: &mut Builder) {
         }
     }
     b.bx([-0.27, 0.40, -0.24], [0.27, 0.50, 0.41], cushion);
-    b.ell_rot([0.0, 0.64, -0.17], [0.2, 0.17, 0.07], Quat::from_rotation_x(-0.3), Material::checker(srgb(0x2f6f86), srgb(0xf1ead8), 0.06));
+    b.ell_rot(
+        [0.0, 0.64, -0.17],
+        [0.2, 0.17, 0.07],
+        Quat::from_rotation_x(-0.3),
+        Material::checker(srgb(0x2f6f86), srgb(0xf1ead8), 0.06),
+    );
 }
 
 fn coffee_table(b: &mut Builder) {
@@ -542,9 +666,25 @@ fn coffee_table(b: &mut Builder) {
         b.bx([x - 0.022, 0.0, z - 0.022], [x + 0.022, 0.38, z + 0.022], dark);
     }
     // A stack of books and a small vase with a sprig.
-    b.bx_rot([-0.3, 0.435, 0.05], [0.13, 0.015, 0.09], Quat::from_rotation_y(0.3), solid(0xb5443a));
-    b.bx_rot([-0.3, 0.462, 0.05], [0.11, 0.012, 0.08], Quat::from_rotation_y(-0.15), solid(0x3d6fa5));
-    b.cone([0.3, 0.42, -0.05], 0.045, 0.07, 0.16, Material::stripes(srgb(0xf1ead8), srgb(0x3e7c6a), Axis::Y, 0.02));
+    b.bx_rot(
+        [-0.3, 0.435, 0.05],
+        [0.13, 0.015, 0.09],
+        Quat::from_rotation_y(0.3),
+        solid(0xb5443a),
+    );
+    b.bx_rot(
+        [-0.3, 0.462, 0.05],
+        [0.11, 0.012, 0.08],
+        Quat::from_rotation_y(-0.15),
+        solid(0x3d6fa5),
+    );
+    b.cone(
+        [0.3, 0.42, -0.05],
+        0.045,
+        0.07,
+        0.16,
+        Material::stripes(srgb(0xf1ead8), srgb(0x3e7c6a), Axis::Y, 0.02),
+    );
     b.ell([0.3, 0.66, -0.05], [0.07, 0.1, 0.07], solid(0x4f9a4b));
 }
 
@@ -564,10 +704,23 @@ fn tv_unit(b: &mut Builder) {
     b.bx([-0.78, 0.58, -0.04], [0.78, 1.48, 0.0], black);
     let picture = Material::gradient(srgb(0x24408f), srgb(0xe07a3f), Axis::X, -0.75, 0.75).with_emissive(0.8);
     b.bx([-0.75, 0.61, 0.0], [0.75, 1.45, 0.006], picture);
-    b.bx([-0.75, 0.61, 0.0], [0.75, 0.9, 0.008], Material::rings(srgb(0x1b2f6b), srgb(0x2f8f6b), Axis::Z, 0.11).with_emissive(0.6));
+    b.bx(
+        [-0.75, 0.61, 0.0],
+        [0.75, 0.9, 0.008],
+        Material::rings(srgb(0x1b2f6b), srgb(0x2f8f6b), Axis::Z, 0.11).with_emissive(0.6),
+    );
     // Speaker and a decorative box.
-    b.bx([0.72, 0.5, -0.12], [0.94, 0.86, 0.1], Material::checker(srgb(0x33363c), srgb(0x24262b), 0.02));
-    b.cyl([-0.84, 0.5, 0.0], 0.07, 0.2, Material::stripes(srgb(0xd9772b), srgb(0xf1ead8), Axis::Y, 0.04));
+    b.bx(
+        [0.72, 0.5, -0.12],
+        [0.94, 0.86, 0.1],
+        Material::checker(srgb(0x33363c), srgb(0x24262b), 0.02),
+    );
+    b.cyl(
+        [-0.84, 0.5, 0.0],
+        0.07,
+        0.2,
+        Material::stripes(srgb(0xd9772b), srgb(0xf1ead8), Axis::Y, 0.04),
+    );
 }
 
 fn bookshelf(b: &mut Builder) {
@@ -576,7 +729,9 @@ fn bookshelf(b: &mut Builder) {
     b.bx([-w, 0.0, -d], [-w + 0.03, h, d], wood);
     b.bx([w - 0.03, 0.0, -d], [w, h, d], wood);
     b.bx([-w, 0.0, -d], [w, h, -d + 0.015], solid(0xcfc6b2));
-    let palette = [0xb5443a, 0x3d6fa5, 0xe2b13c, 0x3e7c6a, 0x7b4f8e, 0xd9772b, 0x2f3a4f, 0xf1ead8, 0x8c2f39, 0x4f9a4b];
+    let palette = [
+        0xb5443a, 0x3d6fa5, 0xe2b13c, 0x3e7c6a, 0x7b4f8e, 0xd9772b, 0x2f3a4f, 0xf1ead8, 0x8c2f39, 0x4f9a4b,
+    ];
     let shelves = 5;
     let pitch = (h - 0.08) / shelves as f32;
     for s in 0..=shelves {
@@ -600,7 +755,11 @@ fn bookshelf(b: &mut Builder) {
         if s % 2 == 1 {
             let cx = w - 0.19;
             match s {
-                1 => b.ell([cx, y + 0.1, 0.0], [0.09, 0.1, 0.09], Material::stripes(srgb(0x3d6fa5), srgb(0xf1ead8), Axis::Y, 0.03)),
+                1 => b.ell(
+                    [cx, y + 0.1, 0.0],
+                    [0.09, 0.1, 0.09],
+                    Material::stripes(srgb(0x3d6fa5), srgb(0xf1ead8), Axis::Y, 0.03),
+                ),
                 _ => b.cone([cx, y, 0.0], 0.08, 0.03, 0.2, solid(0xd9772b)),
             }
         }
@@ -611,11 +770,23 @@ fn floor_lamp(b: &mut Builder) {
     let metal = solid(0x2b2b2e);
     b.cyl([0.0, 0.0, 0.0], 0.16, 0.025, metal);
     b.cyl([0.0, 0.0, 0.0], 0.015, 1.45, metal);
-    b.cone([0.0, 1.42, 0.0], 0.2, 0.12, 0.3, Material::solid(srgb(0xffe2a8)).with_emissive(0.9));
+    b.cone(
+        [0.0, 1.42, 0.0],
+        0.2,
+        0.12,
+        0.3,
+        Material::solid(srgb(0xffe2a8)).with_emissive(0.9),
+    );
 }
 
 fn plant(b: &mut Builder, scale: f32) {
-    b.cone([0.0, 0.0, 0.0], 0.13 * scale, 0.19 * scale, 0.36 * scale, Material::stripes(srgb(0xc2643c), srgb(0xb0552f), Axis::Y, 0.06));
+    b.cone(
+        [0.0, 0.0, 0.0],
+        0.13 * scale,
+        0.19 * scale,
+        0.36 * scale,
+        Material::stripes(srgb(0xc2643c), srgb(0xb0552f), Axis::Y, 0.06),
+    );
     b.cyl([0.0, 0.33 * scale, 0.0], 0.175 * scale, 0.03 * scale, solid(0x3a2a1e));
     b.cyl([0.0, 0.36 * scale, 0.0], 0.018 * scale, 0.5 * scale, solid(0x5b4630));
     let leaf = Material::stripes(srgb(0x3f8f4a), srgb(0x2f7a3d), Axis::X, 0.03);
@@ -651,12 +822,24 @@ fn bed(b: &mut Builder) {
     b.bx([-0.82, 0.0, -1.05], [0.82, 0.28, 1.05], wood);
     b.bx([-0.78, 0.28, -1.0], [0.78, 0.5, 1.03], solid(0xf4f1ea));
     // Duvet over the lower two thirds, then a folded throw at the foot.
-    b.bx([-0.81, 0.3, -0.3], [0.81, 0.56, 1.045], Material::stripes(srgb(0x4a6fa5), srgb(0xdfe7f2), Axis::Z, 0.12));
-    b.bx([-0.815, 0.3, 0.52], [0.815, 0.585, 0.95], Material::checker(srgb(0xd9772b), srgb(0xe9b44c), 0.1));
+    b.bx(
+        [-0.81, 0.3, -0.3],
+        [0.81, 0.56, 1.045],
+        Material::stripes(srgb(0x4a6fa5), srgb(0xdfe7f2), Axis::Z, 0.12),
+    );
+    b.bx(
+        [-0.815, 0.3, 0.52],
+        [0.815, 0.585, 0.95],
+        Material::checker(srgb(0xd9772b), srgb(0xe9b44c), 0.1),
+    );
     b.ell([-0.38, 0.58, -0.7], [0.33, 0.085, 0.2], solid(0xfbfaf6));
     b.ell([0.38, 0.58, -0.7], [0.33, 0.085, 0.2], solid(0xc9d8ec));
     // Upholstered headboard.
-    b.bx([-0.88, 0.0, -1.13], [0.88, 1.12, -1.05], Material::checker(srgb(0x5b5f73), srgb(0x666b80), 0.22));
+    b.bx(
+        [-0.88, 0.0, -1.13],
+        [0.88, 1.12, -1.05],
+        Material::checker(srgb(0x5b5f73), srgb(0x666b80), 0.22),
+    );
 }
 
 fn nightstand(b: &mut Builder) {
@@ -668,7 +851,13 @@ fn nightstand(b: &mut Builder) {
     // Bedside lamp.
     b.cyl([0.0, 0.5, -0.02], 0.06, 0.02, solid(0x2b2b2e));
     b.cyl([0.0, 0.5, -0.02], 0.012, 0.22, solid(0x2b2b2e));
-    b.cone([0.0, 0.69, -0.02], 0.11, 0.07, 0.16, Material::solid(srgb(0xffd9a0)).with_emissive(0.9));
+    b.cone(
+        [0.0, 0.69, -0.02],
+        0.11,
+        0.07,
+        0.16,
+        Material::solid(srgb(0xffd9a0)).with_emissive(0.9),
+    );
 }
 
 fn wardrobe(b: &mut Builder) {
@@ -696,11 +885,22 @@ fn desk(b: &mut Builder) {
     b.bx([-0.36, 0.74, -0.12], [-0.02, 0.755, 0.12], solid(0x9a9da3));
     let tilt = Quat::from_rotation_x(-0.25);
     b.bx_rot([-0.19, 0.865, -0.15], [0.17, 0.115, 0.006], tilt, solid(0x9a9da3));
-    b.bx_rot([-0.19, 0.866, -0.143], [0.155, 0.1, 0.002], tilt, Material::tiles(srgb(0x8fd0ff), srgb(0xf2f7ff), 0.05).with_emissive(0.7));
+    b.bx_rot(
+        [-0.19, 0.866, -0.143],
+        [0.155, 0.1, 0.002],
+        tilt,
+        Material::tiles(srgb(0x8fd0ff), srgb(0xf2f7ff), 0.05).with_emissive(0.7),
+    );
     // Desk lamp, mug and books.
     b.cyl([0.48, 0.74, -0.16], 0.07, 0.015, solid(0x2b2b2e));
     b.rod([0.48, 0.75, -0.16], [0.4, 1.12, -0.12], 0.01, solid(0x2b2b2e));
-    b.cone([0.34, 1.02, -0.09], 0.085, 0.03, 0.11, Material::solid(srgb(0xffd9a0)).with_emissive(0.7));
+    b.cone(
+        [0.34, 1.02, -0.09],
+        0.085,
+        0.03,
+        0.11,
+        Material::solid(srgb(0xffd9a0)).with_emissive(0.7),
+    );
     b.cyl([0.12, 0.74, 0.1], 0.04, 0.09, solid(0xc8553d));
     b.bx([-0.6, 0.74, -0.26], [-0.44, 0.78, -0.02], solid(0x3e7c6a));
     b.bx([-0.59, 0.78, -0.25], [-0.45, 0.81, -0.04], solid(0xe2b13c));
@@ -723,16 +923,34 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     b.bx([-HALF_X, -0.1, -oz], [HALF_X, CEILING_HEIGHT, -HALF_Z], concrete);
     b.bx([-HALF_X, -0.1, HALF_Z], [HALF_X, CEILING_HEIGHT, oz], concrete);
     if options.ceiling {
-        b.bx([-ox, CEILING_HEIGHT, -oz], [ox, CEILING_HEIGHT + 0.2, oz], solid(0xf6f4ee));
+        b.bx(
+            [-ox, CEILING_HEIGHT, -oz],
+            [ox, CEILING_HEIGHT + 0.2, oz],
+            solid(0xf6f4ee),
+        );
         // Exposed beams over the open-plan living room and kitchen.
-        let beam = Material::cells(srgb(0x8a6a48), srgb(0x9a7850), Vec3::new(f32::INFINITY, f32::INFINITY, 1.4));
+        let beam = Material::cells(
+            srgb(0x8a6a48),
+            srgb(0x9a7850),
+            Vec3::new(f32::INFINITY, f32::INFINITY, 1.4),
+        );
         for i in 0..7 {
             let x = -4.6 + i as f32 * 1.52;
-            b.bx([x - 0.06, CEILING_HEIGHT - 0.13, -HALF_Z + SKIN], [x + 0.06, CEILING_HEIGHT, 0.2 - SKIN], beam);
+            b.bx(
+                [x - 0.06, CEILING_HEIGHT - 0.13, -HALF_Z + SKIN],
+                [x + 0.06, CEILING_HEIGHT, 0.2 - SKIN],
+                beam,
+            );
         }
         // Ceiling light fixtures, one per room.
         let glow = Material::solid(srgb(0xfff3d6)).with_emissive(1.5);
-        for (x, z, r) in [(-2.6, -1.9, 0.26), (3.0, -2.6, 0.22), (-0.3, 2.1, 0.18), (-2.6, 2.0, 0.24), (1.5, 2.2, 0.18)] {
+        for (x, z, r) in [
+            (-2.6, -1.9, 0.26),
+            (3.0, -1.5, 0.2),
+            (-0.3, 2.1, 0.18),
+            (-2.6, 2.0, 0.24),
+            (1.5, 2.2, 0.18),
+        ] {
             b.cyl([x, CEILING_HEIGHT - 0.05, z], r, 0.05, glow);
             b.cyl([x, CEILING_HEIGHT - 0.06, z], r + 0.02, 0.02, solid(0xd8d2c4));
         }
@@ -746,10 +964,28 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     let bath_tiles = Material::tiles(srgb(0xf2f5f4), srgb(0x3f9c9a), 0.2);
 
     use Side::{East, North, South, West};
-    room_shell(b, &LIVING, solid(0xeee2c8), oak, &[open(East, -2.8, 0.2), door(South, -0.8, 0.2)]);
-    room_shell(b, &KITCHEN, solid(0xd3e3cf), kitchen_tiles, &[open(West, -2.8, 0.2), open(South, 3.0, 5.5)]);
+    room_shell(
+        b,
+        &LIVING,
+        solid(0xeee2c8),
+        oak,
+        &[open(East, -2.8, 0.2), door(South, -0.8, 0.2)],
+    );
+    room_shell(
+        b,
+        &KITCHEN,
+        solid(0xd3e3cf),
+        kitchen_tiles,
+        &[open(West, -2.8, 0.2), open(South, 3.0, 5.5)],
+    );
     room_shell(b, &DINING, solid(0xecd0b8), kitchen_tiles, &[open(North, 3.0, 5.5)]);
-    room_shell(b, &HALL, solid(0xd5dde6), hall_wood, &[door(North, -0.8, 0.2), door(West, 1.5, 2.5), door(East, 2.5, 3.5)]);
+    room_shell(
+        b,
+        &HALL,
+        solid(0xd5dde6),
+        hall_wood,
+        &[door(North, -0.8, 0.2), door(West, 1.5, 2.5), door(East, 2.5, 3.5)],
+    );
     room_shell(b, &BEDROOM, solid(0xc9d0ea), carpet, &[door(East, 1.5, 2.5)]);
     let bath_wall = Material::checker(srgb(0xe9f3f2), srgb(0xcfe6e4), 0.15);
     room_shell(b, &BATH, bath_wall, bath_tiles, &[door(West, 2.5, 3.5)]);
@@ -771,7 +1007,11 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     // --- Living room --------------------------------------------------------
     b.world();
     // Rug with concentric rings under the seating group.
-    b.bx([-4.4, 0.0, -2.95], [-1.8, 0.012, -0.9], Material::rings(srgb(0xb5443a), srgb(0xe9d9b8), Axis::Y, 0.22));
+    b.bx(
+        [-4.4, 0.0, -2.95],
+        [-1.8, 0.012, -0.9],
+        Material::rings(srgb(0xb5443a), srgb(0xe9d9b8), Axis::Y, 0.22),
+    );
     b.at(-3.1, -0.36, 180.0);
     sofa(b);
     b.at(-3.1, -1.9, 0.0);
@@ -789,15 +1029,51 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     window(b, Facing::PosX, [ww, 1.5, -1.9], 2.2, 1.2);
     window(b, Facing::PosZ, [-4.95, 1.5, wn], 0.7, 1.2);
     // Pictures: two above the sofa, one beside the hallway door, one on the stub wall.
-    panel(b, Facing::NegZ, [-3.65, 1.55, 0.2 - SKIN], 0.9, 0.65, frame_dark, Material::stripes(srgb(0xe07a3f), srgb(0x24408f), Axis::X, 0.11));
-    panel(b, Facing::NegZ, [-2.55, 1.55, 0.2 - SKIN], 0.9, 0.65, frame_dark, Material::rings(srgb(0xf1ead8), srgb(0x3e7c6a), Axis::Z, 0.07));
-    panel(b, Facing::NegZ, [-1.4, 1.5, 0.2 - SKIN], 0.6, 0.8, frame_gold, Material::checker(srgb(0xe2b13c), srgb(0x8c2f39), 0.12));
-    panel(b, Facing::NegX, [0.5 - SKIN, 1.5, -3.4], 0.7, 0.9, frame_white, Material::dots(srgb(0x2f3a4f), srgb(0xf2d34b), 0.14, 0.045));
+    panel(
+        b,
+        Facing::NegZ,
+        [-3.65, 1.55, 0.2 - SKIN],
+        0.9,
+        0.65,
+        frame_dark,
+        Material::stripes(srgb(0xe07a3f), srgb(0x24408f), Axis::X, 0.11),
+    );
+    panel(
+        b,
+        Facing::NegZ,
+        [-2.55, 1.55, 0.2 - SKIN],
+        0.9,
+        0.65,
+        frame_dark,
+        Material::rings(srgb(0xf1ead8), srgb(0x3e7c6a), Axis::Z, 0.07),
+    );
+    panel(
+        b,
+        Facing::NegZ,
+        [-1.4, 1.5, 0.2 - SKIN],
+        0.6,
+        0.8,
+        frame_gold,
+        Material::checker(srgb(0xe2b13c), srgb(0x8c2f39), 0.12),
+    );
+    panel(
+        b,
+        Facing::NegX,
+        [0.5 - SKIN, 1.5, -3.4],
+        0.7,
+        0.9,
+        frame_white,
+        Material::dots(srgb(0x2f3a4f), srgb(0xf2d34b), 0.14, 0.045),
+    );
 
     // --- Kitchen ------------------------------------------------------------
     b.world();
     let cabinet = solid(0xf2ede2);
-    let cabinet_wood = Material::cells(srgb(0xa9825a), srgb(0xb89066), Vec3::new(0.6, f32::INFINITY, f32::INFINITY));
+    let cabinet_wood = Material::cells(
+        srgb(0xa9825a),
+        srgb(0xb89066),
+        Vec3::new(0.6, f32::INFINITY, f32::INFINITY),
+    );
     let stone = Material::cells(srgb(0x35383d), srgb(0x44484e), Vec3::splat(0.02));
     let steel = solid(0xb9bcc2);
     let black = solid(0x17181a);
@@ -817,14 +1093,23 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     b.bx([3.85, 1.4, wn], [we, 2.15, wn + 0.34], cabinet);
     b.bx([1.4, 1.4, wn], [1.95, 2.15, wn + 0.34], cabinet);
     for x in [4.38f32, 4.92] {
-        b.bx([x - 0.008, 1.42, wn + 0.34], [x + 0.008, 2.13, wn + 0.345], solid(0xb9b2a4));
+        b.bx(
+            [x - 0.008, 1.42, wn + 0.34],
+            [x + 0.008, 2.13, wn + 0.345],
+            solid(0xb9b2a4),
+        );
     }
     window(b, Facing::PosZ, [2.9, 1.52, wn], 1.5, 0.85);
     // Toaster, kettle and a row of jars on the counter.
     b.bx([4.0, 0.92, wn + 0.15], [4.3, 1.1, wn + 0.36], solid(0xc8553d));
     b.cyl([4.7, 0.92, wn + 0.28], 0.085, 0.2, steel);
     for (i, c) in [0x3e7c6a, 0xe2b13c, 0xb5443a].into_iter().enumerate() {
-        b.cyl([1.62 + 0.17 * i as f32, 0.92, wn + 0.2], 0.055, 0.16 + 0.03 * i as f32, solid(c));
+        b.cyl(
+            [1.62 + 0.17 * i as f32, 0.92, wn + 0.2],
+            0.055,
+            0.16 + 0.03 * i as f32,
+            solid(c),
+        );
     }
     // Fridge against the stub wall.
     b.bx([0.62, 0.0, wn], [1.32, 1.95, wn + 0.68], steel);
@@ -838,22 +1123,44 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     b.bx([we - 0.62, 0.88, wn + 0.58], [we, 0.92, -1.18], stone);
     b.bx([we - 0.55, 0.92, -2.75], [we - 0.05, 0.93, -1.95], black);
     for (dx, dz) in [(-0.42f32, -2.55f32), (-0.42, -2.15), (-0.18, -2.55), (-0.18, -2.15)] {
-        b.cyl([we + dx, 0.93, dz], 0.085, 0.006, Material::rings(srgb(0x3a3d44), srgb(0x8c2f39), Axis::Y, 0.028));
+        b.cyl(
+            [we + dx, 0.93, dz],
+            0.085,
+            0.006,
+            Material::rings(srgb(0x3a3d44), srgb(0x8c2f39), Axis::Y, 0.028),
+        );
     }
     b.bx([we - 0.6, 0.2, -2.72], [we - 0.58, 0.8, -1.98], black);
     b.bx([we - 0.62, 0.72, -2.68], [we - 0.6, 0.74, -2.02], steel);
     b.bx([we - 0.5, 1.6, -2.78], [we, 1.72, -1.92], steel);
     b.bx([we - 0.3, 1.72, -2.55], [we, CEILING_HEIGHT, -2.15], steel);
-    panel(b, Facing::NegX, [we, 1.55, -0.55], 0.75, 0.75, frame_dark, Material::polar(srgb(0xf1ead8), srgb(0xd9772b), Axis::Z, 0.09, 8));
+    panel(
+        b,
+        Facing::NegX,
+        [we, 1.55, -0.55],
+        0.75,
+        0.75,
+        frame_dark,
+        Material::polar(srgb(0xf1ead8), srgb(0xd9772b), Axis::Z, 0.09, 8),
+    );
     // Island with a stone top overhanging toward three stools.
     b.world();
     b.bx([2.1, 0.0, -1.95], [3.9, 0.88, -1.15], solid(0x3e5c63));
     b.bx([2.05, 0.88, -2.0], [3.95, 0.93, -0.88], stone);
     b.cone([3.45, 0.93, -1.5], 0.09, 0.17, 0.08, solid(0xf1ead8));
-    for (dx, dz, c) in [(-0.05f32, 0.0f32, 0xd9772b), (0.06, 0.03, 0xc23b2e), (0.0, -0.06, 0xe2b13c)] {
+    for (dx, dz, c) in [
+        (-0.05f32, 0.0f32, 0xd9772b),
+        (0.06, 0.03, 0xc23b2e),
+        (0.0, -0.06, 0xe2b13c),
+    ] {
         b.ell([3.45 + dx, 1.03, -1.5 + dz], [0.045, 0.045, 0.045], solid(c));
     }
-    b.bx_rot([2.5, 0.945, -1.45], [0.2, 0.012, 0.14], Quat::from_rotation_y(0.2), cabinet_wood);
+    b.bx_rot(
+        [2.5, 0.945, -1.45],
+        [0.2, 0.012, 0.14],
+        Quat::from_rotation_y(0.2),
+        cabinet_wood,
+    );
     for x in [2.4f32, 3.0, 3.6] {
         b.at(x, -0.6, 0.0);
         stool(b);
@@ -863,24 +1170,38 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     if options.ceiling {
         for x in [2.55f32, 3.45] {
             b.rod([x, 1.95, -1.5], [x, CEILING_HEIGHT, -1.5], 0.006, black);
-            b.cone([x, 1.75, -1.5], 0.14, 0.035, 0.2, Material::solid(srgb(0xffd9a0)).with_emissive(0.8));
+            b.cone(
+                [x, 1.75, -1.5],
+                0.14,
+                0.035,
+                0.2,
+                Material::solid(srgb(0xffd9a0)).with_emissive(0.8),
+            );
         }
     }
 
     // --- Dining nook ----------------------------------------------------------
     b.world();
     let table_wood = Material::cells(srgb(0x9a6b3e), srgb(0xb07d4b), Vec3::new(0.12, f32::INFINITY, 2.5));
-    b.bx([3.8, 0.7, 1.45], [4.7, 0.745, 2.95], table_wood);
-    for (x, z) in [(3.86f32, 1.52f32), (4.64, 1.52), (3.86, 2.88), (4.64, 2.88)] {
+    b.bx([3.8, 0.7, 1.75], [4.7, 0.745, 3.05], table_wood);
+    for (x, z) in [(3.86f32, 1.82f32), (4.64, 1.82), (3.86, 2.98), (4.64, 2.98)] {
         b.bx([x - 0.03, 0.0, z - 0.03], [x + 0.03, 0.7, z + 0.03], solid(0x4a3524));
     }
-    b.bx([4.0, 0.745, 1.75], [4.5, 0.75, 2.65], Material::stripes(srgb(0xf1ead8), srgb(0xb5443a), Axis::Z, 0.09));
-    b.cone([4.25, 0.75, 2.2], 0.05, 0.085, 0.2, solid(0x3d6fa5));
-    for (dx, dz, c) in [(0.0f32, 0.0f32, 0xe85fa0), (0.05, 0.03, 0xf2d34b), (-0.04, 0.04, 0xf7f4ee)] {
-        b.ell([4.25 + dx, 1.03 + dx, 2.2 + dz], [0.05, 0.05, 0.05], solid(c));
+    b.bx(
+        [4.0, 0.745, 2.0],
+        [4.5, 0.75, 2.8],
+        Material::stripes(srgb(0xf1ead8), srgb(0xb5443a), Axis::Z, 0.09),
+    );
+    b.cone([4.25, 0.75, 2.4], 0.05, 0.085, 0.2, solid(0x3d6fa5));
+    for (dx, dz, c) in [
+        (0.0f32, 0.0f32, 0xe85fa0),
+        (0.05, 0.03, 0xf2d34b),
+        (-0.04, 0.04, 0xf7f4ee),
+    ] {
+        b.ell([4.25 + dx, 1.03 + 0.6 * dx, 2.4 + dz], [0.05, 0.05, 0.05], solid(c));
     }
     let seat = solid(0x3e7c6a);
-    for z in [1.85f32, 2.55] {
+    for z in [2.1f32, 2.7] {
         b.at(3.6, z, 90.0);
         chair(b, seat);
         b.at(4.9, z, -90.0);
@@ -894,24 +1215,55 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
         b.bx([x, 0.11, ws - 0.432], [x + 0.507, 0.82, ws - 0.42], solid(0xcfc6b2));
         b.ell([x + 0.25, 0.5, ws - 0.44], [0.016, 0.016, 0.016], black);
     }
-    b.cyl([3.75, 0.85, ws - 0.2], 0.06, 0.26, Material::stripes(srgb(0x24408f), srgb(0xf1ead8), Axis::Y, 0.035));
+    b.cyl(
+        [3.75, 0.85, ws - 0.2],
+        0.06,
+        0.26,
+        Material::stripes(srgb(0x24408f), srgb(0xf1ead8), Axis::Y, 0.035),
+    );
     b.bx([4.3, 0.85, ws - 0.33], [4.8, 0.88, ws - 0.08], solid(0x8c2f39));
     window(b, Facing::NegX, [we, 1.5, 2.2], 1.6, 1.2);
     window(b, Facing::NegZ, [4.25, 1.7, ws], 1.2, 0.8);
-    panel(b, Facing::PosX, [3.0 + SKIN, 1.5, 2.2], 1.1, 0.8, frame_gold, Material::checker(srgb(0x3d6fa5), srgb(0xf1ead8), 0.14));
+    panel(
+        b,
+        Facing::PosX,
+        [3.0 + SKIN, 1.5, 2.2],
+        1.1,
+        0.8,
+        frame_gold,
+        Material::checker(srgb(0x3d6fa5), srgb(0xf1ead8), 0.14),
+    );
     if options.ceiling {
-        b.rod([4.25, 1.85, 2.2], [4.25, CEILING_HEIGHT, 2.2], 0.008, black);
-        b.cone([4.25, 1.62, 2.2], 0.26, 0.06, 0.24, Material::solid(srgb(0xffe2a8)).with_emissive(0.8));
+        b.rod([4.25, 1.85, 2.4], [4.25, CEILING_HEIGHT, 2.4], 0.008, black);
+        b.cone(
+            [4.25, 1.62, 2.4],
+            0.26,
+            0.06,
+            0.24,
+            Material::solid(srgb(0xffe2a8)).with_emissive(0.8),
+        );
     }
 
     // --- Hallway ------------------------------------------------------------
     b.world();
-    b.bx([-0.75, 0.0, 0.5], [0.05, 0.01, 3.7], Material::stripes(srgb(0x8c2f39), srgb(0xd9b88a), Axis::Z, 0.2));
+    b.bx(
+        [-0.75, 0.0, 0.5],
+        [0.05, 0.01, 3.7],
+        Material::stripes(srgb(0x8c2f39), srgb(0xd9b88a), Axis::Z, 0.2),
+    );
     // Front door in the south wall.
-    let door_green = Material::cells(srgb(0x3d5a48), srgb(0x486a55), Vec3::new(0.3, f32::INFINITY, f32::INFINITY));
+    let door_green = Material::cells(
+        srgb(0x3d5a48),
+        srgb(0x486a55),
+        Vec3::new(0.3, f32::INFINITY, f32::INFINITY),
+    );
     b.bx([-0.82, 0.0, ws - 0.035], [0.22, 2.12, ws], frame_white);
     b.bx([-0.75, 0.0, ws - 0.05], [0.15, 2.05, ws], door_green);
-    b.bx([-0.5, 1.3, ws - 0.056], [-0.1, 1.75, ws - 0.05], Material::tiles(srgb(0xd8ecff), srgb(0xb9dcff), 0.1).with_emissive(1.0));
+    b.bx(
+        [-0.5, 1.3, ws - 0.056],
+        [-0.1, 1.75, ws - 0.05],
+        Material::tiles(srgb(0xd8ecff), srgb(0x9ccbff), 0.1).with_emissive(0.45),
+    );
     b.ell([0.05, 1.02, ws - 0.075], [0.03, 0.03, 0.03], frame_gold);
     // Narrow console with a mirror above it.
     let hall_e = 0.4 - SKIN;
@@ -920,7 +1272,15 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     b.bx([hall_e - 0.2, 0.0, 1.41], [hall_e - 0.17, 0.72, 1.44], frame_dark);
     b.cyl([hall_e - 0.11, 0.76, 0.85], 0.05, 0.14, solid(0x3d6fa5));
     b.bx([hall_e - 0.18, 0.76, 1.1], [hall_e - 0.04, 0.8, 1.36], solid(0xe2b13c));
-    panel(b, Facing::NegX, [hall_e, 1.45, 1.05], 0.6, 0.9, frame_gold, Material::gradient(srgb(0xc9d6e2), srgb(0xeef3f7), Axis::Y, -0.4, 0.4).with_emissive(0.25));
+    panel(
+        b,
+        Facing::NegX,
+        [hall_e, 1.45, 1.05],
+        0.6,
+        0.9,
+        frame_gold,
+        Material::gradient(srgb(0xc9d6e2), srgb(0xeef3f7), Axis::Y, -0.4, 0.4).with_emissive(0.25),
+    );
     // Coat hooks with a coat and a scarf on the west wall.
     let hall_w = -1.0 + SKIN;
     b.bx([hall_w, 1.62, 2.9], [hall_w + 0.02, 1.7, 3.7], table_wood);
@@ -928,8 +1288,20 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
         b.rod([hall_w + 0.02, 1.66, z], [hall_w + 0.07, 1.68, z], 0.012, frame_dark);
     }
     b.bx([hall_w + 0.02, 0.85, 2.9], [hall_w + 0.1, 1.66, 3.12], solid(0x2f3a4f));
-    b.bx([hall_w + 0.02, 1.05, 3.52], [hall_w + 0.07, 1.66, 3.66], Material::stripes(srgb(0xd9772b), srgb(0xf1ead8), Axis::Y, 0.06));
-    panel(b, Facing::PosX, [hall_w, 1.5, 0.9], 0.55, 0.7, frame_dark, Material::stripes(srgb(0x3e7c6a), srgb(0xf2d34b), Axis::Y, 0.08));
+    b.bx(
+        [hall_w + 0.02, 1.05, 3.52],
+        [hall_w + 0.07, 1.66, 3.66],
+        Material::stripes(srgb(0xd9772b), srgb(0xf1ead8), Axis::Y, 0.06),
+    );
+    panel(
+        b,
+        Facing::PosX,
+        [hall_w, 1.5, 0.9],
+        0.55,
+        0.7,
+        frame_dark,
+        Material::stripes(srgb(0x3e7c6a), srgb(0xf2d34b), Axis::Y, 0.08),
+    );
 
     // --- Bedroom --------------------------------------------------------------
     b.at(ww + 1.13, 2.3, 90.0);
@@ -945,11 +1317,32 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     b.at(-2.15, ws - 0.82, 15.0);
     chair(b, solid(0xc8553d));
     b.world();
-    b.cyl([-2.45, 0.0, 1.95], 0.85, 0.012, Material::polar(srgb(0xf1ead8), srgb(0x4a6fa5), Axis::Y, 0.21, 10));
+    b.cyl(
+        [-2.45, 0.0, 1.95],
+        0.85,
+        0.012,
+        Material::polar(srgb(0xf1ead8), srgb(0x4a6fa5), Axis::Y, 0.21, 10),
+    );
     window(b, Facing::NegZ, [-4.3, 1.5, ws], 1.5, 1.2);
     window(b, Facing::PosX, [ww, 1.75, 2.3], 1.1, 0.75);
-    panel(b, Facing::PosZ, [-4.5, 1.5, 0.2 + SKIN], 1.0, 0.7, frame_white, Material::rings(srgb(0x4a6fa5), srgb(0xf2d34b), Axis::Z, 0.06));
-    panel(b, Facing::NegX, [-1.0 - SKIN, 1.5, 3.2], 0.7, 0.9, frame_dark, Material::dots(srgb(0xe85fa0), srgb(0xf7f4ee), 0.13, 0.04));
+    panel(
+        b,
+        Facing::PosZ,
+        [-4.5, 1.5, 0.2 + SKIN],
+        1.0,
+        0.7,
+        frame_white,
+        Material::rings(srgb(0x4a6fa5), srgb(0xf2d34b), Axis::Z, 0.06),
+    );
+    panel(
+        b,
+        Facing::NegX,
+        [-1.0 - SKIN, 1.5, 3.2],
+        0.7,
+        0.9,
+        frame_dark,
+        Material::dots(srgb(0xe85fa0), srgb(0xf7f4ee), 0.13, 0.04),
+    );
     b.at(-1.36, 0.6, 0.0);
     plant(b, 0.75);
 
@@ -963,8 +1356,17 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     b.bx([be - 0.07, 0.44, bn], [be, 0.57, bn + 1.7], porcelain);
     b.bx([be - 0.76, 0.44, bn], [be, 0.57, bn + 0.07], porcelain);
     b.bx([be - 0.76, 0.44, bn + 1.63], [be, 0.57, bn + 1.7], porcelain);
-    b.bx([be - 0.69, 0.44, bn + 0.07], [be - 0.07, 0.5, bn + 1.63], Material::tiles(srgb(0x8fd3e8), srgb(0xa8e0f0), 0.11));
-    b.rod([be - 0.38, 0.57, bn + 0.035], [be - 0.38, 0.72, bn + 0.035], 0.016, steel);
+    b.bx(
+        [be - 0.69, 0.44, bn + 0.07],
+        [be - 0.07, 0.5, bn + 1.63],
+        Material::tiles(srgb(0x8fd3e8), srgb(0xa8e0f0), 0.11),
+    );
+    b.rod(
+        [be - 0.38, 0.57, bn + 0.035],
+        [be - 0.38, 0.72, bn + 0.035],
+        0.016,
+        steel,
+    );
     b.rod([be - 0.38, 0.72, bn + 0.035], [be - 0.38, 0.7, bn + 0.2], 0.014, steel);
     // Shower column and head over the tub.
     b.rod([be - 0.03, 0.9, bn + 0.5], [be - 0.03, 2.05, bn + 0.5], 0.014, steel);
@@ -980,7 +1382,15 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     for x in [0.86f32, 1.34] {
         b.bx([x - 0.008, 0.3, bn + 0.48], [x + 0.008, 0.6, bn + 0.5], steel);
     }
-    panel(b, Facing::PosZ, [1.1, 1.5, bn], 0.9, 0.8, frame_white, Material::gradient(srgb(0xc9d6e2), srgb(0xf2f6f9), Axis::Y, -0.35, 0.35).with_emissive(0.3));
+    panel(
+        b,
+        Facing::PosZ,
+        [1.1, 1.5, bn],
+        0.9,
+        0.8,
+        frame_white,
+        Material::gradient(srgb(0xc9d6e2), srgb(0xf2f6f9), Axis::Y, -0.35, 0.35).with_emissive(0.3),
+    );
     b.cyl([1.45, 0.86, bn + 0.12], 0.035, 0.13, solid(0xe85fa0));
     // Toilet against the south wall.
     b.world();
@@ -990,11 +1400,33 @@ fn build(options: HouseOptions) -> Vec<Primitive> {
     b.ell([2.45, 0.43, ws - 0.44], [0.19, 0.025, 0.26], solid(0xe6e9ea));
     // Towel rail with a striped towel, bath mat, laundry basket.
     b.rod([bw + 0.05, 1.15, 0.85], [bw + 0.05, 1.15, 1.75], 0.012, steel);
-    b.bx([bw + 0.03, 0.62, 0.95], [bw + 0.075, 1.17, 1.65], Material::stripes(srgb(0xe9b44c), srgb(0xf7f4ee), Axis::Y, 0.07));
-    b.bx([1.25, 0.0, 1.05], [2.0, 0.015, 1.6], Material::stripes(srgb(0x3f9c9a), srgb(0xf2f5f4), Axis::X, 0.075));
-    b.cone([0.78, 0.0, ws - 0.25], 0.17, 0.2, 0.5, Material::checker(srgb(0xc9a16b), srgb(0xa9825a), 0.05));
+    b.bx(
+        [bw + 0.03, 0.62, 0.95],
+        [bw + 0.075, 1.17, 1.65],
+        Material::stripes(srgb(0xe9b44c), srgb(0xf7f4ee), Axis::Y, 0.07),
+    );
+    b.bx(
+        [1.25, 0.0, 1.05],
+        [2.0, 0.015, 1.6],
+        Material::stripes(srgb(0x3f9c9a), srgb(0xf2f5f4), Axis::X, 0.075),
+    );
+    b.cone(
+        [0.78, 0.0, ws - 0.25],
+        0.17,
+        0.2,
+        0.5,
+        Material::checker(srgb(0xc9a16b), srgb(0xa9825a), 0.05),
+    );
     window(b, Facing::NegZ, [1.5, 1.8, ws], 0.9, 0.55);
-    panel(b, Facing::NegX, [be, 1.5, 2.9], 0.6, 0.6, frame_dark, Material::polar(srgb(0x3f9c9a), srgb(0xf1ead8), Axis::Z, 0.06, 6));
+    panel(
+        b,
+        Facing::NegX,
+        [be, 1.5, 2.9],
+        0.6,
+        0.6,
+        frame_dark,
+        Material::polar(srgb(0x3f9c9a), srgb(0xf1ead8), Axis::Z, 0.06, 6),
+    );
 
     core::mem::take(&mut b.prims)
 }
@@ -1006,7 +1438,10 @@ mod tests {
 
     #[test]
     fn rooms_tile_the_interior() {
-        let total: f32 = ROOMS.iter().map(|r| (r.max[0] - r.min[0]) * (r.max[1] - r.min[1])).sum();
+        let total: f32 = ROOMS
+            .iter()
+            .map(|r| (r.max[0] - r.min[0]) * (r.max[1] - r.min[1]))
+            .sum();
         assert!((total - 4.0 * HALF_X * HALF_Z).abs() < 1e-3, "rooms cover {total} m2");
         // Roughly 11 m x 8 m with a 2.5 m ceiling.
         assert_eq!((2.0 * HALF_X, 2.0 * HALF_Z, CEILING_HEIGHT), (11.0, 8.0, 2.5));
@@ -1037,7 +1472,11 @@ mod tests {
         let snap = HouseScene::new().snapshot(0.0);
         let mut rng = Lcg(9);
         for _ in 0..3000 {
-            let p = Vec3::new(rng.range(-HALF_X + 0.1, HALF_X - 0.1), 1.3, rng.range(-HALF_Z + 0.1, HALF_Z - 0.1));
+            let p = Vec3::new(
+                rng.range(-HALF_X + 0.1, HALF_X - 0.1),
+                1.3,
+                rng.range(-HALF_Z + 0.1, HALF_Z - 0.1),
+            );
             let down = snap.raycast(p, Vec3::NEG_Y, 10.0).expect("something below");
             assert!(down.pos.y > -0.2, "hole in the floor at {p:?}");
             let up = snap.raycast(p, Vec3::Y, 10.0).expect("something above");
@@ -1055,11 +1494,19 @@ mod tests {
         for eye in tour_waypoints() {
             for _ in 0..3000 {
                 let dir = rng.unit_vec();
-                let hit = snap.raycast(eye, dir, 100.0).unwrap_or_else(|| panic!("ray from {eye:?} along {dir:?} escaped"));
+                let hit = snap
+                    .raycast(eye, dir, 100.0)
+                    .unwrap_or_else(|| panic!("ray from {eye:?} along {dir:?} escaped"));
                 let p = hit.pos;
                 assert!(p.cmpge(bounds.min - 1e-3).all() && p.cmple(bounds.max + 1e-3).all());
                 // Nothing seen from inside lies beyond the interior faces of the shell.
-                assert!(p.x.abs() <= HALF_X + 1e-3 && p.z.abs() <= HALF_Z + 1e-3 && p.y >= -0.1 - 1e-3 && p.y <= CEILING_HEIGHT + 1e-3, "saw the void at {p:?}");
+                assert!(
+                    p.x.abs() <= HALF_X + 1e-3
+                        && p.z.abs() <= HALF_Z + 1e-3
+                        && p.y >= -0.1 - 1e-3
+                        && p.y <= CEILING_HEIGHT + 1e-3,
+                    "saw the void at {p:?}"
+                );
             }
         }
     }
@@ -1075,15 +1522,27 @@ mod tests {
                 for s in [-0.5f32, 0.0, 0.5] {
                     let lateral = side * (s * (d.width - 0.06));
                     let from = d.center + Vec3::Y * y + lateral - d.through * 0.45;
-                    assert!(!snap.occluded(from, d.through, 0.9), "door {:?} blocked at y = {y}, offset {s}", d.rooms);
+                    assert!(
+                        !snap.occluded(from, d.through, 0.9),
+                        "door {:?} blocked at y = {y}, offset {s}",
+                        d.rooms
+                    );
                 }
             }
             // Just beyond the clear width there is a jamb or wall.
             let outside = d.center + Vec3::Y + side * (0.5 * d.width + 0.08) - d.through * 0.45;
             let other = d.center + Vec3::Y - side * (0.5 * d.width + 0.08) - d.through * 0.45;
-            assert!(snap.occluded(outside, d.through, 0.9) || snap.occluded(other, d.through, 0.9), "door {:?} wider than declared", d.rooms);
+            assert!(
+                snap.occluded(outside, d.through, 0.9) || snap.occluded(other, d.through, 0.9),
+                "door {:?} wider than declared",
+                d.rooms
+            );
             // Both sides belong to the rooms the door claims to connect.
-            let rooms: Vec<&Room> = d.rooms.iter().map(|n| ROOMS.iter().find(|r| r.name == *n).unwrap()).collect();
+            let rooms: Vec<&Room> = d
+                .rooms
+                .iter()
+                .map(|n| ROOMS.iter().find(|r| r.name == *n).unwrap())
+                .collect();
             let (a, b) = (d.center - d.through * 0.3, d.center + d.through * 0.3);
             assert!(
                 (rooms[0].contains(a) && rooms[1].contains(b)) || (rooms[0].contains(b) && rooms[1].contains(a)),
@@ -1111,15 +1570,25 @@ mod tests {
         // Each room has its own floor material and wall tint.
         let snap = HouseScene::new().snapshot(0.0);
         let mut floor_ids = Vec::new();
-        for (name, x, z) in [("living", -1.2, -1.6), ("kitchen", 1.5, -0.6), ("hall", -0.85, 2.0), ("bedroom", -3.1, 0.95), ("bathroom", 1.0, 3.5)] {
+        for (name, x, z) in [
+            ("living", -1.2, -1.6),
+            ("kitchen", 1.5, -0.6),
+            ("hall", -0.85, 2.0),
+            ("bedroom", -3.1, 0.95),
+            ("bathroom", 1.0, 3.5),
+        ] {
             let hit = snap.raycast(Vec3::new(x, 0.5, z), Vec3::NEG_Y, 2.0).unwrap();
-            assert!(hit.pos.y.abs() < 1e-4, "{name}: bare floor expected at ({x}, {z}), got y = {}", hit.pos.y);
+            assert!(
+                hit.pos.y.abs() < 1e-4,
+                "{name}: bare floor expected at ({x}, {z}), got y = {}",
+                hit.pos.y
+            );
             let m = snap.primitives()[hit.prim as usize].material;
             assert!(!floor_ids.contains(&m), "{name} shares its floor material");
             floor_ids.push(m);
         }
         // Windows glow.
-        let hit = snap.raycast(Vec3::new(-3.0, 1.5, -1.9), Vec3::NEG_X, 10.0).unwrap();
+        let hit = snap.raycast(Vec3::new(-3.0, 1.75, -2.4), Vec3::NEG_X, 10.0).unwrap();
         assert!(snap.primitives()[hit.prim as usize].material.emissive > 0.5);
         let c = snap.shade(&hit, true);
         assert!(c.min_element() > 0.9, "window should be bright: {c:?}");
@@ -1171,6 +1640,69 @@ mod tests {
             assert_eq!(snap.occluded(origin, dir, t_max), slow.is_some(), "ray {i}");
         }
         assert!(hits > 9000);
+    }
+
+    #[test]
+    fn bvh_matches_brute_force_on_grazing_rays() {
+        // Origins snapped to a 10 cm grid and axis-parallel or diagonal
+        // directions: many of these rays run exactly along faces of the
+        // (mostly grid-aligned) furniture or touch a cylinder tangentially,
+        // where an unpadded BVH box and the primitive test disagree.
+        let snap = HouseScene::new().snapshot(0.0);
+        let mut rng = Lcg(999);
+        for i in 0..40_000u32 {
+            let p = rng.in_box(Vec3::new(-5.4, 0.1, -3.9), Vec3::new(5.4, 2.4, 3.9));
+            let origin = (p * 10.0).round() / 10.0;
+            let r = rng.unit_vec();
+            let dir = match i % 6 {
+                0 => Vec3::X * r.x.signum(),
+                1 => Vec3::Y * r.y.signum(),
+                2 => Vec3::Z * r.z.signum(),
+                3 => Vec3::new(r.x.signum(), 0.0, r.z.signum()).normalize(),
+                4 => Vec3::new(r.x, 0.0, r.z).normalize(),
+                _ => Vec3::new(0.0, r.y, r.z).normalize(),
+            };
+            let t_max = if i % 4 == 0 { rng.range(0.2, 4.0) } else { f32::INFINITY };
+            let fast = snap.raycast(origin, dir, t_max);
+            let slow = snap.raycast_brute_force(origin, dir, t_max);
+            match (fast, slow) {
+                (None, None) => assert!(t_max.is_finite(), "ray {i} from {origin:?} along {dir:?} escaped"),
+                (Some(a), Some(b)) => assert!(
+                    (a.t - b.t).abs() < 1e-4,
+                    "ray {i} from {origin:?} along {dir:?}: t {} vs {}",
+                    a.t,
+                    b.t
+                ),
+                (a, b) => panic!("ray {i} from {origin:?} along {dir:?}: bvh {a:?} vs brute force {b:?}"),
+            }
+            assert_eq!(snap.occluded(origin, dir, t_max), slow.is_some(), "ray {i}");
+        }
+    }
+
+    #[test]
+    fn no_ray_escapes_from_anywhere_inside() {
+        // Not only from the tour: from any interior point (free space or
+        // inside furniture) every direction ends on something within the shell.
+        let snap = HouseScene::new().snapshot(0.0);
+        let mut rng = Lcg(4711);
+        for i in 0..60_000 {
+            let origin = rng.in_box(
+                Vec3::new(-HALF_X + 0.07, 0.01, -HALF_Z + 0.07),
+                Vec3::new(HALF_X - 0.07, CEILING_HEIGHT - 0.01, HALF_Z - 0.07),
+            );
+            let dir = rng.unit_vec();
+            let hit = snap
+                .raycast(origin, dir, f32::INFINITY)
+                .unwrap_or_else(|| panic!("ray {i} from {origin:?} along {dir:?} escaped"));
+            let p = hit.pos;
+            assert!(
+                p.x.abs() <= HALF_X + 1e-3
+                    && p.z.abs() <= HALF_Z + 1e-3
+                    && (-0.101..=CEILING_HEIGHT + 1e-3).contains(&p.y),
+                "ray {i} saw the void at {p:?}"
+            );
+            assert!((hit.normal.length() - 1.0).abs() < 1e-4 && hit.normal.dot(dir) <= 1e-4);
+        }
     }
 
     #[test]
