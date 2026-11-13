@@ -32,6 +32,8 @@ const NEAR: f32 = 0.05;
 const FAR: f32 = 1000.0;
 /// Weight of a new sample in the smoothed frame statistics.
 const STATS_SMOOTHING: f32 = 0.1;
+/// Upper bound of the drawing-buffer size per axis, pixels.
+const MAX_CANVAS_SIZE: f32 = 8192.0;
 
 /// Handle to a running splat viewer. Cloning is cheap (reference counted);
 /// the viewer stops and frees its resources when the last handle is dropped
@@ -45,12 +47,15 @@ pub struct Viewer {
 }
 
 /// The closures handed to the browser. They only hold weak references, so
-/// the viewer is not kept alive by its own callbacks.
+/// the viewer is not kept alive by its own callbacks (see [`with_inner`]).
 struct Callbacks {
     desktop_frame: Closure<dyn FnMut(f64)>,
     xr_frame: Closure<dyn FnMut(f64, XrFrame)>,
     xr_end: Closure<dyn FnMut(Event)>,
 }
+
+/// Callback of [`Viewer::on_xr_change`].
+type XrListener = Rc<dyn Fn(bool)>;
 
 struct Inner {
     window: Window,
@@ -70,10 +75,12 @@ struct Inner {
     pointers: RefCell<Pointers>,
     /// `Some` while an immersive session runs.
     xr: RefCell<Option<XrState>>,
-    /// `requestSession` was called and has not resolved yet.
+    /// `requestSession` was called and the session is not installed yet.
     xr_pending: Cell<bool>,
+    /// `exit_xr` was called while the session was starting.
+    xr_cancelled: Cell<bool>,
     xr_error: RefCell<Option<String>>,
-    xr_listeners: RefCell<Vec<Rc<dyn Fn(bool)>>>,
+    xr_listeners: RefCell<Vec<XrListener>>,
     /// Miniature mode requested through the API, applied by the next XR frame.
     xr_miniature_request: Cell<Option<bool>>,
     stats: Cell<ViewerStats>,
@@ -92,10 +99,12 @@ impl Viewer {
     /// Creates the WebGL2 context on `canvas`, attaches the input listeners
     /// and starts the animation loop.
     ///
-    /// The canvas must get its display size from CSS (for example
+    /// The canvas should get its display size from CSS (for example
     /// `width: 100%; height: 100%`): the viewer sets the drawing-buffer size
     /// (`canvas.width/height`) from the CSS size and the device pixel ratio
-    /// every frame. It also sets `touch-action: none` on the canvas.
+    /// every frame. A canvas without a CSS size is pinned to the size it has
+    /// (with a console warning). The viewer also sets `touch-action: none`
+    /// on the canvas.
     ///
     /// Fails when WebGL2 is not available or a shader does not compile.
     pub fn new(canvas: HtmlCanvasElement, opts: ViewerOptions) -> Result<Viewer, JsValue> {
@@ -144,6 +153,7 @@ impl Viewer {
             pointers: RefCell::new(Pointers::default()),
             xr: RefCell::new(None),
             xr_pending: Cell::new(false),
+            xr_cancelled: Cell::new(false),
             xr_error: RefCell::new(None),
             xr_listeners: RefCell::new(Vec::new()),
             xr_miniature_request: Cell::new(None),
@@ -157,31 +167,17 @@ impl Viewer {
             listeners: RefCell::new(Vec::new()),
         });
 
+        let weak = Rc::downgrade(&inner);
         let callbacks = Callbacks {
             desktop_frame: {
-                let weak = Rc::downgrade(&inner);
-                Closure::new(move |time_ms: f64| {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.on_desktop_frame(time_ms);
-                    }
-                })
+                let weak = weak.clone();
+                Closure::new(move |time_ms: f64| with_inner(&weak, |inner| inner.on_desktop_frame(time_ms)))
             },
             xr_frame: {
-                let weak = Rc::downgrade(&inner);
-                Closure::new(move |time_ms: f64, frame: XrFrame| {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.on_xr_frame(time_ms, frame);
-                    }
-                })
+                let weak = weak.clone();
+                Closure::new(move |time_ms: f64, frame: XrFrame| with_inner(&weak, |inner| inner.on_xr_frame(time_ms, frame)))
             },
-            xr_end: {
-                let weak = Rc::downgrade(&inner);
-                Closure::new(move |_event: Event| {
-                    if let Some(inner) = weak.upgrade() {
-                        inner.on_xr_end();
-                    }
-                })
-            },
+            xr_end: Closure::new(move |_event: Event| with_inner(&weak, |inner| inner.on_xr_end())),
         };
         let _ = inner.callbacks.set(callbacks);
         input::attach(&inner)?;
@@ -276,7 +272,10 @@ impl Viewer {
         let mut batch = self.inner.gizmo_lines.borrow_mut();
         batch.clear();
         batch.scene(scene);
-        self.inner.lines.borrow_mut().set_scene(&batch);
+        // Without GL objects (context lost) the batch waits for the restore.
+        if self.inner.has_gl_objects() {
+            self.inner.lines.borrow_mut().set_scene(&batch);
+        }
         self.inner.dirty.set(true);
     }
 
@@ -291,11 +290,17 @@ impl Viewer {
     }
 
     /// Renders the splats (no gizmos) as seen by `cam` into an off-screen
-    /// buffer of the camera's size and returns the pixels. Uses the current
-    /// [`RenderParams`]; the canvas is not touched.
+    /// 8-bit buffer of the camera's size and returns the pixels. Uses the
+    /// current [`RenderParams`]; the canvas is not touched.
     ///
-    /// This is the same shader and blending as the on-screen path and the
-    /// counterpart of `gs_core::raster::rasterize`.
+    /// Fails for cameras larger than 8192 pixels on a side, on a lost WebGL
+    /// context and after [`Viewer::destroy`]; a camera without pixels gives
+    /// an empty image.
+    ///
+    /// This is the same shader, blending and projection-matrix path as the
+    /// on-screen views (the camera is turned into a view and a projection
+    /// matrix first) and the counterpart of `gs_core::raster::rasterize`
+    /// with `near = 0.05`. Useful for thumbnails, exports and tests.
     pub fn snapshot(&self, cam: &Camera) -> Result<Image, JsValue> {
         self.inner.snapshot(cam)
     }
@@ -389,7 +394,10 @@ impl Viewer {
         xr::enter(&self.inner);
     }
 
-    /// Ends the running session, if any.
+    /// Ends the running session, if any. A session that is still starting
+    /// (after [`Viewer::enter_xr`], before the first `on_xr_change(true)`) is
+    /// cancelled: it is ended as soon as the browser hands it over, and no
+    /// listener is called.
     pub fn exit_xr(&self) {
         self.inner.exit_xr();
     }
@@ -436,11 +444,31 @@ impl Viewer {
     // -------------------------------------------------------------- lifetime
 
     /// Stops the animation loop, ends a running VR session, removes every
-    /// event listener and frees the GPU resources. The handle (and its
-    /// clones) must not be used for rendering afterwards; calls are harmless
-    /// no-ops or return stale data. Dropping the last handle does the same.
+    /// event listener and frees the GPU resources. Dropping the last handle
+    /// does the same.
+    ///
+    /// The handle and its clones stay safe to use, but nothing is drawn any
+    /// more: layer updates only change the CPU copy (what [`Viewer::splats`]
+    /// returns), [`Viewer::snapshot`] fails, [`Viewer::enter_xr`] does
+    /// nothing, and no WebGL call is made.
     pub fn destroy(&self) {
         self.inner.shutdown();
+    }
+}
+
+/// Runs `f` on the viewer behind `weak` if it still exists. Every browser
+/// callback goes through here.
+///
+/// The callbacks only hold weak references, so user code running inside `f`
+/// (an `on_xr_change` listener, say) may drop the last [`Viewer`] handle.
+/// The viewer owns the very closure that is executing at that moment; it
+/// must not be freed before that closure has returned, so in that case the
+/// final drop is handed to a microtask.
+fn with_inner(weak: &Weak<Inner>, f: impl FnOnce(&Inner)) {
+    let Some(inner) = weak.upgrade() else { return };
+    f(&inner);
+    if Rc::strong_count(&inner) == 1 {
+        wasm_bindgen_futures::spawn_local(async move { drop(inner) });
     }
 }
 
@@ -508,15 +536,29 @@ impl Inner {
         let dpr = self.window.device_pixel_ratio() as f32;
         let dpr = if dpr.is_finite() && dpr > 0.0 { dpr.min(self.max_dpr) } else { 1.0 };
         let scale = dpr * self.params.get().render_scale;
-        let limit = self.gl.drawing_buffer_width().max(self.gl.drawing_buffer_height()).max(4096) as f32;
-        let size = |css: i32| ((css as f32 * scale).round().clamp(1.0, limit.max(8192.0))) as u32;
-        let (width, height) = (size(self.canvas.client_width()), size(self.canvas.client_height()));
+        let size = |css: i32| (css as f32 * scale).round().clamp(1.0, MAX_CANVAS_SIZE) as u32;
+        let (css_width, css_height) = (self.canvas.client_width(), self.canvas.client_height());
+        let (width, height) = (size(css_width), size(css_height));
         let changed = self.canvas.width() != width || self.canvas.height() != height;
         if changed {
             self.canvas.set_width(width);
             self.canvas.set_height(height);
+            // A canvas without a CSS size is as large as its drawing buffer:
+            // resizing the buffer by any factor but 1 would then resize the
+            // element, which would resize the buffer ... until it hits the
+            // size limit. Pin the element to the size it had.
+            if css_width > 0 && css_height > 0 && (self.canvas.client_width() != css_width || self.canvas.client_height() != css_height) {
+                let style = self.canvas.style();
+                let _ = style.set_property("width", &format!("{css_width}px"));
+                let _ = style.set_property("height", &format!("{css_height}px"));
+                web_sys::console::warn_1(
+                    &"gs-render: the canvas has no CSS size; it was pinned to its current size (give it a size in CSS to make it responsive)".into(),
+                );
+            }
         }
-        (width, height, changed, scale)
+        // The browser may allocate less than requested (memory limits).
+        let actual = |v: i32, wanted: u32| if v > 0 { v as u32 } else { wanted };
+        (actual(self.gl.drawing_buffer_width(), width), actual(self.gl.drawing_buffer_height(), height), changed, scale)
     }
 
     fn on_desktop_frame(&self, time_ms: f64) {
@@ -573,6 +615,12 @@ impl Inner {
         if width == 0 || height == 0 {
             return Ok(Image { width, height, rgb: Vec::new() });
         }
+        if width as f32 > MAX_CANVAS_SIZE || height as f32 > MAX_CANVAS_SIZE {
+            return Err(format!("snapshot of {width}x{height} pixels exceeds the limit of {MAX_CANVAS_SIZE} per axis").into());
+        }
+        if !self.alive.get() {
+            return Err("the viewer was destroyed".into());
+        }
         if self.context_lost.get() {
             return Err("the WebGL context is lost".into());
         }
@@ -594,7 +642,8 @@ impl Inner {
             gl.clear_color(r, g, b, 1.0);
             gl.clear(GL::COLOR_BUFFER_BIT);
             let clip_y = self.clip_y(&params, false);
-            let vp = ViewParams::from_camera(cam);
+            // Through the projection matrix, like every on-screen view.
+            let vp = ViewParams::from_projection(cam.view_matrix(), &cam.projection_matrix(NEAR, FAR), width as f32, height as f32);
             let mut scene = self.scene.borrow_mut();
             let key = SortKey { show: [params.show_static, params.show_dynamic], clip_y };
             scene.sort(&vp.view, key, &|| self.now(), true);
@@ -623,9 +672,16 @@ impl Inner {
         Ok(Image { width, height, rgb })
     }
 
+    /// The splat and line renderers have their GL objects: the viewer is
+    /// alive and its context is not lost.
+    fn has_gl_objects(&self) -> bool {
+        self.alive.get() && !self.context_lost.get()
+    }
+
     /// `webglcontextlost`: stop drawing until the context comes back.
     fn on_context_lost(&self) {
         self.context_lost.set(true);
+        self.scene.borrow_mut().context_lost();
     }
 
     /// `webglcontextrestored`: every GL object is gone; rebuild them from the
@@ -658,8 +714,8 @@ impl Inner {
         }
         self.listeners.borrow_mut().clear();
         self.shutdown_xr();
+        self.scene.borrow_mut().destroy();
         if !self.context_lost.get() {
-            self.scene.borrow().destroy();
             self.lines.borrow().destroy();
         }
     }
@@ -670,6 +726,3 @@ impl Drop for Inner {
         self.shutdown();
     }
 }
-
-/// Weak handle used by the event listeners.
-pub(crate) type WeakInner = Weak<Inner>;

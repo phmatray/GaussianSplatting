@@ -41,7 +41,3 @@ pub(crate) fn link_program(gl: &GL, vertex: &str, fragment: &str) -> Result<WebG
 pub(crate) fn uniform(gl: &GL, program: &WebGlProgram, name: &str) -> Result<WebGlUniformLocation, JsValue> {
     gl.get_uniform_location(program, name).ok_or_else(|| format!("WebGL: uniform {name} not found").into())
 }
-
-/// The two-triangle strip `(-1,-1) (1,-1) (-1,1) (1,1)` every instanced quad
-/// of this crate is built from.
-pub(crate) const QUAD_CORNERS: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];

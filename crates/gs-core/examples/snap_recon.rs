@@ -13,6 +13,7 @@
 //!   --noise                      realistic sensor noise
 //!   --light                      start from PipelineConfig::light
 //!   --no-png                     numbers only
+//!   --half-res                   held-out views at 160x120 instead of 320x240
 //! ```
 
 #[path = "../tests/common/mod.rs"]
@@ -21,11 +22,16 @@ mod common;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use common::{evaluate, house_views, mean, run_full_scan, save_png, side_by_side, stack, stage_views, Client};
+use common::{
+    evaluate, house_views, mean, observed_mask, run_full_scan, save_png, side_by_side, stack, stage_views, top_view, Client,
+    Exposures,
+};
 use gs_core::capture::NoiseModel;
 use gs_core::pipeline::Pipeline;
 use gs_core::protocol::{ControlMsg, PipelineConfig};
-use gs_core::scene::{make_scene, SceneKind};
+use gs_core::glam::Vec3;
+use gs_core::scene::house::{HouseOptions, HouseScene};
+use gs_core::scene::{make_scene, Scene, SceneKind};
 
 struct Options {
     out: PathBuf,
@@ -34,6 +40,8 @@ struct Options {
     noise: bool,
     light: bool,
     png: bool,
+    /// Divides the resolution of the held-out views.
+    view_divisor: u32,
 }
 
 fn parse_args() -> Options {
@@ -44,6 +52,7 @@ fn parse_args() -> Options {
         noise: false,
         light: false,
         png: true,
+        view_divisor: 1,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -62,6 +71,7 @@ fn parse_args() -> Options {
             "--noise" => options.noise = true,
             "--light" => options.light = true,
             "--no-png" => options.png = false,
+            "--half-res" => options.view_divisor = 2,
             other => options.out = PathBuf::from(other),
         }
     }
@@ -91,7 +101,10 @@ fn stage(options: &Options) {
     client.apply(&pipeline.snapshot());
     println!("stage: pipeline ready in {:.0} ms", start.elapsed().as_secs_f64() * 1e3);
 
-    let views = stage_views();
+    let mut views = stage_views();
+    for view in &mut views {
+        view.cam = view.cam.resized(view.cam.width / options.view_divisor, view.cam.height / options.view_divisor);
+    }
     let mut all = Vec::new();
     let mut dynamic = Vec::new();
     // Three instants of the dance; each tick jumps straight to the next one.
@@ -103,7 +116,7 @@ fn stage(options: &Options) {
         dynamic.push(client.layers[1].len() as f32);
         let mut sheets = Vec::new();
         for view in &views {
-            let score = evaluate(&snap, &cloud, &view.cam, pipeline.config().shadows);
+            let score = evaluate(&snap, &cloud, &view.cam, pipeline.config().shadows, None);
             println!("  t={time:4.1} {:8} psnr {:5.2} dB  coverage {:5.1} %", view.name, score.psnr, 100.0 * score.coverage);
             all.push(score.psnr);
             sheets.push(side_by_side(&score));
@@ -134,25 +147,67 @@ fn house(options: &Options) {
     let cloud = client.cloud();
     println!("house: {} splats after {ticks} ticks, {scan_s:.1} s, {} bytes on the wire", cloud.len(), client.bytes);
 
+    let exposures = Exposures::of_scan(&snap, pipeline.config());
     let (mut psnrs, mut coverages, mut sheets) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut psnrs_observed, mut coverages_observed, mut observed) = (Vec::new(), Vec::new(), Vec::new());
     for view in house_views() {
-        let score = evaluate(&snap, &cloud, &view.cam, pipeline.config().shadows);
-        println!("  {:12} psnr {:5.2} dB  coverage {:5.1} %", view.name, score.psnr, 100.0 * score.coverage);
+        let mask = observed_mask(&snap, &exposures, &view.cam);
+        let score = evaluate(&snap, &cloud, &view.cam, pipeline.config().shadows, Some(&mask));
+        println!(
+            "  {:12} psnr {:5.2} dB  coverage {:5.1} %   where observed ({:5.1} %): psnr {:5.2} dB  coverage {:5.1} %",
+            view.name,
+            score.psnr,
+            100.0 * score.coverage,
+            100.0 * score.observed_fraction,
+            score.psnr_observed,
+            100.0 * score.coverage_observed
+        );
         psnrs.push(score.psnr);
         coverages.push(score.coverage);
+        psnrs_observed.push(score.psnr_observed);
+        coverages_observed.push(score.coverage_observed);
+        observed.push(score.observed_fraction);
         sheets.push(side_by_side(&score));
     }
     if options.png {
         for (i, chunk) in sheets.chunks(6).enumerate() {
             save_png(&options.out.join(format!("house_{i}.png")), &stack(chunk));
         }
+        // Dollhouse view: ceiling clipped the way the viewer does in
+        // miniature mode, with the scan path drawn on the reconstruction.
+        let state = client.state.as_ref().expect("no State received");
+        let ceiling = state.ceiling_height.expect("the house reports its ceiling height");
+        let open = HouseScene::with_options(HouseOptions { ceiling: false }).snapshot(0.0);
+        let clipped: Vec<_> = cloud.iter().copied().filter(|s| s.pos[1] < ceiling - 0.12).collect();
+        let top = top_view();
+        let mut score = evaluate(&open, &clipped, &top.cam, pipeline.config().shadows, None);
+        for p in &state.scan.as_ref().expect("the house reports its scan path").path {
+            let Some((x, y, _)) = top.cam.project(Vec3::from_array(*p)) else { continue };
+            let image = &mut score.reconstruction;
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let (x, y) = (x as i64 + dx, y as i64 + dy);
+                if x >= 0 && y >= 0 && x < image.width as i64 && y < image.height as i64 {
+                    let i = (y as usize * image.width as usize + x as usize) * 3;
+                    image.rgb[i..i + 3].copy_from_slice(&[255, 0, 255]);
+                }
+            }
+        }
+        println!("  {:12} psnr {:5.2} dB  coverage {:5.1} %", top.name, score.psnr, 100.0 * score.coverage);
+        save_png(&options.out.join("house_top.png"), &side_by_side(&score));
     }
+    let min = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min);
     println!(
-        "RESULT house psnr_mean={:.2} psnr_min={:.2} coverage_mean={:.2} coverage_min={:.2} splats={} scan_s={:.1}",
+        "RESULT house psnr_mean={:.2} psnr_min={:.2} coverage_mean={:.2} coverage_min={:.2} observed={:.1} \
+         psnr_obs_mean={:.2} psnr_obs_min={:.2} coverage_obs_mean={:.2} coverage_obs_min={:.2} splats={} scan_s={:.1}",
         mean(&psnrs),
-        psnrs.iter().copied().fold(f32::INFINITY, f32::min),
+        min(&psnrs),
         100.0 * mean(&coverages),
-        100.0 * coverages.iter().copied().fold(f32::INFINITY, f32::min),
+        100.0 * min(&coverages),
+        100.0 * mean(&observed),
+        mean(&psnrs_observed),
+        min(&psnrs_observed),
+        100.0 * mean(&coverages_observed),
+        100.0 * min(&coverages_observed),
         cloud.len(),
         scan_s,
     );

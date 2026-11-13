@@ -37,12 +37,19 @@ fn finite_clamp(value: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanConfig {
-    /// Edge length of a fusion cell in meters (one splat per cell).
+    /// Edge length of a fusion cell in meters (one splat per cell). The
+    /// splat count grows with its inverse square: about 275 000 for the
+    /// whole house at 4 cm, 415 000 at 3.2 cm, 475 000 at 3 cm, 680 000 at
+    /// 2.5 cm, for a gain of roughly 0.1 dB of held-out PSNR per 50 000
+    /// splats.
     pub voxel_size: f32,
     /// Cruise walking speed along the scan path in meters per second.
     pub speed: f32,
     /// Vertical field of view of the handheld camera in degrees. The house
     /// needs at least 70 degrees to see floors and ceilings from eye height.
+    /// With the sweep of [`crate::pipeline::scan_camera`] the default of 90
+    /// (106 horizontally) leaves about 0.5 % of what a visitor can see
+    /// unscanned; 80 leaves twice as much, 100 adds splats but no quality.
     pub fov_y_deg: f32,
     /// Image width of the handheld camera in pixels.
     pub width: u32,
@@ -61,12 +68,12 @@ pub struct ScanConfig {
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
-            voxel_size: 0.03,
+            voxel_size: 0.032,
             speed: ScanPath::DEFAULT_SPEED,
-            fov_y_deg: 80.0,
+            fov_y_deg: 90.0,
             width: 192,
             height: 144,
-            max_range: 5.0,
+            max_range: 6.0,
             frames_per_second: 6.0,
             autostart: true,
         }
@@ -174,7 +181,9 @@ impl PipelineConfig {
     pub const MAX_RIG_PIXELS: u64 = 1_250_000;
 
     /// The default configuration for a scene: eight 160x120 cameras for the
-    /// stage, a 192x144 handheld camera and 3 cm cells for the house.
+    /// stage; a 192x144 handheld camera with a 90 degree vertical field of
+    /// view and 3.2 cm cells for the house (about 410 000 splats for the
+    /// whole scan).
     pub fn for_scene(scene: SceneKind) -> Self {
         Self {
             scene,
@@ -361,7 +370,8 @@ pub enum ScanState {
     Scanning,
     /// Stopped midway by [`ControlMsg::ScanPause`]; the map is kept.
     Paused,
-    /// The whole path has been fused.
+    /// The whole path has been fused. The tick that announces it also
+    /// replaces layer 0 with the final, refined map.
     Done,
 }
 
@@ -438,12 +448,14 @@ pub enum ControlMsg {
     /// this starts a new one from scratch.
     ScanStart,
     /// House: stop walking; the map is kept and [`ControlMsg::ScanStart`]
-    /// resumes.
+    /// resumes. Layer 0 is sent again as a whole if splats were refined
+    /// since they were appended.
     ScanPause,
     /// House: discard the map and go back to idle.
     ScanReset,
     /// House: fuse the rest of the path as fast as possible (a bounded
-    /// amount of work per tick) instead of in real time.
+    /// amount of work per tick) instead of in real time. Starts the scan if
+    /// it is idle or paused.
     ScanFinish,
 }
 
@@ -527,7 +539,7 @@ mod tests {
 
     #[test]
     fn non_finite_numbers_fall_back_to_defaults() {
-        let mut c = PipelineConfig::default();
+        let mut c = PipelineConfig::for_scene(SceneKind::Stage);
         c.target_hz = f32::NAN;
         c.time_scale = f32::INFINITY;
         c.rig.radius = f32::NAN;

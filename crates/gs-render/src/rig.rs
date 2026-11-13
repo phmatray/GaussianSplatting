@@ -223,7 +223,14 @@ impl Locomotion {
 
     /// Applies one frame of controller input. `rig_from_head` is the most
     /// recent head pose, `dt` the frame time in seconds.
-    pub fn update(&mut self, left: &PadState, right: &PadState, rig_from_head: &Mat4, dt: f32, ctx: &LocomotionContext) -> LocomotionEvents {
+    pub fn update(
+        &mut self,
+        left: &PadState,
+        right: &PadState,
+        rig_from_head: &Mat4,
+        dt: f32,
+        ctx: &LocomotionContext,
+    ) -> LocomotionEvents {
         let mut events = LocomotionEvents::default();
         let pressed = |now: bool, prev: &mut bool| {
             let edge = now && !*prev;
@@ -255,7 +262,10 @@ impl Locomotion {
         let speed = if self.is_miniature() { MINIATURE_SPEED } else { ctx.options.move_speed };
         let meters = speed * boost * dt;
         let (strafe, forward) = (dead_zone(left.stick[0]), -dead_zone(left.stick[1]));
-        let up = -dead_zone(right.stick[1]) * VERTICAL_SPEED_RATIO;
+        // The right stick turns or lifts, whichever axis dominates, so that a
+        // sloppy sideways flick does not also change the height.
+        let lifting = right.stick[1].abs() > right.stick[0].abs();
+        let up = if lifting { -dead_zone(right.stick[1]) * VERTICAL_SPEED_RATIO } else { 0.0 };
         if forward != 0.0 || strafe != 0.0 || up != 0.0 {
             self.rig.travel(rig_from_head, forward * meters, strafe * meters, up * meters);
         }
@@ -332,6 +342,15 @@ mod tests {
             loco.update(&left, &right, &head(Vec3::new(0.0, 1.6, 0.0), 0.0), 1.0 / 90.0, &ctx());
         }
         assert_vec(loco.rig().pos, Vec3::new(2.0, 1.0, 0.0), 1e-3);
+
+        // A diagonal flick of the right stick turns without changing the height.
+        let mut loco = Locomotion::new(Rig { pos: Vec3::ZERO, yaw: 0.0, scale: 1.0 });
+        let flick = PadState { stick: [0.9, -0.5], ..Default::default() };
+        for _ in 0..30 {
+            loco.update(&PadState::default(), &flick, &head(Vec3::new(0.0, 1.6, 0.0), 0.0), 1.0 / 90.0, &ctx());
+        }
+        assert_eq!(loco.rig().pos.y, 0.0);
+        assert!((loco.rig().yaw + 30f32.to_radians()).abs() < 1e-6);
     }
 
     #[test]

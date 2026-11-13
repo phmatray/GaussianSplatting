@@ -5,8 +5,13 @@ use wasm_bindgen::JsValue;
 use web_sys::{WebGl2RenderingContext as GL, WebGlBuffer, WebGlProgram, WebGlUniformLocation, WebGlVertexArrayObject};
 
 use crate::gizmo::{LineBatch, FLOATS_PER_SEGMENT};
-use crate::glutil::{link_program, uniform, QUAD_CORNERS};
+use crate::glutil::{link_program, uniform};
 use crate::shaders::{LINE_FS, LINE_VS};
+
+/// Floats per vertex: the whole segment (`FLOATS_PER_SEGMENT`) plus the corner.
+const FLOATS_PER_VERTEX: usize = FLOATS_PER_SEGMENT + 2;
+/// Corners of the two triangles of a segment quad: `(end, side)`.
+const CORNERS: [[f32; 2]; 6] = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]];
 
 /// One vertex buffer of segments with its own vertex array.
 struct Batch {
@@ -14,7 +19,7 @@ struct Batch {
     buffer: WebGlBuffer,
     /// Allocated size in floats.
     capacity: usize,
-    segments: i32,
+    vertices: i32,
 }
 
 /// Draws [`LineBatch`]es as screen-space quads of constant pixel width,
@@ -29,75 +34,75 @@ pub(crate) struct LineRenderer {
     u_viewport: WebGlUniformLocation,
     u_near: WebGlUniformLocation,
     u_px_scale: WebGlUniformLocation,
-    corner_buffer: WebGlBuffer,
     scene: Batch,
     overlay: Batch,
+    /// Expanded vertices on their way to the GPU.
+    staging: Vec<f32>,
 }
 
-fn create_batch(gl: &GL, corner_buffer: &WebGlBuffer) -> Result<Batch, JsValue> {
+fn create_batch(gl: &GL) -> Result<Batch, JsValue> {
     let vao = gl.create_vertex_array().ok_or("WebGL: createVertexArray failed")?;
     gl.bind_vertex_array(Some(&vao));
-    gl.bind_buffer(GL::ARRAY_BUFFER, Some(corner_buffer));
-    gl.enable_vertex_attrib_array(0);
-    gl.vertex_attrib_pointer_with_i32(0, 2, GL::FLOAT, false, 0, 0);
     let buffer = gl.create_buffer().ok_or("WebGL: createBuffer failed")?;
     gl.bind_buffer(GL::ARRAY_BUFFER, Some(&buffer));
-    let stride = (FLOATS_PER_SEGMENT * 4) as i32;
-    // a_p0, a_p1, a_color, a_width: one segment per instance.
-    for (location, size, offset) in [(1u32, 3, 0), (2, 3, 12), (3, 4, 24), (4, 1, 40)] {
+    let stride = (FLOATS_PER_VERTEX * 4) as i32;
+    // a_p0, a_p1, a_color, a_width, a_corner.
+    for (location, size, offset) in [(0u32, 3, 0), (1, 3, 12), (2, 4, 24), (3, 1, 40), (4, 2, 44)] {
         gl.enable_vertex_attrib_array(location);
         gl.vertex_attrib_pointer_with_i32(location, size, GL::FLOAT, false, stride, offset);
-        gl.vertex_attrib_divisor(location, 1);
     }
     gl.bind_vertex_array(None);
-    Ok(Batch { vao, buffer, capacity: 0, segments: 0 })
+    Ok(Batch { vao, buffer, capacity: 0, vertices: 0 })
 }
 
-fn upload(gl: &GL, batch: &mut Batch, lines: &LineBatch, usage: u32) {
-    let data = lines.data();
-    batch.segments = lines.len() as i32;
-    if data.is_empty() {
+/// Expands every segment into the six vertices of its quad and uploads them.
+fn upload(gl: &GL, batch: &mut Batch, lines: &LineBatch, staging: &mut Vec<f32>, usage: u32) {
+    batch.vertices = (lines.len() * CORNERS.len()) as i32;
+    if lines.len() == 0 {
         return;
     }
+    staging.clear();
+    for segment in lines.data().chunks_exact(FLOATS_PER_SEGMENT) {
+        for corner in &CORNERS {
+            staging.extend_from_slice(segment);
+            staging.extend_from_slice(corner);
+        }
+    }
     gl.bind_buffer(GL::ARRAY_BUFFER, Some(&batch.buffer));
-    if data.len() > batch.capacity {
-        batch.capacity = data.len().next_power_of_two();
+    if staging.len() > batch.capacity {
+        batch.capacity = staging.len().next_power_of_two();
         gl.buffer_data_with_i32(GL::ARRAY_BUFFER, (batch.capacity * 4) as i32, usage);
     }
     // SAFETY: the view is only used by bufferSubData, which copies the data
     // before any allocation can move wasm memory.
-    let view = unsafe { js_sys::Float32Array::view(data) };
+    let view = unsafe { js_sys::Float32Array::view(staging) };
     gl.buffer_sub_data_with_i32_and_array_buffer_view(GL::ARRAY_BUFFER, 0, &view);
 }
 
 impl LineRenderer {
     pub fn new(gl: &GL) -> Result<Self, JsValue> {
         let program = link_program(gl, LINE_VS, LINE_FS)?;
-        let corner_buffer = gl.create_buffer().ok_or("WebGL: createBuffer failed")?;
-        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&corner_buffer));
-        // SAFETY: consumed synchronously by bufferData.
-        gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &unsafe { js_sys::Float32Array::view(&QUAD_CORNERS) }, GL::STATIC_DRAW);
         Ok(Self {
             gl: gl.clone(),
             u_view_proj: uniform(gl, &program, "u_view_proj")?,
             u_viewport: uniform(gl, &program, "u_viewport")?,
             u_near: uniform(gl, &program, "u_near")?,
             u_px_scale: uniform(gl, &program, "u_px_scale")?,
-            scene: create_batch(gl, &corner_buffer)?,
-            overlay: create_batch(gl, &corner_buffer)?,
-            corner_buffer,
+            scene: create_batch(gl)?,
+            overlay: create_batch(gl)?,
             program,
+            staging: Vec::new(),
         })
     }
 
     /// Replaces the persistent gizmo scene.
     pub fn set_scene(&mut self, lines: &LineBatch) {
-        upload(&self.gl, &mut self.scene, lines, GL::STATIC_DRAW);
+        upload(&self.gl, &mut self.scene, lines, &mut self.staging, GL::STATIC_DRAW);
     }
 
     /// Replaces the per-frame overlay (may be empty).
     pub fn set_overlay(&mut self, lines: &LineBatch) {
-        upload(&self.gl, &mut self.overlay, lines, GL::DYNAMIC_DRAW);
+        upload(&self.gl, &mut self.overlay, lines, &mut self.staging, GL::DYNAMIC_DRAW);
     }
 
     /// Draws both batches into the bound framebuffer and viewport.
@@ -106,8 +111,8 @@ impl LineRenderer {
     /// clipped against it in the vertex shader) and `px_scale` the number of
     /// device pixels per unit of line width.
     pub fn draw(&self, view_proj: &Mat4, viewport: [f32; 2], near: f32, px_scale: f32, with_scene: bool) {
-        let scene = if with_scene { self.scene.segments } else { 0 };
-        if scene + self.overlay.segments == 0 {
+        let scene = if with_scene { self.scene.vertices } else { 0 };
+        if scene + self.overlay.vertices == 0 {
             return;
         }
         let gl = &self.gl;
@@ -120,10 +125,10 @@ impl LineRenderer {
         gl.disable(GL::CULL_FACE);
         gl.enable(GL::BLEND);
         gl.blend_func(GL::ONE, GL::ONE_MINUS_SRC_ALPHA);
-        for (batch, count) in [(&self.scene, scene), (&self.overlay, self.overlay.segments)] {
+        for (batch, count) in [(&self.scene, scene), (&self.overlay, self.overlay.vertices)] {
             if count > 0 {
                 gl.bind_vertex_array(Some(&batch.vao));
-                gl.draw_arrays_instanced(GL::TRIANGLE_STRIP, 0, 4, count);
+                gl.draw_arrays(GL::TRIANGLES, 0, count);
             }
         }
         gl.bind_vertex_array(None);
@@ -136,7 +141,6 @@ impl LineRenderer {
             gl.delete_buffer(Some(&batch.buffer));
             gl.delete_vertex_array(Some(&batch.vao));
         }
-        gl.delete_buffer(Some(&self.corner_buffer));
         gl.delete_program(Some(&self.program));
     }
 }

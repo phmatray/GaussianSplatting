@@ -5,20 +5,27 @@
 //! of that recipe). Keep the two in sync: the end-to-end test compares this
 //! shader with `gs_core::raster::rasterize` pixel by pixel.
 
-/// Splat vertex shader. One instance per splat, four vertices per instance.
+/// Splat vertex shader. Four vertices per splat, drawn as indexed triangles:
+/// vertex `4·q + k` is corner `k` of the `q`-th quad in draw order, and the
+/// splat that quad shows is looked up in the order texture.
+///
+/// Deliberately not instanced. Instancing is the obvious way to draw one
+/// quad per sorted index and costs the same on a hardware GPU, but software
+/// rasterizers (SwiftShader, which headless Chromium and therefore every
+/// automated check of this project runs on) execute an instanced draw as one
+/// draw call per instance: measured 25× slower than this formulation.
 pub(crate) const SPLAT_VS: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
 precision highp usampler2D;
 
-layout(location = 0) in vec2 a_corner;   // quad corner in {-1, +1}^2
-layout(location = 1) in uint a_index;    // sorted splat index (per instance)
-
 uniform usampler2D u_data0;   // layer 0, three RGBA32UI texels per splat
 uniform usampler2D u_data1;   // layer 1
+uniform usampler2D u_order;   // sorted splat indices, one R32UI texel per quad
+uniform int u_order_width;    // texels per row of u_order
 uniform uint u_split;         // indices >= u_split address layer 1
 uniform uvec2 u_counts;       // splats currently stored in each layer
-uniform int u_spr;            // splats per texture row
+uniform int u_spr;            // splats per data texture row
 uniform mat4 u_view;          // world -> camera, may contain a uniform scale
 uniform vec2 u_focal;         // fx, fy in pixels
 uniform vec2 u_center;        // cx, cy in pixels, top-left origin
@@ -36,9 +43,13 @@ out vec4 v_color;
 const vec4 CULLED = vec4(0.0, 0.0, 2.0, 1.0);
 
 void main() {
-  bool second = a_index >= u_split;
-  uint local = second ? a_index - u_split : a_index;
-  // The index buffer can be one frame older than the data.
+  int quad = gl_VertexID >> 2;
+  int k = gl_VertexID & 3;
+  vec2 corner = vec2((k & 1) != 0 ? 1.0 : -1.0, (k & 2) != 0 ? 1.0 : -1.0);   // in {-1, +1}^2
+  uint index = texelFetch(u_order, ivec2(quad % u_order_width, quad / u_order_width), 0).x;
+  bool second = index >= u_split;
+  uint local = second ? index - u_split : index;
+  // The order can be one frame older than the data.
   if (local >= (second ? u_counts.y : u_counts.x)) { gl_Position = CULLED; return; }
   ivec2 at = ivec2((int(local) % u_spr) * 3, int(local) / u_spr);
   uvec4 t0, t1, t2;
@@ -109,10 +120,10 @@ void main() {
   if (any(greaterThan(abs(px - 0.5 * u_viewport), 0.5 * u_viewport + reach))) { gl_Position = CULLED; return; }
 
   // 8. quad around the center; pixels have y down, NDC has y up
-  vec2 offset = a_corner.x * major + a_corner.y * minor;
+  vec2 offset = corner.x * major + corner.y * minor;
   vec2 ndc = vec2(2.0 * px.x / u_viewport.x - 1.0, 1.0 - 2.0 * px.y / u_viewport.y);
   gl_Position = vec4(ndc + offset * vec2(2.0, -2.0) / u_viewport, 0.0, 1.0);
-  v_corner = a_corner;
+  v_corner = corner;
   v_color = color;
 }
 "#;
@@ -136,17 +147,18 @@ void main() {
 }
 "#;
 
-/// Line vertex shader: one instance per segment, expanded to a screen-space
-/// quad of constant pixel width (WebGL lines are always one pixel wide, which
-/// is invisible in a headset and on high-DPI screens).
+/// Line vertex shader: every segment is a screen-space quad of constant
+/// pixel width (WebGL lines are always one pixel wide, which is invisible in
+/// a headset and on high-DPI screens). Each of the six vertices of a quad
+/// carries the whole segment; not instanced for the same reason as the splats.
 pub(crate) const LINE_VS: &str = r#"#version 300 es
 precision highp float;
 
-layout(location = 0) in vec2 a_corner;   // x: which end (-1, +1), y: side (-1, +1)
-layout(location = 1) in vec3 a_p0;
-layout(location = 2) in vec3 a_p1;
-layout(location = 3) in vec4 a_color;
-layout(location = 4) in float a_width;
+layout(location = 0) in vec3 a_p0;
+layout(location = 1) in vec3 a_p1;
+layout(location = 2) in vec4 a_color;
+layout(location = 3) in float a_width;
+layout(location = 4) in vec2 a_corner;   // x: which end (-1, +1), y: side (-1, +1)
 
 uniform mat4 u_view_proj;
 uniform vec2 u_viewport;     // W, H in pixels

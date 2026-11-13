@@ -7,7 +7,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{AddEventListenerOptions, Event, EventTarget, KeyboardEvent, PointerEvent, WheelEvent};
 
-use super::Inner;
+use super::{with_inner, Inner};
 use crate::nav::{NavKey, NavMode};
 
 /// An event listener that removes itself when dropped.
@@ -70,6 +70,16 @@ impl Pointers {
 fn typing_target(event: &Event) -> bool {
     let Some(element) = event.target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) else { return false };
     matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || element.is_content_editable()
+}
+
+/// True when the space bar would activate the focused control (a button, a
+/// link ...): that key press belongs to the page, not to the camera.
+fn space_activates_target(event: &KeyboardEvent) -> bool {
+    if event.code() != "Space" {
+        return false;
+    }
+    let Some(element) = event.target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) else { return false };
+    matches!(element.tag_name().as_str(), "BUTTON" | "A" | "SUMMARY") || element.get_attribute("role").as_deref() == Some("button")
 }
 
 impl Inner {
@@ -145,7 +155,7 @@ impl Inner {
     fn on_key(&self, e: &KeyboardEvent, down: bool) {
         let Some(key) = NavKey::from_code(&e.code()) else { return };
         if down {
-            if e.ctrl_key() || e.meta_key() || e.alt_key() || typing_target(e) || self.xr.borrow().is_some() {
+            if e.ctrl_key() || e.meta_key() || e.alt_key() || typing_target(e) || space_activates_target(e) || self.xr.borrow().is_some() {
                 return;
             }
             let mut nav = self.nav.borrow_mut();
@@ -172,11 +182,7 @@ pub(super) fn attach(inner: &Rc<Inner>) -> Result<(), JsValue> {
     let mut listeners = Vec::new();
     let mut listen = |target: &EventTarget, kind: &'static str, passive: bool, handler: fn(&Inner, &Event)| -> Result<(), JsValue> {
         let weak = Rc::downgrade(inner);
-        listeners.push(Listener::new(target, kind, passive, move |event: Event| {
-            if let Some(inner) = weak.upgrade() {
-                handler(&inner, &event);
-            }
-        })?);
+        listeners.push(Listener::new(target, kind, passive, move |event: Event| with_inner(&weak, |inner| handler(inner, &event)))?);
         Ok(())
     };
 

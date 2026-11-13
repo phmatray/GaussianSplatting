@@ -101,18 +101,14 @@ pub struct XrOptions {
     pub snap_angle: f32,
     /// Fixed foveation level in `0..=1` requested on the layer where the
     /// runtime supports it (Quest); `None` leaves the runtime default.
+    /// Splats are fill-rate bound, so rendering the periphery coarser is the
+    /// cheapest speed-up there is. Applies to the next session.
     pub foveation: Option<f32>,
 }
 
 impl Default for XrOptions {
     fn default() -> Self {
-        Self {
-            framebuffer_scale: 1.0,
-            miniature_scale: 15.0,
-            move_speed: 2.0,
-            snap_angle: 30f32.to_radians(),
-            foveation: Some(1.0),
-        }
+        Self { framebuffer_scale: 1.0, miniature_scale: 15.0, move_speed: 2.0, snap_angle: 30f32.to_radians(), foveation: Some(0.5) }
     }
 }
 

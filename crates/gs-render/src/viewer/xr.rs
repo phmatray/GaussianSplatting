@@ -100,7 +100,12 @@ fn read_pad(gamepad: &Gamepad) -> PadState {
             0.0
         }
     };
-    PadState { stick: [axis(2), axis(3)], trigger: button(0) as f32, primary: button(4) > BUTTON_THRESHOLD, secondary: button(5) > BUTTON_THRESHOLD }
+    PadState {
+        stick: [axis(2), axis(3)],
+        trigger: button(0) as f32,
+        primary: button(4) > BUTTON_THRESHOLD,
+        secondary: button(5) > BUTTON_THRESHOLD,
+    }
 }
 
 /// Starts entering VR. Must run synchronously inside a user-gesture handler.
@@ -119,6 +124,7 @@ pub(super) fn enter(inner: &Rc<Inner>) {
     // right here; only the waiting happens asynchronously.
     let promise = xr.request_session_with_options(XrSessionMode::ImmersiveVr, &init);
     inner.xr_pending.set(true);
+    inner.xr_cancelled.set(false);
     let inner = inner.clone();
     wasm_bindgen_futures::spawn_local(async move {
         let result = match promise.await {
@@ -127,7 +133,10 @@ pub(super) fn enter(inner: &Rc<Inner>) {
         };
         inner.xr_pending.set(false);
         match result {
-            Ok(()) => inner.notify_xr(true),
+            Ok(true) => inner.notify_xr(true),
+            // Cancelled while starting: not an error, and nobody was told
+            // that a session had begun.
+            Ok(false) => {}
             Err(e) => inner.set_xr_error(format!("could not start the VR session: {}", describe(&e))),
         }
     });
@@ -157,18 +166,25 @@ impl Inner {
         }
     }
 
-    async fn start_session(&self, session: XrSession) -> Result<(), JsValue> {
+    /// `exit_xr` or `destroy` was called while the session was starting.
+    fn xr_start_cancelled(&self) -> bool {
+        !self.alive.get() || self.xr_cancelled.get()
+    }
+
+    /// Returns whether the session runs now (`false`: cancelled meanwhile).
+    async fn start_session(&self, session: XrSession) -> Result<bool, JsValue> {
         let result = self.configure_session(&session).await;
-        if result.is_err() || !self.alive.get() {
-            // Half-started or orphaned session: do not leave the user in the void.
+        if !matches!(result, Ok(true)) {
+            // Half-started or unwanted session: do not leave the user in the void.
             let end = session.end();
             let _ = end.await;
-            return result.and(Err("the viewer was destroyed".into()));
         }
         result
     }
 
-    async fn configure_session(&self, session: &XrSession) -> Result<(), JsValue> {
+    /// Sets the session up and installs it as the running one. Returns
+    /// `Ok(false)`, with nothing installed, when the start was cancelled.
+    async fn configure_session(&self, session: &XrSession) -> Result<bool, JsValue> {
         let gl = &self.gl;
         // A no-op for a context created with `xrCompatible: true`.
         gl.make_xr_compatible().await?;
@@ -205,6 +221,12 @@ impl Inner {
             Err(_) => (session.request_reference_space(XrReferenceSpaceType::Local).await?, "local", -NOMINAL_EYE_HEIGHT),
         };
 
+        // Last await above: from here on the session is installed
+        // synchronously, so this is the one place to honor a cancellation.
+        if self.xr_start_cancelled() {
+            return Ok(false);
+        }
+
         // The user starts where the desktop camera is, standing on the floor
         // and facing the same way.
         let (eye, yaw) = {
@@ -233,10 +255,14 @@ impl Inner {
             controllers: Vec::new(),
             overlay: LineBatch::default(),
         });
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn exit_xr(&self) {
+        if self.xr_pending.get() {
+            // Still starting: the session is ended as soon as it exists.
+            self.xr_cancelled.set(true);
+        }
         // Clone the session out: `end()` may dispatch `end` re-entrantly.
         let session = self.xr.borrow().as_ref().map(|x| x.session.clone());
         if let Some(session) = session {
@@ -255,7 +281,7 @@ impl Inner {
         let callbacks = self.callbacks();
         let _ = state.session.remove_event_listener_with_callback("end", callbacks.xr_end.as_ref().unchecked_ref());
         drop(state);
-        if !self.context_lost.get() {
+        if self.has_gl_objects() {
             // The layer's framebuffer is gone; the desktop loop draws to the canvas again.
             self.gl.bind_framebuffer(GL::FRAMEBUFFER, None);
             self.lines.borrow_mut().set_overlay(&LineBatch::default());
@@ -288,6 +314,10 @@ impl Inner {
         // Re-arm first, like the JS idiom; the callback is persistent, so
         // this allocates nothing.
         x.raf_handle = session.request_animation_frame(self.callbacks().xr_frame.as_ref().unchecked_ref());
+        if self.context_lost.get() {
+            // Nothing can be drawn until `webglcontextrestored`.
+            return;
+        }
         let interval = x.last_time_ms.replace(time_ms).map(|last| time_ms - last);
         let dt = interval.map_or(0.0, |ms| (ms / 1000.0) as f32);
         x.frames += 1;
