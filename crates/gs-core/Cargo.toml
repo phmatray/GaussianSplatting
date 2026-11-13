@@ -1,0 +1,22 @@
+[package]
+name = "gs-core"
+description = "Scenes, simulated RGB-D sensors, Gaussian reconstruction, wire codec and reference rasterizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Multi-threaded capture/reconstruction (native only; do not enable on wasm32).
+par = ["dep:rayon"]
+
+[dependencies]
+glam.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+web-time.workspace = true
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+png.workspace = true
