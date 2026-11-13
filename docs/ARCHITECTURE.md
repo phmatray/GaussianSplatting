@@ -73,7 +73,7 @@ feed-forward depth network) would deliver.
 | `raster` | CPU reference splat rasterizer (tests, golden images, PSNR) |
 | `codec` | Binary wire messages (quantized 16-byte splats, previews) |
 | `protocol` | serde types: `PipelineConfig`, `SessionState`, `ControlMsg`, `Stats` |
-| `pipeline` | `Pipeline`: owns scene, rig, fusion state; `tick(dt) -> Vec<Message>` |
+| `pipeline` | `Pipeline`: owns scene, rig, fusion state; `tick(dt) -> Vec<Outgoing>` (one encoded message each, with `reliable` and a latest-wins `slot`), `snapshot()` for late joiners, `handle_control` |
 | `io` | Import/export of INRIA 3DGS `.ply` and antimatter15 `.splat` |
 
 ### Reconstruction (per valid depth pixel)
@@ -89,8 +89,12 @@ feed-forward depth network) would deliver.
 
 Live mode: a pixel is foreground when it is closer than the background plate
 (or its color differs from the plate, which keeps contact shadows).
-Scan mode: positions are hashed into voxels; only the first good observation of
-a voxel produces a splat, and its radius is at least `0.6 ×` the voxel size.
+Scan mode: positions are hashed into voxels; the first good observation of a
+voxel produces a round disc splat (radius `0.6 ×` the voxel size) and closer
+views refine it in place. New cells are streamed as `Append` chunks; because
+refinement rewrites earlier splats, layer 0 gets one full `Replace` when the
+scan ends or is paused. The handheld camera pose comes from
+`pipeline::scan_camera` (walk along `ScanPath` plus a look-around sweep).
 
 ### Wire format
 
@@ -104,7 +108,13 @@ One self-describing little-endian binary message per WebSocket frame or
 - `Stats`: JSON timings and counts.
 
 Layer 0 is static (background plate, or the accumulated scan), layer 1 is the
-live dynamic layer. Clients send JSON `ControlMsg` text frames back.
+live dynamic layer. Clients send JSON `ControlMsg` text frames back
+(`set_config`, `patch_config`, `set_scene`, `set_paused`, `set_time_scale`,
+`restart`, `scan_start`, `scan_pause`, `scan_reset`, `scan_finish`).
+
+Delivery contract: `State` and everything on layer 0 are *reliable* and
+ordered. Layer 0 may receive a full `Replace` at any time. Layer 1, `Stats`
+and `Preview` are *latest wins* per slot: a slow client skips stale ones.
 
 ## Transport and deployment modes
 
@@ -119,10 +129,64 @@ open the URL (or scan the QR code shown in the desktop app) and press
 "Entrer en VR". The frontend probes `GET /api/info`; if it answers, it uses the
 WebSocket, otherwise it starts the local worker.
 
+## Server interface (binding for `gs-server`, `src-tauri`, `gs-app`)
+
+`gs-server` runs one `Pipeline` on its own thread and two listeners:
+
+- **Loopback HTTP**, `127.0.0.1:7878` by default (next free port if busy).
+  Always on. Used by the desktop window and by a browser on the same machine.
+- **LAN HTTPS**, `0.0.0.0:7879` by default, self-signed certificate (WebXR
+  needs a secure context). **Off by default**; switched on at start
+  (`--lan`) or at run time through `POST /api/lan` from loopback only.
+
+Routes (identical on both listeners unless noted):
+
+| Route | Answer |
+|---|---|
+| `GET /api/info` | JSON, see below |
+| `POST /api/lan` body `{"enabled": bool}` | Loopback listener only (403 on the LAN one). Starts or stops the LAN listener, answers the new info JSON |
+| `GET /api/qr.svg?i=<n>` | SVG QR code of `lan.urls[n]` (default 0). 404 while LAN is off |
+| `GET /ws` | WebSocket. Server to client: binary frames, one codec message each. Client to server: text frames, one `ControlMsg` JSON each |
+| anything else | The web build (`gs-app` dist), `index.html` fallback, correct MIME types (`application/wasm`) |
+
+```json
+{
+  "name": "splat-live",
+  "version": "0.1.0",
+  "protocol": 1,
+  "http_url": "http://127.0.0.1:7878",
+  "ws_path": "/ws",
+  "lan": { "enabled": true, "urls": ["https://192.168.1.20:7879"], "fingerprint": "AB:CD:…" },
+  "clients": 1
+}
+```
+
+`lan.urls` is empty while LAN is off. `fingerprint` is the SHA-256 of the
+certificate so the user can compare it with what the headset browser shows.
+
+WebSocket behaviour: on connect the client receives `Pipeline::snapshot()`
+taken between two ticks, then the live stream. Reliable messages are queued
+per client in order; latest-wins messages overwrite their slot. A client whose
+reliable queue grows past a bound is resynchronised with a fresh snapshot
+instead of being fed an ever-growing backlog. A control message from any
+client applies to the shared pipeline; resulting reliable messages go to all
+clients. The pipeline does not tick while no client is connected.
+
+Hardening: the WebSocket and `POST` routes check the `Origin` header (same
+host, or the Tauri origins `tauri://localhost` / `http://tauri.localhost`);
+CORS on the loopback listener allows only those Tauri origins; control text
+frames are capped at `pipeline::MAX_CONTROL_JSON`.
+
+The Tauri shell starts the server in-process and exposes one command,
+`server_info`, returning the same info JSON. The frontend resolves its
+source in this order: Tauri command (then uses `http_url` as base), else
+`GET /api/info` on its own origin, else the local `gs-worker`.
+
 ## Viewer
 
-- Splat data lives in a GPU data texture; each instance is one sorted index.
-  The vertex shader projects the 3D covariance to a screen-space ellipse
+- Splat data lives in a GPU data texture; the sorted order lives in a second
+  (`R32UI`) texture and quads are indexed triangles that derive splat and
+  corner from `gl_VertexID`. The vertex shader projects the 3D covariance to a screen-space ellipse
   (EWA), the fragment shader evaluates the Gaussian, blending is back-to-front
   premultiplied alpha.
 - Sorting is a 16-bit counting sort on view depth, throttled to camera motion.
