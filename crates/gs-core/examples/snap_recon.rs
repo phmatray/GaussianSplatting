@@ -174,11 +174,12 @@ fn house(options: &Options) {
             save_png(&options.out.join(format!("house_{i}.png")), &stack(chunk));
         }
         // Dollhouse view: ceiling clipped the way the viewer does in
-        // miniature mode, with the scan path drawn on the reconstruction.
+        // miniature mode (15 cm below it, which also removes the beams that
+        // hang 13 cm down), with the scan path drawn on the reconstruction.
         let state = client.state.as_ref().expect("no State received");
         let ceiling = state.ceiling_height.expect("the house reports its ceiling height");
         let open = HouseScene::with_options(HouseOptions { ceiling: false }).snapshot(0.0);
-        let clipped: Vec<_> = cloud.iter().copied().filter(|s| s.pos[1] < ceiling - 0.12).collect();
+        let clipped: Vec<_> = cloud.iter().copied().filter(|s| s.pos[1] < ceiling - 0.15).collect();
         let top = top_view();
         let mut score = evaluate(&open, &clipped, &top.cam, pipeline.config().shadows, None);
         for p in &state.scan.as_ref().expect("the house reports its scan path").path {

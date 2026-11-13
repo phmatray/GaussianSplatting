@@ -98,7 +98,7 @@ fn held_out_views_are_really_held_out() {
 
 #[test]
 fn stage_default_settings() {
-    // Measured: mean 25.12 dB, worst view 22.86 dB (the one from above, which
+    // Measured: mean 25.14 dB, worst view 22.86 dB (the one from above, which
     // sees floor that no camera sees).
     let (psnrs, client) = stage_scores(PipelineConfig::for_scene(SceneKind::Stage), &[1.3, 2.8, 3.6], "stage_default.png");
     let (mean_psnr, worst) = (mean(&psnrs), min(&psnrs));
@@ -117,7 +117,7 @@ fn stage_default_settings() {
 
 #[test]
 fn stage_with_sensor_noise() {
-    // Measured: mean 24.55 dB, worst 22.62 dB.
+    // Measured: mean 24.56 dB, worst 22.63 dB.
     let config = PipelineConfig { noise: NoiseModel::realistic(), ..PipelineConfig::for_scene(SceneKind::Stage) };
     let (psnrs, client) = stage_scores(config, &[1.3, 3.2], "stage_noise.png");
     let (mean_psnr, worst) = (mean(&psnrs), min(&psnrs));
@@ -130,8 +130,8 @@ fn stage_with_sensor_noise() {
 
 #[test]
 fn stage_light_preset_and_without_background_subtraction() {
-    // Measured: light preset mean 25.01 dB (worst 22.26); everything live
-    // mean 25.47 dB (worst 23.04).
+    // Measured: light preset mean 25.02 dB (worst 22.26); everything live
+    // mean 25.47 dB (worst 23.03).
     let (psnrs, _) = stage_scores(PipelineConfig::light(SceneKind::Stage), &[2.1], "stage_light.png");
     println!("stage light: mean {:.2} dB, worst {:.2} dB", mean(&psnrs), min(&psnrs));
     assert!(mean(&psnrs) >= 24.3 && min(&psnrs) >= 21.7, "{psnrs:?}");
@@ -209,7 +209,7 @@ fn the_dancers_shadow_is_reconstructed_without_a_halo() {
         // Measured (clean / noisy): in the shadow the reconstruction is
         // 12.3 / 12.5 levels from the shadowed truth and 55 from the lit
         // one; the plate alone is 41 levels off. In the band around the
-        // shadow: 8.3 / 8.5 levels, against 8.1 / 8.3 for the plate alone.
+        // shadow: 8.4 / 8.5 levels, against 8.1 / 8.3 for the plate alone.
         let (to_shadow, to_lit) = (error(&reconstruction, &with_shadow, &shadow), error(&reconstruction, &without, &shadow));
         let plate_to_shadow = error(&static_only, &with_shadow, &shadow);
         // Around the shadow the floor is as good as without live layer.

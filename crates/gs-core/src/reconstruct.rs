@@ -102,7 +102,11 @@ pub struct ReconstructParams {
     /// edges, unless they continue a plane seen at a grazing angle (see the
     /// module documentation).
     pub edge_threshold: f32,
-    /// Largest ratio between the two tangential standard deviations.
+    /// Largest ratio between the two tangential standard deviations: the
+    /// long axis of a splat seen at a slant is cut down to this multiple of
+    /// the short one. Smaller values give crisper outlines on curved
+    /// surfaces and, with fewer than about six cameras, gaps on floors that
+    /// every camera sees at a grazing angle.
     pub max_anisotropy: f32,
     /// A pixel needs at least this many depth-continuous 4-neighbours;
     /// lonelier ones are flying pixels or speckles and are dropped. With `0`
@@ -297,8 +301,6 @@ struct PixelSurface {
     z: f32,
     /// The surface ends (silhouette) toward `-u`, `+u`, `-v`, `+v`.
     open: [bool; 4],
-    /// The surface curves or creases at this pixel.
-    bent: bool,
 }
 
 /// Inverse-depth fit along one image axis.
@@ -312,9 +314,6 @@ struct AxisFit {
     /// No neighbour continues the surface, yet the depth keeps stepping by
     /// the same amount: a plane beyond the grazing limit, not an edge.
     steep: bool,
-    /// Both neighbours continue the surface but their slopes differ: the
-    /// surface curves or creases at this pixel.
-    bent: bool,
 }
 
 /// One neighbour of a pixel along an image axis.
@@ -495,7 +494,6 @@ impl<'a> FrameGeometry<'a> {
             Neighbor::Invalid => !matches!(self.neighbor(c, at, 2 * step, 2.0 * cap), Neighbor::Near(_)),
             _ => false,
         };
-        let bent = matches!((d0.filter(|_| keep0), d1.filter(|_| keep1)), (Some(a), Some(b)) if (a - b).abs() > tolerance);
         let (grad, sides) = match (d0.filter(|_| keep0), d1.filter(|_| keep1)) {
             (Some(a), Some(b)) => {
                 // Differences that agree within the tolerance average (the
@@ -517,7 +515,7 @@ impl<'a> FrameGeometry<'a> {
         };
         let steep = sides == 0 && (beyond(n0, -1) || beyond(n1, 1));
         let (n0, n1) = (settle(n0, keep0), settle(n1, keep1));
-        AxisFit { grad, sides, open: [open(n0, -1), open(n1, 1)], steep, bent }
+        AxisFit { grad, sides, open: [open(n0, -1), open(n1, 1)], steep }
     }
 
     /// The surface at pixel `(x, y)`, or `None` for an invalid or unsupported
@@ -547,8 +545,7 @@ impl<'a> FrameGeometry<'a> {
         if !(cos > 0.0 && p.is_finite()) {
             return None;
         }
-        let open = [fu.open[0], fu.open[1], fv.open[0], fv.open[1]];
-        Some(PixelSurface { p, pu, pv, n, cos, z, open, bent: fu.bent || fv.bent })
+        Some(PixelSurface { p, pu, pv, n, cos, z, open: [fu.open[0], fu.open[1], fv.open[0], fv.open[1]] })
     }
 }
 
@@ -570,14 +567,12 @@ fn tangent_splat(pos: Vec3, tu: Vec3, tv: Vec3, n: Vec3, thickness: f32, max_ani
     major -= n * n.dot(major);
     let major = major.try_normalize().unwrap_or_else(|| n.any_orthonormal_vector());
     let minor = n.cross(major);
+    // The long axis is cut down to the allowed ratio (never the short one
+    // widened: that would blur across the surface). The floor on the short
+    // axis only guards degenerate tangents.
     let s1 = l1.sqrt();
-    let (s1, s2) = if std::env::var("GS_CAPLONG").is_ok() {
-        let s2 = l2.sqrt().max(s1 / 20.0);
-        (s1.min(s2 * max_anisotropy.max(1.0)), s2)
-    } else {
-        let s2 = l2.sqrt().max(s1 / max_anisotropy.max(1.0));
-        (s1.min(s2 * max_anisotropy.max(1.0)), s2)
-    };
+    let s2 = l2.sqrt().max(s1 * 0.05);
+    let s1 = s1.min(s2 * max_anisotropy.max(1.0));
     let rot = Quat::from_mat3(&Mat3::from_cols(major, minor, n));
     Splat { pos: pos.to_array(), scale: [s1, s2, (s2 * thickness).max(1.0e-5)], rot: rot.to_array(), rgba }
 }
@@ -623,11 +618,7 @@ fn row_to_splats(
             rotation * (s.pv * kv),
             rotation * s.n,
             params.thickness,
-            {
-                let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-                let open = s.open.iter().any(|&o| o);
-                if s.bent { env("GS_BENT", params.max_anisotropy) } else if open { env("GS_OPEN", params.max_anisotropy) } else { params.max_anisotropy }
-            },
+            params.max_anisotropy,
             [rgb[0], rgb[1], rgb[2], alpha],
         );
         if is_finite_splat(&splat) {
@@ -637,8 +628,9 @@ fn row_to_splats(
 }
 
 /// True when `frame` has the buffers its size promises and matches `cam`,
-/// and `cam` is a usable calibration (finite pose, finite focal lengths in a
-/// range where the per-pixel geometry does not underflow or overflow).
+/// and `cam` is a usable calibration (a finite rigid pose, finite focal
+/// lengths in a range where the per-pixel geometry does not underflow or
+/// overflow).
 fn frame_matches(frame: &RgbdFrame, cam: &Camera) -> bool {
     let n = frame.width as usize * frame.height as usize;
     let focal = |f: f32| (1.0e-3..=1.0e9).contains(&f);
@@ -651,8 +643,9 @@ fn frame_matches(frame: &RgbdFrame, cam: &Camera) -> bool {
         && focal(cam.fy)
         && cam.cx.is_finite()
         && cam.cy.is_finite()
-        && pose.matrix3.is_finite()
         && pose.translation.is_finite()
+        // A rotation, give or take calibration round-off (also false for NaN).
+        && (pose.matrix3.determinant() - 1.0).abs() < 1.0e-2
 }
 
 /// True when every number of `splat` is finite. Depths near the limits of
@@ -671,7 +664,8 @@ fn is_finite_splat(splat: &Splat) -> bool {
 /// pixel. Normals always use the whole depth map, masked or not.
 ///
 /// A frame that does not match the camera's image size, a camera whose
-/// calibration is not finite, or a mask of the wrong length, produces nothing. With the `par` feature rows are processed
+/// calibration is not finite or whose pose is not rigid, or a mask of the
+/// wrong length, produces nothing. With the `par` feature rows are processed
 /// in parallel; the output is identical to the single-threaded one.
 pub fn frame_to_splats(
     frame: &RgbdFrame,
@@ -2138,6 +2132,8 @@ mod tests {
             Camera { fx: 1.0e30, fy: 1.0e30, ..good },
             Camera { cx: f32::NAN, ..good },
             Camera { world_from_cam: nan_pose, ..good },
+            Camera { world_from_cam: glam::Affine3A::from_scale(Vec3::ZERO), ..good },
+            Camera { world_from_cam: glam::Affine3A::from_scale(Vec3::splat(1.0e20)), ..good },
         ] {
             assert!(splats_of(&frame, &cam, &params).is_empty(), "{cam:?}");
             assert!(VoxelFusion::default().integrate(&frame, &cam, &params).is_empty(), "{cam:?}");
