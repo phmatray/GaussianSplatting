@@ -9,6 +9,9 @@
 //!   with navigation, gizmos and an "Enter VR" button.
 //! * `?test=perf&n=200000` — sort and frame times for `n` splats in
 //!   `window.__perf`.
+//! * `?test=scene&scene=stage|house` — the product's own cloud from
+//!   `gs_core::Pipeline` in the real viewer: pictures, timings per blending
+//!   mode, popping and fragment counts through `window.__scene`.
 //! * `?test=drop&when=end` — the last viewer handle is dropped from inside
 //!   one of the viewer's own callbacks.
 //!
@@ -29,6 +32,10 @@ mod drop_in_callback;
 mod live;
 #[cfg(target_arch = "wasm32")]
 mod perf;
+#[cfg(target_arch = "wasm32")]
+mod scene;
+#[cfg(target_arch = "wasm32")]
+mod scenes;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -43,6 +50,7 @@ fn main() {
     let started = match test.as_str() {
         "compare" => compare::start(),
         "perf" => perf::start(),
+        "scene" => scene::start(),
         "drop" => drop_in_callback::start(),
         _ => live::start(),
     };

@@ -95,6 +95,14 @@ impl Bounds {
     }
 }
 
+/// The box the hierarchy files a primitive with world box `b` under: `b`
+/// grown by the padding of [`PAD_ABS`]. A ray that hits the primitive passes
+/// through it.
+pub(crate) fn padded(b: &Aabb) -> Aabb {
+    let p = Bounds::padded(b);
+    Aabb::new(p.min.into(), p.max.into())
+}
+
 /// A subtree under construction: a range of `order` and its bounds.
 #[derive(Clone, Copy)]
 struct Range {

@@ -111,6 +111,7 @@
 mod depth;
 pub mod gizmo;
 pub mod nav;
+mod normalized;
 mod pack;
 pub mod params;
 pub mod rig;
@@ -129,7 +130,8 @@ mod viewer;
 pub use gizmo::{FrustumGizmo, GizmoScene, GridGizmo};
 pub use nav::NavMode;
 pub use params::{
-    Applied, RenderParams, SceneHints, ViewerOptions, ViewerStats, XrInfo, XrOptions, XrViewInfo, LAYER_COUNT, LAYER_DYNAMIC, LAYER_STATIC,
+    ActiveBlend, Applied, BlendMode, BlendQuality, BlendReason, BlendStatus, LayerContent, RenderParams, SceneHints, ViewerOptions,
+    ViewerStats, XrInfo, XrOptions, XrViewInfo, LAYER_COUNT, LAYER_DYNAMIC, LAYER_STATIC, LIVE_LAYER_WEIGHT,
 };
 #[cfg(target_arch = "wasm32")]
 pub use viewer::Viewer;

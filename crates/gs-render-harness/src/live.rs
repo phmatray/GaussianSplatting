@@ -10,7 +10,10 @@
 //! hint for the miniature clip), `tick=<ms>`, `static_cams=<n>` and
 //! `capture_scale=<factor>` (number and resolution of the simulated cameras;
 //! the scripted checks use small values because a headless browser
-//! rasterizes in software).
+//! rasterizes in software), `blend=auto|sorted|normalized` and
+//! `quality=hard|soft` (initial blending; the default is the viewer's),
+//! `mask_float=1` (hides the float render-target extensions from the viewer,
+//! as on a GPU without them).
 //!
 //! For scripts: `window.__harness.state()` returns a snapshot of the viewer,
 //! `window.__harness.cmd(name, arg)` changes it (see [`Live::command`]),
@@ -24,21 +27,50 @@ use std::rc::Rc;
 use glam::{Affine3A, Mat4, Vec3};
 use gs_core::capture::{render_rgbd, CaptureOptions};
 use gs_core::codec::{self, LayerMode};
-use gs_core::raster::{rasterize, RasterOptions};
 use gs_core::rig::RingRig;
 use gs_core::scene::stage::{CAPTURE_HEIGHT, STAGE_RADIUS};
 use gs_core::scene::{Scene, StageScene};
 use gs_core::{Aabb, Camera, RgbdFrame, Splat};
 use gs_render::{
-    Applied, FrustumGizmo, GizmoScene, GridGizmo, NavMode, RenderParams, SceneHints, Viewer, ViewerOptions, XrInfo, LAYER_DYNAMIC,
-    LAYER_STATIC,
+    Applied, BlendMode, BlendQuality, FrustumGizmo, GizmoScene, GridGizmo, LayerContent, NavMode, RenderParams, SceneHints, Viewer,
+    ViewerOptions, XrInfo, LAYER_DYNAMIC, LAYER_STATIC,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{HtmlButtonElement, HtmlCanvasElement};
 
 use crate::clouds::{unproject_frame, UnprojectOptions};
+use crate::compare::reference_image;
 use crate::dom;
+
+/// `auto`, `sorted` or `normalized` (anything else is `auto`).
+pub fn parse_blend(name: Option<&str>) -> BlendMode {
+    match name {
+        Some("sorted") => BlendMode::Sorted,
+        Some("normalized") => BlendMode::Normalized,
+        _ => BlendMode::Auto,
+    }
+}
+
+/// `hard` or `soft` (anything else is the default level).
+pub fn parse_quality(name: Option<&str>) -> BlendQuality {
+    match name {
+        Some("hard") => BlendQuality::Hard,
+        Some("soft") => BlendQuality::Soft,
+        _ => BlendQuality::default(),
+    }
+}
+
+/// Makes `getExtension` deny the two float render-target extensions, as a
+/// GPU without them would. Must run before the viewer creates its context.
+pub fn mask_float_targets() {
+    let script = "(() => { const real = WebGL2RenderingContext.prototype.getExtension; \
+        WebGL2RenderingContext.prototype.getExtension = function (name) { \
+            return /^EXT_color_buffer_(half_)?float$/.test(name) ? null : real.call(this, name); }; })()";
+    if let Err(error) = js_sys::eval(script) {
+        web_sys::console::error_2(&"[harness] could not mask the float extensions:".into(), &error);
+    }
+}
 
 /// Splats per `Append` message of the static layer.
 const STATIC_CHUNK: usize = 4_000;
@@ -195,6 +227,24 @@ impl Live {
             }
             "gizmos" => viewer.set_params(RenderParams { show_gizmos: flag, ..params }),
             "points" => viewer.set_params(RenderParams { point_mode: flag, ..params }),
+            "blend" => viewer.set_params(RenderParams { blend: parse_blend(arg.as_string().as_deref()), ..params }),
+            "quality" => viewer.set_params(RenderParams { quality: parse_quality(arg.as_string().as_deref()), ..params }),
+            "cullBackfaces" => viewer.set_params(RenderParams { cull_backfaces: flag, ..params }),
+            "liveWeight" => {
+                let weight = arg.as_f64().unwrap_or(f64::NAN) as f32;
+                viewer.set_params(RenderParams { layer_weights: [params.layer_weights[0], weight], ..params });
+            }
+            "background" => {
+                let v: Vec<f32> = js_sys::Array::from(arg).iter().map(|x| x.as_f64().unwrap_or(f64::NAN) as f32).collect();
+                if v.len() == 3 {
+                    viewer.set_params(RenderParams { background: [v[0], v[1], v[2]], ..params });
+                }
+            }
+            // What the static layer is taken to hold: "imported" or "surfels".
+            "staticContent" => {
+                let content = if arg.as_string().as_deref() == Some("imported") { LayerContent::Imported } else { LayerContent::Surfels };
+                let _ = viewer.set_layer_content(LAYER_STATIC, content);
+            }
             "showStatic" => viewer.set_params(RenderParams { show_static: flag, ..params }),
             "showDynamic" => viewer.set_params(RenderParams { show_dynamic: flag, ..params }),
             "splatScale" => viewer.set_params(RenderParams { splat_scale: arg.as_f64().unwrap_or(1.0) as f32, ..params }),
@@ -231,8 +281,9 @@ impl Live {
 
     /// `window.__harness.xrReference(eye)`: the picture eye `eye` of the
     /// running VR session should show (splats only), rendered by the CPU
-    /// reference rasterizer from the view and projection matrices the viewer
-    /// reports: `{ width, height, viewport, rgb }`, or `null` without a session.
+    /// reference of the blending mode in use from the view and projection
+    /// matrices the viewer reports: `{ width, height, viewport, rgb }`, or
+    /// `null` without a session.
     fn xr_reference(&self, eye: u32) -> JsValue {
         let Some(info) = self.viewer.xr_info() else { return JsValue::NULL };
         let Some(view) = info.views.get(eye as usize) else { return JsValue::NULL };
@@ -249,16 +300,11 @@ impl Live {
             world_from_cam: Affine3A::from_mat4(view.view.inverse()),
         };
         let params = self.viewer.params();
-        let options = RasterOptions {
-            // What an 8-bit framebuffer makes of the clear color.
-            background: params.background.map(|c| (c * 255.0).round() as u8),
-            splat_scale: params.splat_scale,
-            point_mode: params.point_mode,
-            point_sigma_px: params.point_sigma_px,
-            // The near plane of the session, in view units.
-            near: p.w_axis.z / (p.z_axis.z - 1.0),
-        };
-        let image = rasterize(&self.viewer.splats(), &cam, &options);
+        // What an 8-bit framebuffer makes of the clear color.
+        let background = params.background.map(|c| (c * 255.0).round() as u8);
+        // The near plane of the session, in view units.
+        let near = p.w_axis.z / (p.z_axis.z - 1.0);
+        let image = reference_image(&self.viewer, &cam, &params, background, near);
         let out = js_sys::Object::new();
         dom::set(&out, "width", width);
         dom::set(&out, "height", height);
@@ -296,6 +342,10 @@ impl Live {
         dom::set(&state, "target", dom::numbers(&viewer.target().to_array()));
         dom::set(&state, "view", dom::numbers(&viewer.view_matrix().to_cols_array()));
         dom::set(&state, "showGizmos", params.show_gizmos);
+        dom::set(&state, "blend", stats.blend.active.as_str());
+        dom::set(&state, "blendReason", stats.blend.reason.as_str());
+        dom::set(&state, "blendFallback", stats.blend.reason.is_fallback());
+        dom::set(&state, "offscreen", dom::numbers(&[stats.offscreen_width as f32, stats.offscreen_height as f32]));
         dom::set(&state, "xrActive", stats.xr_active);
         dom::set(&state, "xrSupported", self.xr_supported.get().map_or(JsValue::NULL, JsValue::from));
         dom::set(&state, "xrError", viewer.xr_error().map_or(JsValue::NULL, JsValue::from));
@@ -340,7 +390,15 @@ pub fn start() -> Result<(), JsValue> {
     button.style().set_property("display", "inline-block")?;
     let scene = StageScene::new();
     let (eye, target) = scene.viewer_start();
+    if dom::query("mask_float").is_some() {
+        mask_float_targets();
+    }
     let options = ViewerOptions {
+        params: RenderParams {
+            blend: parse_blend(dom::query("blend").as_deref()),
+            quality: parse_quality(dom::query("quality").as_deref()),
+            ..RenderParams::default()
+        },
         nav_mode: if dom::query("nav").as_deref() == Some("fly") { NavMode::Fly } else { NavMode::Orbit },
         eye,
         target,

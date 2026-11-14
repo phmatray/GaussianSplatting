@@ -4,9 +4,23 @@
 //! compositing so that every combination can be compared on equal terms.
 //!
 //! [`rasterize`] has the interface of [`crate::raster::rasterize`]; with
-//! [`WblendOptions::default`] it reproduces that function (a unit test pins
-//! this down). [`render`] additionally returns the coverage of every pixel
-//! and accepts several layers with a blending priority each.
+//! [`WblendOptions::sorted`] it reproduces that function, with
+//! [`WblendOptions::default`] its `classic_dilation` variant, the renderer
+//! of the product before the quality round (unit tests pin both down).
+//! [`render`] additionally returns the coverage of every pixel and accepts
+//! several layers with a blending priority each.
+//!
+//! # The two modes of the product
+//!
+//! [`WblendOptions::normalized_hard`] and [`WblendOptions::normalized_soft`]
+//! are the CPU reference of the "Normalised" blending mode of
+//! `docs/ARCHITECTURE.md` at its two quality levels; `e2e/render` compares
+//! the WebGL2 viewer against them pixel by pixel, with the layers weighted
+//! `1` and [`LIVE_LAYER_WEIGHT`]. [`WblendOptions::sorted`] is the "Sorted"
+//! mode. The section "What a WebGL2 port needs" below is the lab's original
+//! sketch; `gs-render` documents what the port actually does (a logarithmic
+//! depth encoding, an 8-bit target for the coverage, no depth attachment in
+//! the accumulation pass).
 //!
 //! # Normalised blending ([`Blend::Normalized`])
 //!
@@ -239,10 +253,15 @@ pub struct WblendOptions {
     pub cull_backfaces: bool,
     /// Splats whose center is closer than this are not drawn (meters).
     pub near: f32,
+    /// Point-cloud view: when positive, every splat is drawn as a dot with
+    /// this standard deviation in pixels, facing the camera, instead of its
+    /// real footprint (the `point_mode` of [`crate::raster::RasterOptions`]).
+    pub point_sigma_px: f32,
 }
 
 impl Default for WblendOptions {
-    /// Today's renderer: sorted "over", EWA, 0.3 px² dilation, 3σ cutoff.
+    /// The renderer of the product before the quality round, which the lab
+    /// calls "today": sorted "over", EWA, plain 0.3 px² dilation, 3σ cutoff.
     fn default() -> Self {
         Self {
             background: [0, 0, 0],
@@ -255,7 +274,70 @@ impl Default for WblendOptions {
             cutoff: 3.0,
             cull_backfaces: false,
             near: DEFAULT_NEAR,
+            point_sigma_px: 0.0,
         }
+    }
+}
+
+/// Blending weight of the live layer (layer 1) relative to the static one
+/// under [`Blend::Normalized`]. The live layer carries the shadows the dancer
+/// casts on the floor of the static plate; at equal weights they come out at
+/// half strength and patchy.
+pub const LIVE_LAYER_WEIGHT: f32 = 16.0;
+
+impl WblendOptions {
+    /// The "Sorted" blending mode of `docs/ARCHITECTURE.md`: back-to-front
+    /// "over" with the energy-conserving low-pass. Reproduces
+    /// [`crate::raster::rasterize`] with its default options.
+    /// ([`Self::default`] is the same with the plain dilation: the renderer
+    /// the lab calls "today".)
+    pub fn sorted() -> Self {
+        Self { low_pass: LowPass::Normalized(crate::splat::LOW_PASS_PX2), ..Self::default() }
+    }
+
+    /// The "Normalised" blending mode of `docs/ARCHITECTURE.md` with hard
+    /// silhouettes: the cheaper of the two quality levels and exactly what
+    /// the WebGL2 viewer renders at `Quality::Hard` (one visibility pass, one
+    /// `RGBA16F` accumulation target).
+    ///
+    /// Opaque inside visibility discs of 1.6 standard deviations and empty
+    /// outside every disc, depth of a fragment on the plane of its splat,
+    /// two-sided 1 % depth test, tapered 3σ kernel, EWA footprint with the
+    /// normalised low-pass filter ([`crate::splat::LOW_PASS_PX2`]) and no
+    /// screen-space floor.
+    pub fn normalized_hard() -> Self {
+        let params = Normalized {
+            vis_cutoff: 1.6,
+            depth_tol: 0.01,
+            depth_tol_sigma: 0.0,
+            coverage: Coverage::None,
+            taper: true,
+            silhouette: Silhouette::Hard,
+            near_fringe: false,
+        };
+        Self {
+            blend: Blend::Normalized(params),
+            depth: DepthModel::Plane,
+            low_pass: LowPass::Normalized(crate::splat::LOW_PASS_PX2),
+            ..Self::default()
+        }
+    }
+
+    /// The same mode with soft silhouettes over the next surface: the
+    /// configuration behind the lab's headline figures and what the viewer
+    /// renders at `Quality::Soft` (two visibility passes, three accumulation
+    /// targets).
+    ///
+    /// Visibility discs of 2 standard deviations, coverage `min(1, W / 0.5)`
+    /// of the weight accumulated without the layer weights, first surface
+    /// over second surface over the background; everything else as in
+    /// [`Self::normalized_hard`].
+    pub fn normalized_soft() -> Self {
+        let hard = Self::normalized_hard();
+        let Blend::Normalized(params) = hard.blend else { unreachable!("normalized_hard is normalised") };
+        let params =
+            Normalized { vis_cutoff: 2.0, coverage: Coverage::Linear(0.5), silhouette: Silhouette::SoftOverNextSurface, ..params };
+        Self { blend: Blend::Normalized(params), ..hard }
     }
 }
 
@@ -361,6 +443,9 @@ struct View {
     cy: f32,
     width: f32,
     height: f32,
+    /// View units per world unit: 1 unless the camera pose carries a uniform
+    /// scale (the miniature mode of the viewer).
+    scale: f32,
 }
 
 impl View {
@@ -378,6 +463,7 @@ impl View {
             cy: cam.cy,
             width: cam.width as f32,
             height: cam.height as f32,
+            scale: m.x_axis.truncate().length(),
         }
     }
 
@@ -439,9 +525,15 @@ fn prepare(splat: &Splat, layer_weight: f32, view: &View, opts: &WblendOptions) 
         LowPass::Dilate(s) => (s.max(1.0e-4), false),
         LowPass::Normalized(s) => (s.max(1.0e-4), true),
     };
-    let (a, b, c) = (ma + low, mb, mc + low);
-    let det_m = positive(ma * mc - mb * mb);
-    let det = det_m + low * (ma + mc) + low * low;
+    let point = opts.point_sigma_px > 0.0;
+    let (a, b, c, det_m, det) = if point {
+        // A dot has the size it is asked to have: nothing is dilated.
+        let var = (opts.point_sigma_px * opts.point_sigma_px).max(1.0e-6);
+        (var, 0.0, var, var * var, var * var)
+    } else {
+        let det_m = positive(ma * mc - mb * mb);
+        (ma + low, mb, mc + low, det_m, det_m + low * (ma + mc) + low * low)
+    };
     if !(det > 0.0 && det.is_finite() && px.is_finite() && py.is_finite()) {
         return None;
     }
@@ -467,8 +559,10 @@ fn prepare(splat: &Splat, layer_weight: f32, view: &View, opts: &WblendOptions) 
     let mut x_extent = reach * a.sqrt();
     let mut y_extent = reach * c.sqrt();
 
-    let sigma = k * splat.scale[0].max(splat.scale[1]);
-    let needs_plane = opts.footprint == Footprint::Planar || opts.depth == DepthModel::Plane;
+    // In view units, like the depths it is compared with. A dot has no
+    // extent in depth: all its fragments take the depth of its center.
+    let sigma = if point { 0.0 } else { k * splat.scale[0].max(splat.scale[1]) * view.scale };
+    let needs_plane = !point && (opts.footprint == Footprint::Planar || opts.depth == DepthModel::Plane);
     let mut plane = None;
     let mut whole_screen = false;
     if needs_plane {
@@ -866,6 +960,92 @@ mod tests {
     }
 
     #[test]
+    fn sorted_options_reproduce_the_reference_rasterizer() {
+        let cam = camera();
+        let mut rng = Rng::new(8);
+        // Down to a tenth of a pixel, where the gain of the low-pass matters.
+        let splats: Vec<Splat> = (0..600)
+            .map(|_| {
+                let mut s = rng.splat(1.0, 0.001, 0.1);
+                s.pos[2] -= 3.0;
+                s
+            })
+            .collect();
+        for background in [[0, 0, 0], [18, 20, 28]] {
+            let expected = raster::rasterize(&splats, &cam, &RasterOptions { background, ..Default::default() });
+            let got = rasterize(&splats, &cam, &WblendOptions { background, ..WblendOptions::sorted() });
+            assert!(max_difference(&expected, &got) <= 1, "differs by {}", max_difference(&expected, &got));
+            // And the two filters do differ on this cloud.
+            let classic = rasterize(&splats, &cam, &WblendOptions { background, ..WblendOptions::default() });
+            assert!(max_difference(&classic, &got) > 20);
+        }
+    }
+
+    #[test]
+    fn point_mode_draws_dots_of_fixed_size() {
+        let cam = camera();
+        // Very different world sizes and depths, the same dot on screen.
+        let a = disc(cam.unproject(50.5, 80.5, 1.0), Vec3::new(0.6, 0.0, 0.8), 0.5, [255; 4]);
+        let b = disc(cam.unproject(150.5, 80.5, 6.0), Vec3::Z, 0.001, [255; 4]);
+        let sorted = WblendOptions { point_sigma_px: 1.0, ..WblendOptions::sorted() };
+        let expected = raster::rasterize(&[a, b], &cam, &RasterOptions { point_mode: true, point_sigma_px: 1.0, ..Default::default() });
+        assert!(max_difference(&rasterize(&[a, b], &cam, &sorted), &expected) <= 1);
+        // Normalised: opaque dots of the visibility radius (1.6 px), the
+        // nearer one in front, each at the depth of its center.
+        let hard = WblendOptions { point_sigma_px: 1.0, ..WblendOptions::normalized_hard() };
+        let image = rasterize(&[a, b], &cam, &hard);
+        for cx in [50u32, 150] {
+            assert_eq!(image.pixel(cx, 80), [255; 3]);
+            assert_eq!(image.pixel(cx + 1, 80), [255; 3]);
+            assert_eq!(image.pixel(cx + 2, 80), [0; 3]);
+        }
+        let behind = disc(cam.unproject(50.5, 80.5, 1.2), Vec3::Z, 0.3, [255, 0, 0, 255]);
+        assert_eq!(rasterize(&[behind, a], &cam, &hard).pixel(50, 80), [255; 3]);
+    }
+
+    #[test]
+    fn presets_are_the_documented_configurations() {
+        let hard = WblendOptions::normalized_hard();
+        let Blend::Normalized(h) = hard.blend else { panic!("not normalised") };
+        assert_eq!((h.vis_cutoff, h.silhouette, h.coverage, h.near_fringe), (1.6, Silhouette::Hard, Coverage::None, false));
+        assert_eq!((hard.depth, hard.footprint, hard.screen_floor_px), (DepthModel::Plane, Footprint::Ewa, 0.0));
+        assert_eq!(hard.low_pass, LowPass::Normalized(crate::splat::LOW_PASS_PX2));
+        let soft = WblendOptions::normalized_soft();
+        let Blend::Normalized(s) = soft.blend else { panic!("not normalised") };
+        assert_eq!((s.vis_cutoff, s.silhouette, s.coverage), (2.0, Silhouette::SoftOverNextSurface, Coverage::Linear(0.5)));
+        assert_eq!(WblendOptions { blend: hard.blend, ..soft }, hard);
+        assert_eq!(WblendOptions::sorted().blend, Blend::Over);
+        assert_eq!(LIVE_LAYER_WEIGHT, 16.0);
+    }
+
+    #[test]
+    fn a_scaled_view_renders_like_a_scaled_scene() {
+        // The miniature mode of the viewer puts a uniform scale into the
+        // camera pose: the picture must be the one of the scaled scene.
+        let cam = camera();
+        let mut rng = Rng::new(9);
+        let splats: Vec<Splat> = (0..300)
+            .map(|_| {
+                let mut s = Splat::surfel(rng.vec3(-0.6, 0.6), rng.quat() * Vec3::Z, rng.range(0.02, 0.08), 0.004, [0, 0, 0, 255]);
+                s.pos[2] -= 3.0;
+                s.rgba = [rng.below(256) as u8, rng.below(256) as u8, rng.below(256) as u8, 255];
+                s
+            })
+            .collect();
+        let factor = 15.0;
+        let big: Vec<Splat> = splats.iter().map(|s| Splat { pos: s.pos.map(|v| v * factor), scale: s.scale.map(|v| v * factor), ..*s }).collect();
+        let mut scaled = cam;
+        scaled.world_from_cam = glam::Affine3A::from_mat4(glam::Mat4::from_scale(Vec3::splat(factor)) * glam::Mat4::from(cam.world_from_cam));
+        for opts in [WblendOptions::normalized_hard(), WblendOptions::normalized_soft(), WblendOptions::sorted()] {
+            let a = rasterize(&splats, &cam, &opts);
+            let b = rasterize(&big, &scaled, &opts);
+            let off = a.rgb.iter().zip(&b.rgb).filter(|(x, y)| x.abs_diff(**y) > 2).count();
+            assert!(off < a.rgb.len() / 500, "{off} of {} channels differ", a.rgb.len());
+            assert!(a.rgb.iter().filter(|&&v| v > 0).count() > 5_000);
+        }
+    }
+
+    #[test]
     fn default_options_reproduce_the_reference_rasterizer() {
         let cam = camera();
         let mut rng = Rng::new(7);
@@ -877,14 +1057,15 @@ mod tests {
             })
             .collect();
         for background in [[0, 0, 0], [255, 255, 255], [18, 20, 28]] {
-            let expected = raster::rasterize(&splats, &cam, &RasterOptions { background, ..Default::default() });
+            let expected = raster::rasterize(&splats, &cam, &RasterOptions { background, classic_dilation: true, ..Default::default() });
             let got = rasterize(&splats, &cam, &WblendOptions { background, ..Default::default() });
             assert!(max_difference(&expected, &got) <= 1, "differs by {}", max_difference(&expected, &got));
         }
         // And the coverage is the accumulated opacity.
         let rendered = render(&[Layer { splats: &splats, weight: 1.0 }], &cam, &WblendOptions::default());
-        let black = raster::rasterize(&splats, &cam, &RasterOptions { background: [0; 3], ..Default::default() });
-        let white = raster::rasterize(&splats, &cam, &RasterOptions { background: [255; 3], ..Default::default() });
+        let classic = RasterOptions { classic_dilation: true, ..Default::default() };
+        let black = raster::rasterize(&splats, &cam, &RasterOptions { background: [0; 3], ..classic });
+        let white = raster::rasterize(&splats, &cam, &RasterOptions { background: [255; 3], ..classic });
         for i in 0..rendered.alpha.len() {
             let transparency = (white.rgb[i * 3] as f32 - black.rgb[i * 3] as f32) / 255.0;
             assert!((1.0 - rendered.alpha[i] - transparency).abs() < 0.01);

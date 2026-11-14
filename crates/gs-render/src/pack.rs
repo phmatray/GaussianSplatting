@@ -4,15 +4,23 @@
 //!
 //! The vertex shader needs, per splat: the center (3 × f32), the six unique
 //! terms of the world covariance (6 × f32) and the color with opacity
-//! (4 × u8). That is ten 32-bit words; they are stored in three texels of an
-//! unsigned-integer texture (twelve words, two spare) and read back with
+//! (4 × u8). The normalised blending mode also needs the plane of a surfel:
+//! its normal and the reach of its disc. That is twelve 32-bit words, stored
+//! in three texels of an unsigned-integer texture and read back with
 //! `texelFetch` + `uintBitsToFloat`:
 //!
 //! ```text
 //! texel 0: pos.x      pos.y      pos.z      r | g<<8 | b<<16 | a<<24
 //! texel 1: Σxx        Σxy        Σxz        Σyy
-//! texel 2: Σyz        Σzz        0          0
+//! texel 2: Σyz        Σzz        normal     reach
 //! ```
+//!
+//! `normal` is the third local axis of the splat in octahedral encoding,
+//! 16 bits per coordinate ([`encode_normal`]; 3·10⁻⁵ rad, far below what the
+//! 1 % depth tolerance of the normalised mode can see). `reach` is the larger
+//! of the two tangential standard deviations, or `0.0` for a splat that has
+//! no plane (a zero tangential scale): its fragments then all take the depth
+//! of its center, like in the CPU reference (`gs_core::experimental::wblend`).
 //!
 //! * `RGBA32UI` textures, `texelFetch` and `uintBitsToFloat` are core WebGL2 /
 //!   GLSL ES 3.00: no extension is involved, unlike rendering to or filtering
@@ -28,7 +36,8 @@
 //! rectangles (`texSubImage2D` calls): a partial first row, full rows, a
 //! partial last row.
 
-use gs_core::splat::cov6;
+use glam::Vec3;
+use gs_core::splat::{cov6, surfel_normal};
 use gs_core::Splat;
 
 /// Texels per splat.
@@ -52,8 +61,37 @@ pub(crate) fn pack_splat(splat: &Splat, out: &mut [u32]) {
     out[7] = c[3].to_bits();
     out[8] = c[4].to_bits();
     out[9] = c[5].to_bits();
-    out[10] = 0;
-    out[11] = 0;
+    out[10] = encode_normal(surfel_normal(splat));
+    let [su, sv, _] = splat.scale;
+    // The reference builds the plane from the two scaled tangent axes: it
+    // exists when neither of them vanishes.
+    let has_plane = su != 0.0 && sv != 0.0 && su.is_finite() && sv.is_finite();
+    out[11] = if has_plane { su.max(sv) } else { 0.0 }.to_bits();
+}
+
+/// Octahedral encoding of a unit vector: `x | y << 16`, each coordinate of
+/// the unfolded octahedron mapped from `-1..=1` to `0..=65535`. The sign of
+/// every component survives (back-face culling depends on it). The inverse
+/// is `decode_normal` in the vertex shader (and [`decode_normal`] here).
+#[inline]
+pub(crate) fn encode_normal(n: Vec3) -> u32 {
+    let l1 = n.x.abs() + n.y.abs() + n.z.abs();
+    // Not finite or zero: any direction will do; +Z is what an identity
+    // rotation gives.
+    let n = if l1.is_finite() && l1 > 0.0 { n / l1 } else { Vec3::Z };
+    let (x, y) = if n.z >= 0.0 { (n.x, n.y) } else { ((1.0 - n.y.abs()).copysign(n.x), (1.0 - n.x.abs()).copysign(n.y)) };
+    let quantize = |v: f32| ((v * 0.5 + 0.5) * 65535.0).round().clamp(0.0, 65535.0) as u32;
+    quantize(x) | quantize(y) << 16
+}
+
+/// Inverse of [`encode_normal`], written like the GLSL version.
+#[cfg(test)]
+pub(crate) fn decode_normal(word: u32) -> Vec3 {
+    let f = |v: u32| v as f32 / 65535.0 * 2.0 - 1.0;
+    let (x, y) = (f(word & 0xffff), f(word >> 16));
+    let z = 1.0 - x.abs() - y.abs();
+    let t = (-z).max(0.0);
+    Vec3::new(x + if x >= 0.0 { -t } else { t }, y + if y >= 0.0 { -t } else { t }, z).normalize()
 }
 
 /// Packs `splats` into `out` (cleared first).
@@ -172,8 +210,64 @@ mod tests {
         assert_eq!((w[3] & 0xff, (w[3] >> 8) & 0xff, (w[3] >> 16) & 0xff, w[3] >> 24), (10, 20, 30, 200));
         let cov: Vec<f32> = w[4..10].iter().map(|&b| f32::from_bits(b)).collect();
         assert_eq!(cov, cov6(&splat));
-        assert_eq!(&w[10..], &[0, 0]);
-        let _ = Vec3::ZERO;
+        // The plane: normal within a tenth of a millirad, reach = larger
+        // tangential scale.
+        let normal = splat.rotation() * Vec3::Z;
+        assert!(decode_normal(w[10]).angle_between(normal) < 1.0e-4);
+        assert_eq!(f32::from_bits(w[11]), 0.2);
+    }
+
+    #[test]
+    fn normals_survive_the_octahedral_encoding() {
+        let mut worst = 0.0f32;
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut unit = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        for i in 0..20_000 {
+            let n = match i {
+                0 => Vec3::X,
+                1 => Vec3::NEG_X,
+                2 => Vec3::Y,
+                3 => Vec3::NEG_Y,
+                4 => Vec3::Z,
+                5 => Vec3::NEG_Z,
+                _ => Vec3::new(unit(), unit(), unit()).normalize_or(Vec3::Z),
+            };
+            let decoded = decode_normal(encode_normal(n));
+            worst = worst.max(decoded.angle_between(n));
+            // The side a surfel faces must never flip.
+            for eye in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(0.3, -0.5, 0.8)] {
+                if n.dot(eye).abs() > 1.0e-3 {
+                    assert_eq!(n.dot(eye) > 0.0, decoded.dot(eye) > 0.0, "{n:?} -> {decoded:?}");
+                }
+            }
+        }
+        assert!(worst < 1.0e-4, "worst error {worst} rad");
+        // Garbage in: a valid direction out.
+        for bad in [Vec3::ZERO, Vec3::splat(f32::NAN), Vec3::new(f32::INFINITY, 0.0, 0.0)] {
+            assert_eq!(decode_normal(encode_normal(bad)), Vec3::Z);
+        }
+    }
+
+    #[test]
+    fn splats_without_a_plane_are_marked() {
+        let ok = Splat::surfel(Vec3::ZERO, Vec3::Y, 0.05, 0.005, [255; 4]);
+        let reach = |splat: Splat| {
+            let mut words = Vec::new();
+            pack_splats(&[splat], &mut words);
+            f32::from_bits(words[11])
+        };
+        assert_eq!(reach(ok), 0.05);
+        assert_eq!(reach(Splat { scale: [0.02, 0.07, 0.3], ..ok }), 0.07);
+        assert_eq!(reach(Splat { scale: [0.0, 0.07, 0.3], ..ok }), 0.0);
+        assert_eq!(reach(Splat { scale: [0.0; 3], ..ok }), 0.0);
+        assert_eq!(reach(Splat { scale: [f32::NAN, 0.05, 0.05], ..ok }), 0.0);
+        assert_eq!(reach(Splat { scale: [f32::INFINITY, 0.05, 0.05], ..ok }), 0.0);
+        // Negative scales square to the same covariance; the reference takes
+        // the larger signed value.
+        assert_eq!(reach(Splat { scale: [-0.05, 0.03, 0.05], ..ok }), 0.03);
     }
 
     #[test]

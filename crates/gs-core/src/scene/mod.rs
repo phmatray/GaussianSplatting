@@ -299,17 +299,14 @@ impl SceneSnapshot {
         }
         let (o, d) = (Vec3A::from(origin), Vec3A::from(dir));
         let inv = safe_recip(d);
-        let mut best: Option<(u32, Vec3A)> = None;
-        let mut t_hit = t_max;
+        let mut nearest = Nearest::new(t_max);
         self.inner.bvh.traverse(o, inv, t_max, |i, t_far| {
-            if let Some((t, n)) = self.inner.prims[i as usize].intersect(o, d, inv, T_MIN, *t_far) {
-                *t_far = t;
-                t_hit = t;
-                best = Some((i, n));
+            if nearest.offer(i, &self.inner.prims[i as usize], o, d, inv) {
+                *t_far = nearest.t;
             }
             false
         });
-        best.map(|(i, n)| self.finish_hit(o, d, t_hit, i, n))
+        nearest.hit.map(|(i, n)| self.finish_hit(o, d, nearest.t, i, n))
     }
 
     #[inline]
@@ -361,10 +358,45 @@ impl SceneSnapshot {
     /// shadows, plus the material's self-illumination.
     pub fn shade(&self, hit: &Hit, shadows: bool) -> Vec3 {
         let l = &self.inner.lighting;
+        let mut irradiance = l.ambient_ground.lerp(l.ambient_sky, 0.5 + 0.5 * hit.normal.y);
+        self.for_each_light(hit, |_, light, gain, ray| {
+            if shadows && light.casts_shadow && self.occluded(ray.origin, ray.dir, ray.t_max) {
+                return;
+            }
+            irradiance += light.color * gain;
+        });
+        let emissive = self.inner.prims[hit.prim as usize].material.emissive;
+        hit.albedo * (irradiance + Vec3::splat(emissive))
+    }
+
+    /// The shadow rays of [`SceneSnapshot::shade`] (with shadows on) that
+    /// reach their light from `hit`: one per shadow-casting light that
+    /// currently lights the point.
+    ///
+    /// These are the only rays through which *more* geometry can change the
+    /// color of the point: a light that does not reach it stays away
+    /// whatever is added to the scene. [`crate::capture::StaticRender`]
+    /// keeps them to find the pixels a moving object can darken.
+    ///
+    /// `visit` gets the index of the light in [`Lighting::lights`] and its
+    /// shadow ray.
+    pub fn open_shadow_rays(&self, hit: &Hit, mut visit: impl FnMut(usize, ShadowRay)) {
+        self.for_each_light(hit, |index, light, _, ray| {
+            if light.casts_shadow && !self.occluded(ray.origin, ray.dir, ray.t_max) {
+                visit(index, ray);
+            }
+        });
+    }
+
+    /// Calls `visit(index, light, gain, shadow ray)` for every light that
+    /// faces the surface at `hit` and reaches it within its region: the
+    /// light adds `light.color * gain` to the irradiance unless its shadow
+    /// ray is blocked.
+    #[inline]
+    fn for_each_light(&self, hit: &Hit, mut visit: impl FnMut(usize, &Light, f32, ShadowRay)) {
         let n = hit.normal;
-        let mut irradiance = l.ambient_ground.lerp(l.ambient_sky, 0.5 + 0.5 * n.y);
         let shadow_origin = hit.pos + n * SHADOW_BIAS;
-        for light in &l.lights {
+        for (index, light) in self.inner.lighting.lights.iter().enumerate() {
             let mut weight = 1.0;
             if let Some(region) = &light.region {
                 let outside = (region.min - hit.pos)
@@ -393,13 +425,13 @@ impl SceneSnapshot {
             if cos <= 0.0 {
                 continue;
             }
-            if shadows && light.casts_shadow && self.occluded(shadow_origin, to_light, distance - SHADOW_BIAS) {
-                continue;
-            }
-            irradiance += light.color * (cos * weight);
+            let ray = ShadowRay {
+                origin: shadow_origin,
+                dir: to_light,
+                t_max: distance - SHADOW_BIAS,
+            };
+            visit(index, light, cos * weight, ray);
         }
-        let emissive = self.inner.prims[hit.prim as usize].material.emissive;
-        hit.albedo * (irradiance + Vec3::splat(emissive))
     }
 
     /// Background radiance (linear RGB) seen along `dir` when nothing is hit.
@@ -414,6 +446,37 @@ impl SceneSnapshot {
     /// World bounds of all primitives ([`Aabb::EMPTY`] for an empty snapshot).
     pub fn bounds(&self) -> Aabb {
         self.inner.bounds
+    }
+
+    /// The moving primitives of this snapshot as a snapshot of their own,
+    /// when everything else in it is exactly `base`: the same lights, and
+    /// the same primitives in the same order once the
+    /// [`Primitive::dynamic`] ones are left out. `None` otherwise.
+    ///
+    /// With `base` the [`Scene::snapshot_static`] of the scene this snapshot
+    /// was taken from, a ray meets the same static surface in both, unless
+    /// something in the returned snapshot is in its way.
+    pub fn moving_parts(&self, base: &SceneSnapshot) -> Option<SceneSnapshot> {
+        if self.inner.lighting != base.inner.lighting || base.inner.prims.iter().any(|p| p.dynamic) {
+            return None;
+        }
+        let mut fixed = self.inner.prims.iter().filter(|p| !p.dynamic);
+        if !base.inner.prims.iter().all(|p| fixed.next() == Some(p)) || fixed.next().is_some() {
+            return None;
+        }
+        let moving = self.inner.prims.iter().filter(|p| p.dynamic).cloned().collect();
+        Some(SceneSnapshot::new(moving, self.inner.lighting.clone()))
+    }
+
+    /// True when both handles share one frozen scene (not merely equal ones).
+    pub fn is_same(&self, other: &SceneSnapshot) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The box of every primitive, grown by the hair that makes ray casts
+    /// conservative: a ray that hits primitive `i` passes through box `i`.
+    pub fn padded_boxes(&self) -> impl Iterator<Item = Aabb> + '_ {
+        self.inner.prims.iter().map(|p| bvh::padded(&p.world_aabb()))
     }
 
     /// Number of primitives.
@@ -445,15 +508,66 @@ impl SceneSnapshot {
         }
         let (o, d) = (Vec3A::from(origin), Vec3A::from(dir));
         let inv = safe_recip(d);
-        let mut best: Option<(u32, Vec3A)> = None;
-        let mut t_hit = t_max;
+        let mut nearest = Nearest::new(t_max);
         for (i, p) in self.inner.prims.iter().enumerate() {
-            if let Some((t, n)) = p.intersect(o, d, inv, T_MIN, t_hit) {
-                t_hit = t;
-                best = Some((i as u32, n));
+            nearest.offer(i as u32, p, o, d, inv);
+        }
+        nearest.hit.map(|(i, n)| self.finish_hit(o, d, nearest.t, i, n))
+    }
+}
+
+/// A shadow ray of [`SceneSnapshot::shade`]: the light is hidden when
+/// `occluded(origin, dir, t_max)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowRay {
+    pub origin: Vec3,
+    pub dir: Vec3,
+    pub t_max: f32,
+}
+
+/// The nearest intersection found so far by a closest-hit query.
+///
+/// Among intersections at exactly the same distance the primitive with the
+/// lowest index wins, so the result does not depend on the order in which
+/// the primitives are visited: two snapshots that hold the same primitives
+/// in the same order, apart from others that the ray misses, report the
+/// same hit whatever their hierarchies look like. The partial capture of
+/// [`crate::capture`] relies on this.
+struct Nearest {
+    t: f32,
+    /// Primitive index and local normal.
+    hit: Option<(u32, Vec3A)>,
+}
+
+impl Nearest {
+    /// Relative slack that lets an intersection at the distance of the
+    /// current hit through the strict range test of the primitives (a few
+    /// float steps).
+    const TIE_SLACK: f32 = 4.0 * f32::EPSILON;
+
+    #[inline]
+    fn new(t_max: f32) -> Self {
+        Self { t: t_max, hit: None }
+    }
+
+    /// Tests primitive `index`; true when it becomes the nearest hit.
+    #[inline]
+    fn offer(&mut self, index: u32, prim: &Primitive, o: Vec3A, d: Vec3A, inv: Vec3A) -> bool {
+        let limit = match self.hit {
+            Some(_) => self.t * (1.0 + Self::TIE_SLACK),
+            None => self.t,
+        };
+        let Some((t, n)) = prim.intersect(o, d, inv, T_MIN, limit) else {
+            return false;
+        };
+        if let Some((best, _)) = self.hit {
+            if t > self.t || (t == self.t && index > best) {
+                return false;
             }
         }
-        best.map(|(i, n)| self.finish_hit(o, d, t_hit, i, n))
+        self.t = t;
+        self.hit = Some((index, n));
+        true
     }
 }
 

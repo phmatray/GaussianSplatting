@@ -20,15 +20,20 @@ use web_sys::{
 use crate::gizmo::{GizmoScene, LineBatch};
 use crate::lines::LineRenderer;
 use crate::nav::{perspective, NavMode, Navigator};
-use crate::params::{Applied, RenderParams, SceneHints, ViewerOptions, ViewerStats, XrInfo, XrOptions, LAYER_COUNT};
-use crate::splats::{SortKey, SplatScene};
+use crate::normalized::Output;
+use crate::params::{
+    ActiveBlend, Applied, BlendQuality, BlendStatus, LayerContent, RenderParams, SceneHints, ViewerOptions, ViewerStats, XrInfo, XrOptions,
+    LAYER_COUNT,
+};
+use crate::splats::{SortKey, SortOutcome, SplatScene};
 
 use input::{Listener, Pointers};
 use xr::XrState;
 
 /// Near plane of the desktop camera and of the VR session, view-space meters.
 const NEAR: f32 = 0.05;
-/// Far plane (only the gizmo lines are clipped by it; splats have no depth).
+/// Far plane. Only the gizmo lines are clipped by it: sorted splats have no
+/// depth, and the normalised mode encodes depth on its own, far beyond it.
 const FAR: f32 = 1000.0;
 /// Weight of a new sample in the smoothed frame statistics.
 const STATS_SMOOTHING: f32 = 0.1;
@@ -197,6 +202,8 @@ impl Viewer {
     /// `Layer` messages are decoded straight into the viewer's layers and
     /// uploaded to the GPU: a `Replace` costs O(message), an `Append`
     /// O(message) amortized, independent of what the other layer holds.
+    /// The layer then counts as [`LayerContent::Surfels`], which is what the
+    /// capture pipeline sends.
     /// `State`, `Stats` and `Preview` messages are decoded and returned
     /// untouched for the caller to interpret.
     ///
@@ -224,18 +231,45 @@ impl Viewer {
     }
 
     /// Replaces the content of a layer ([`crate::LAYER_STATIC`] or
-    /// [`crate::LAYER_DYNAMIC`]), e.g. with an imported file.
+    /// [`crate::LAYER_DYNAMIC`]) with an imported file: the layer counts as
+    /// [`LayerContent::Imported`], which [`crate::BlendMode::Auto`] draws
+    /// sorted. For surfels use [`Viewer::set_surfel_layer`], or correct the
+    /// label afterwards with [`Viewer::set_layer_content`].
     pub fn set_layer(&self, layer: u8, splats: &[Splat]) -> Result<(), String> {
         let layer = layer_index(layer)?;
         self.inner.dirty.set(true);
-        self.inner.scene.borrow_mut().replace(layer, splats)
+        self.inner.scene.borrow_mut().replace(layer, splats, LayerContent::Imported)
     }
 
-    /// Adds splats to a layer.
+    /// Replaces the content of a layer with sensor surfels, as a `Replace`
+    /// wire message would: the layer counts as [`LayerContent::Surfels`].
+    pub fn set_surfel_layer(&self, layer: u8, splats: &[Splat]) -> Result<(), String> {
+        let layer = layer_index(layer)?;
+        self.inner.dirty.set(true);
+        self.inner.scene.borrow_mut().replace(layer, splats, LayerContent::Surfels)
+    }
+
+    /// Adds splats to a layer. The layer keeps the content label it has; an
+    /// empty one becomes [`LayerContent::Imported`].
     pub fn append_layer(&self, layer: u8, splats: &[Splat]) -> Result<(), String> {
         let layer = layer_index(layer)?;
         self.inner.dirty.set(true);
-        self.inner.scene.borrow_mut().append(layer, splats)
+        self.inner.scene.borrow_mut().append(layer, splats, LayerContent::Imported)
+    }
+
+    /// Declares what a layer holds (see [`LayerContent`]). The data is not
+    /// touched; with [`crate::BlendMode::Auto`] the blending mode follows.
+    pub fn set_layer_content(&self, layer: u8, content: LayerContent) -> Result<(), String> {
+        let layer = layer_index(layer)?;
+        self.inner.scene.borrow_mut().set_content(layer, content);
+        self.inner.dirty.set(true);
+        Ok(())
+    }
+
+    /// What a layer is taken to hold ([`LayerContent::Surfels`] for an
+    /// unknown layer id).
+    pub fn layer_content(&self, layer: u8) -> LayerContent {
+        layer_index(layer).map(|l| self.inner.scene.borrow().content(l)).unwrap_or_default()
     }
 
     /// Empties both layers.
@@ -266,6 +300,15 @@ impl Viewer {
         self.inner.params.get()
     }
 
+    /// The blending mode the next frame is drawn with, and why: what
+    /// [`RenderParams::blend`] and [`RenderParams::quality`] ask for, what
+    /// the visible layers hold, and what this GPU can do. A
+    /// [`crate::BlendReason`] with `is_fallback()` means the normalised mode
+    /// was wanted and could not be had.
+    pub fn blend_status(&self) -> BlendStatus {
+        self.inner.scene.borrow().blend_status(&self.inner.params.get())
+    }
+
     /// Replaces the gizmo scene (grid, camera frusta, scan path, axes).
     /// Whether it is drawn is `RenderParams::show_gizmos`.
     pub fn set_gizmos(&self, scene: &GizmoScene) {
@@ -291,7 +334,8 @@ impl Viewer {
 
     /// Renders the splats (no gizmos) as seen by `cam` into an off-screen
     /// 8-bit buffer of the camera's size and returns the pixels. Uses the
-    /// current [`RenderParams`]; the canvas is not touched.
+    /// current [`RenderParams`] and the blending mode of
+    /// [`Viewer::blend_status`]; the canvas is not touched.
     ///
     /// Fails for cameras larger than 8192 pixels on a side, on a lost WebGL
     /// context and after [`Viewer::destroy`]; a camera without pixels gives
@@ -299,8 +343,11 @@ impl Viewer {
     ///
     /// This is the same shader, blending and projection-matrix path as the
     /// on-screen views (the camera is turned into a view and a projection
-    /// matrix first) and the counterpart of `gs_core::raster::rasterize`
-    /// with `near = 0.05`. Useful for thumbnails, exports and tests.
+    /// matrix first). Its CPU counterpart, with `near = 0.05`, is
+    /// `gs_core::raster::rasterize` in the sorted mode and
+    /// `gs_core::experimental::wblend::render` with the preset of the
+    /// quality level in the normalised mode. Useful for thumbnails, exports
+    /// and tests.
     pub fn snapshot(&self, cam: &Camera) -> Result<Image, JsValue> {
         self.inner.snapshot(cam)
     }
@@ -373,6 +420,8 @@ impl Viewer {
         stats.sort_ms = scene.sort_ms as f32;
         stats.sorts = scene.sort_count;
         stats.xr_active = self.xr_active();
+        stats.blend = scene.blend_status(&self.inner.params.get());
+        (stats.offscreen_width, stats.offscreen_height) = scene.normalized_target_size().unwrap_or((0, 0));
         stats
     }
 
@@ -525,7 +574,7 @@ impl Inner {
             stats.frames_rendered += 1;
             stats.canvas_width = width;
             stats.canvas_height = height;
-            stats.splats_drawn = self.scene.borrow().instances();
+            stats.splats_drawn = self.scene.borrow().drawn();
         }
         self.stats.set(stats);
     }
@@ -597,17 +646,70 @@ impl Inner {
         gl.clear(GL::COLOR_BUFFER_BIT);
         {
             let mut scene = self.scene.borrow_mut();
-            let key = SortKey { show: [params.show_static, params.show_dynamic], clip_y };
-            if scene.sort(&view, key, &|| self.now(), false) == crate::splats::SortOutcome::Deferred {
+            let vp = ViewParams::from_projection(view, &proj, width as f32, height as f32);
+            let output = Output { framebuffer: None, viewport: [0, 0, width as i32, height as i32] };
+            let status = scene.blend_status(&params);
+            if self.prepare_order(&mut scene, status, &view, &params, clip_y, false) == SortOutcome::Deferred {
                 // The order on the GPU is one frame old: draw again next frame.
                 self.dirty.set(true);
             }
-            scene.draw(&ViewParams::from_projection(view, &proj, width as f32, height as f32), &params, clip_y);
+            self.draw_splats(&mut scene, status, &vp, &params, clip_y, output);
         }
         if params.show_gizmos {
             self.lines.borrow().draw(&(proj * view), [width as f32, height as f32], NEAR, px_scale, true);
         }
         self.record_frame(interval, self.now() - start, Some((width, height)));
+    }
+
+    /// Makes the draw order valid for `view` when the frame is drawn sorted;
+    /// the normalised mode has no order. Once per frame, before its views.
+    fn prepare_order(
+        &self,
+        scene: &mut SplatScene,
+        status: BlendStatus,
+        view: &Mat4,
+        params: &RenderParams,
+        clip_y: f32,
+        force: bool,
+    ) -> SortOutcome {
+        if status.active.is_normalized() {
+            return SortOutcome::Fresh;
+        }
+        let key = SortKey { show: [params.show_static, params.show_dynamic], clip_y };
+        scene.sort(view, key, &|| self.now(), force)
+    }
+
+    /// Draws the splats of one view into `output` (already cleared) with
+    /// the blending `status` names. `output` is left bound with its viewport
+    /// set, ready for the gizmo lines.
+    ///
+    /// When the normalised mode fails here (its render targets could not be
+    /// allocated) it is given up for this context and the view is drawn
+    /// sorted instead; `blend_status` reports the fallback from then on.
+    fn draw_splats(&self, scene: &mut SplatScene, status: BlendStatus, vp: &ViewParams, params: &RenderParams, clip_y: f32, output: Output) {
+        let gl = &self.gl;
+        let (framebuffer, [x, y, width, height]) = (output.framebuffer, output.viewport);
+        let quality = match status.active {
+            ActiveBlend::Sorted => None,
+            ActiveBlend::NormalizedHard => Some(BlendQuality::Hard),
+            ActiveBlend::NormalizedSoft => Some(BlendQuality::Soft),
+        };
+        if let Some(quality) = quality {
+            match scene.draw_normalized(vp, params, clip_y, quality, output) {
+                Ok(()) => return,
+                Err(error) => {
+                    web_sys::console::warn_1(&format!("gs-render: normalised blending failed, falling back to sorted blending: {error}").into());
+                    scene.disable_normalized();
+                    let key = SortKey { show: [params.show_static, params.show_dynamic], clip_y };
+                    scene.sort(&vp.view, key, &|| self.now(), true);
+                }
+            }
+        }
+        // Sorted frames need none of the off-screen targets.
+        scene.release_normalized_targets();
+        gl.bind_framebuffer(GL::FRAMEBUFFER, framebuffer);
+        gl.viewport(x, y, width, height);
+        scene.draw(vp, params, clip_y);
     }
 
     fn snapshot(&self, cam: &Camera) -> Result<Image, JsValue> {
@@ -645,10 +747,11 @@ impl Inner {
             // Through the projection matrix, like every on-screen view.
             let vp = ViewParams::from_projection(cam.view_matrix(), &cam.projection_matrix(NEAR, FAR), width as f32, height as f32);
             let mut scene = self.scene.borrow_mut();
-            let key = SortKey { show: [params.show_static, params.show_dynamic], clip_y };
-            scene.sort(&vp.view, key, &|| self.now(), true);
-            scene.draw(&vp, &params, clip_y);
-            // The index buffer now belongs to this camera; the next frame re-sorts.
+            let status = scene.blend_status(&params);
+            self.prepare_order(&mut scene, status, &vp.view, &params, clip_y, true);
+            let output = Output { framebuffer: Some(&framebuffer), viewport: [0, 0, width as i32, height as i32] };
+            self.draw_splats(&mut scene, status, &vp, &params, clip_y, output);
+            // The order texture now belongs to this camera; the next sorted frame re-sorts.
             scene.invalidate_order();
             result = gl.read_pixels_with_opt_u8_array(0, 0, width as i32, height as i32, GL::RGBA, GL::UNSIGNED_BYTE, Some(&mut rgba));
         }

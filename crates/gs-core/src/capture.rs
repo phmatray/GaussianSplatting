@@ -6,12 +6,38 @@
 //! where there is no return). An optional [`NoiseModel`] degrades the result
 //! the way consumer depth sensors do. [`render_reference`] produces the
 //! noise-free, anti-aliased ground truth used to score reconstructions.
+//!
+//! # Partial capture
+//!
+//! A fixed camera looking at a mostly static scene need not cast every ray
+//! again for every frame. [`StaticRender`] keeps what the camera sees of the
+//! static part of the scene; [`PartialCapture`] then casts only the pixels
+//! that the moving objects of an instant can change and takes the others
+//! from it. The frame is *bit-identical* to [`render_rgbd`] of the whole
+//! scene, sensor noise included.
+//!
+//! A pixel can differ from the static render in two ways only:
+//!
+//! * its primary ray meets a moving object no farther than the static
+//!   surface it used to end on (or before it leaves the sensor range);
+//! * a moving object blocks one of the shadow rays that reach their light
+//!   from that static surface point (a new shadow). Lights that never
+//!   reached the point stay away whatever moves.
+//!
+//! Both are tested per pixel against the moving primitives alone, a handful
+//! of them in a hierarchy of their own. Most pixels never get that far: the
+//! primary test only runs inside the screen boxes of the moving primitives,
+//! and the shadow test of a directional light only where the point lies in
+//! the light's view of those boxes ([`ShadowMask`]). On the stage about 6 %
+//! of the pixels of a ring camera change from the empty stage; one
+//! screen-space bounding box around them would still hold 42 % of the
+//! image, which is why the tests are per pixel and per primitive.
 
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-use crate::scene::{linear_to_srgb8, srgb8_to_linear, SceneSnapshot};
-use crate::types::{Camera, RgbdFrame};
+use crate::scene::{linear_to_srgb8, srgb8_to_linear, LightKind, SceneSnapshot, ShadowRay};
+use crate::types::{Aabb, Camera, RgbdFrame};
 
 /// Sensor noise. All noise is a pure function of `(seed, pixel index)`: the
 /// same inputs always give the same frame, whatever the thread count.
@@ -163,78 +189,500 @@ pub fn render_reference(
 /// depth stays distinguishable from the `0.0` "no return" marker.
 const MIN_NOISY_DEPTH: f32 = 1.0e-3;
 
+/// What a perfect sensor returns for one pixel.
+#[derive(Clone, Copy)]
+struct CleanSample {
+    /// Forward depth, inside the sensor range.
+    z: f32,
+    color: [u8; 3],
+}
+
+/// The primary ray of pixel `(x, y)`: origin, direction, the cosine between
+/// the ray and the optical axis and the ray length at which the forward
+/// distance reaches the range limit.
+#[inline]
+fn pixel_ray(cam: &Camera, forward: Vec3, max_range: f32, x: u32, y: u32) -> (Vec3, Vec3, f32, f32) {
+    let (origin, dir) = cam.ray(x as f32 + 0.5, y as f32 + 0.5);
+    let cos = dir.dot(forward);
+    (origin, dir, cos, max_range / cos.max(1e-6))
+}
+
+/// Casts the primary ray of a pixel and shades what it hits. `None` when
+/// nothing is hit or the hit is outside the sensor range.
+#[inline]
+fn clean_sample(snap: &SceneSnapshot, cam: &Camera, forward: Vec3, opts: &CaptureOptions, x: u32, y: u32) -> Option<CleanSample> {
+    let (origin, dir, cos, reach) = pixel_ray(cam, forward, opts.max_range, x, y);
+    let hit = snap.raycast(origin, dir, reach)?;
+    let z = hit.t * cos;
+    if z < opts.min_range || z > opts.max_range {
+        return None;
+    }
+    Some(CleanSample { z, color: linear_to_srgb8(snap.shade(&hit, opts.shadows)) })
+}
+
+/// Writes a pixel as the sensor of `opts` delivers it: the clean sample
+/// degraded by the noise model, or nothing when the pixel drops out.
+#[inline]
+fn store_sample(opts: &CaptureOptions, pixel: u32, x: usize, sample: CleanSample, rgb: &mut [u8], depth: &mut [f32]) {
+    let CleanSample { mut z, mut color } = sample;
+    let n = &opts.noise;
+    if !n.is_none() {
+        if n.dropout > 0.0 && uniform(opts.seed, pixel, 0) < n.dropout {
+            return;
+        }
+        if n.depth_sigma_at_1m > 0.0 {
+            let noisy = z + gaussian(opts.seed, pixel, 1) * n.depth_sigma_at_1m * z * z;
+            if !noisy.is_finite() {
+                return;
+            }
+            // Stay a valid return: positive and inside the sensor range.
+            // (`max`/`min` rather than `clamp`, which panics on a NaN limit.)
+            z = noisy.max(opts.min_range.max(MIN_NOISY_DEPTH)).min(opts.max_range);
+        }
+        if n.color_sigma > 0.0 {
+            for (c, channel) in color.iter_mut().enumerate() {
+                let v = *channel as f32 + gaussian(opts.seed, pixel, 3 + 2 * c as u32) * n.color_sigma;
+                *channel = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    depth[x] = z;
+    rgb[x * 3..x * 3 + 3].copy_from_slice(&color);
+}
+
 fn render_row(snap: &SceneSnapshot, cam: &Camera, opts: &CaptureOptions, y: u32, rgb: &mut [u8], depth: &mut [f32]) {
     let forward = cam.forward();
-    let noisy = !opts.noise.is_none();
     for x in 0..cam.width {
-        let (origin, dir) = cam.ray(x as f32 + 0.5, y as f32 + 0.5);
-        let cos = dir.dot(forward);
-        // Stop the ray where its forward distance reaches the range limit.
-        let Some(hit) = snap.raycast(origin, dir, opts.max_range / cos.max(1e-6)) else {
-            continue;
-        };
-        let mut z = hit.t * cos;
-        if z < opts.min_range || z > opts.max_range {
-            continue;
+        if let Some(sample) = clean_sample(snap, cam, forward, opts, x, y) {
+            store_sample(opts, y * cam.width + x, x as usize, sample, rgb, depth);
         }
-        let mut color = linear_to_srgb8(snap.shade(&hit, opts.shadows));
-        if noisy {
-            let pixel = y * cam.width + x;
-            let n = &opts.noise;
-            if n.dropout > 0.0 && uniform(opts.seed, pixel, 0) < n.dropout {
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Partial capture
+// ---------------------------------------------------------------------------
+
+/// What a fixed camera sees of the static part of a scene, noise-free, with
+/// everything needed to tell which pixels a moving object can change. See
+/// the module documentation.
+#[derive(Clone, Debug)]
+pub struct StaticRender {
+    scene: SceneSnapshot,
+    cam: Camera,
+    shadows: bool,
+    min_range: f32,
+    max_range: f32,
+    /// Clean forward depth per pixel, `0.0` where the sensor has no return.
+    depth: Vec<f32>,
+    /// Clean color per pixel.
+    rgb: Vec<u8>,
+    /// Per pixel: a moving object changes the pixel when its primary ray
+    /// meets it within this ray length (just past the static surface, or
+    /// the range limit where nothing static is hit).
+    reach: Vec<f32>,
+    /// Per pixel: the index of its first shadow ray in `shadow_rays`; one
+    /// more entry closes the last pixel.
+    first_ray: Vec<u32>,
+    /// The shadow rays that reach their light from the static surface.
+    shadow_rays: Vec<LightRay>,
+}
+
+/// A shadow ray and the light it leads to.
+#[derive(Clone, Copy, Debug)]
+struct LightRay {
+    ray: ShadowRay,
+    /// Index of the light in the scene's lighting.
+    light: u32,
+}
+
+/// A static row under construction.
+struct StaticRow {
+    reach: Vec<f32>,
+    ray_counts: Vec<u32>,
+    shadow_rays: Vec<LightRay>,
+}
+
+impl StaticRender {
+    /// A moving surface at the same ray length as the static one may win the
+    /// pixel (see the tie rule of the ray caster): the primary test reaches
+    /// this much farther than the static hit.
+    const REACH_SLACK: f32 = 8.0 * f32::EPSILON;
+
+    /// Renders `scene` (the static part of a scene, as
+    /// [`crate::scene::Scene::snapshot_static`] returns it) through `cam`.
+    /// Of `opts`, the shadows and the range limits are used; the noise is
+    /// applied per exposure.
+    pub fn new(scene: &SceneSnapshot, cam: &Camera, opts: &CaptureOptions) -> Self {
+        let clean = CaptureOptions { noise: NoiseModel::NONE, ..*opts };
+        let forward = cam.forward();
+        let width = cam.width as usize;
+        let mut frame = RgbdFrame::new(cam.width, cam.height);
+        let rows = for_each_row_collect(&mut frame, |y, rgb, depth| {
+            let mut row = StaticRow { reach: Vec::with_capacity(width), ray_counts: Vec::with_capacity(width), shadow_rays: Vec::new() };
+            for x in 0..cam.width {
+                let (origin, dir, cos, reach) = pixel_ray(cam, forward, clean.max_range, x, y);
+                let before = row.shadow_rays.len();
+                let hit = scene.raycast(origin, dir, reach);
+                row.reach.push(hit.map_or(reach, |hit| hit.t * (1.0 + Self::REACH_SLACK)));
+                if let Some(hit) = hit {
+                    let z = hit.t * cos;
+                    if z >= clean.min_range && z <= clean.max_range {
+                        depth[x as usize] = z;
+                        rgb[x as usize * 3..x as usize * 3 + 3].copy_from_slice(&linear_to_srgb8(scene.shade(&hit, clean.shadows)));
+                        if clean.shadows {
+                            scene.open_shadow_rays(&hit, |light, ray| row.shadow_rays.push(LightRay { ray, light: light as u32 }));
+                        }
+                    }
+                }
+                row.ray_counts.push((row.shadow_rays.len() - before) as u32);
+            }
+            row
+        });
+        let mut reach = Vec::with_capacity(frame.depth.len());
+        let mut first_ray = Vec::with_capacity(frame.depth.len() + 1);
+        let mut shadow_rays = Vec::new();
+        for row in rows {
+            reach.extend_from_slice(&row.reach);
+            let mut next = shadow_rays.len() as u32;
+            for count in row.ray_counts {
+                first_ray.push(next);
+                next += count;
+            }
+            shadow_rays.extend_from_slice(&row.shadow_rays);
+        }
+        first_ray.push(shadow_rays.len() as u32);
+        Self {
+            scene: scene.clone(),
+            cam: *cam,
+            shadows: clean.shadows,
+            min_range: clean.min_range,
+            max_range: clean.max_range,
+            depth: frame.depth,
+            rgb: frame.rgb,
+            reach,
+            first_ray,
+            shadow_rays,
+        }
+    }
+
+    /// The static scene this render shows.
+    pub fn scene(&self) -> &SceneSnapshot {
+        &self.scene
+    }
+
+    /// The camera this render was taken with.
+    pub fn camera(&self) -> &Camera {
+        &self.cam
+    }
+
+    /// True when a capture through `cam` with `opts` can build on this
+    /// render: same camera, same shadows, same range limits.
+    fn serves(&self, cam: &Camera, opts: &CaptureOptions) -> bool {
+        // Bit patterns, so that a NaN limit matches itself.
+        let same = |a: f32, b: f32| a.to_bits() == b.to_bits();
+        self.cam == *cam && self.shadows == opts.shadows && same(self.min_range, opts.min_range) && same(self.max_range, opts.max_range)
+    }
+
+    /// The clean sample of pixel `i`, if the sensor has a return there.
+    #[inline]
+    fn sample(&self, i: usize) -> Option<CleanSample> {
+        let z = self.depth[i];
+        (z != 0.0).then(|| CleanSample { z, color: [self.rgb[i * 3], self.rgb[i * 3 + 1], self.rgb[i * 3 + 2]] })
+    }
+
+    /// One exposure of the static scene alone: exactly
+    /// [`render_rgbd`]`(self.scene(), self.camera(), opts)` for options that
+    /// only differ in noise and seed from those this render was built with.
+    /// With other shadows or range limits the scene is rendered afresh.
+    pub fn expose(&self, opts: &CaptureOptions) -> RgbdFrame {
+        if !self.serves(&self.cam, opts) {
+            return render_rgbd(&self.scene, &self.cam, opts);
+        }
+        let mut frame = RgbdFrame::new(self.cam.width, self.cam.height);
+        let width = self.cam.width as usize;
+        for_each_row(&mut frame, |y, rgb, depth| {
+            for x in 0..width {
+                let i = y as usize * width + x;
+                if let Some(sample) = self.sample(i) {
+                    store_sample(opts, i as u32, x, sample, rgb, depth);
+                }
+            }
+        });
+        frame
+    }
+}
+
+/// One instant of a scene, prepared for capturing it through cameras that
+/// have a [`StaticRender`] of its static part. See the module documentation.
+#[derive(Clone, Debug)]
+pub struct PartialCapture<'a> {
+    snap: &'a SceneSnapshot,
+    /// The static part the split was made against.
+    base: SceneSnapshot,
+    /// The moving primitives alone.
+    moving: SceneSnapshot,
+    /// Their boxes (conservative, see [`SceneSnapshot::padded_boxes`]).
+    boxes: Vec<Aabb>,
+    /// Per light of the scene: where its shadow rays can meet a moving
+    /// primitive at all (directional lights only).
+    shadow_masks: Vec<Option<ShadowMask>>,
+}
+
+/// Screen-space boxes are widened by this many pixels: far more than the
+/// rounding of a projection.
+const SCREEN_MARGIN: f32 = 1.5;
+
+/// The moving primitives as a directional light sees them: a grid on the
+/// plane perpendicular to the light, marked where the box of a moving
+/// primitive projects to. A shadow ray toward the light runs along the
+/// light direction, so it projects to one point of that plane and can only
+/// be blocked when that point is marked.
+#[derive(Clone, Debug)]
+struct ShadowMask {
+    /// Orthonormal axes of the plane.
+    axes: [Vec3; 2],
+    /// Plane coordinates of the grid's corner.
+    origin: [f32; 2],
+    /// Cells per meter.
+    scale: [f32; 2],
+    cells: Vec<bool>,
+}
+
+impl ShadowMask {
+    /// Cells along each axis.
+    const SIZE: usize = 128;
+    /// The boxes are widened by this much on the plane (meters): a ray is
+    /// only as parallel to the light as floats allow.
+    const MARGIN: f32 = 2.0e-3;
+
+    fn new(to_light: Vec3, boxes: &[Aabb]) -> Self {
+        let (a, b) = to_light.any_orthonormal_pair();
+        let rect = |bounds: &Aabb| {
+            let (mut min, mut max) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+            for corner in 0..8 {
+                let p = box_corner(bounds, corner);
+                let uv = [p.dot(a), p.dot(b)];
+                // Farther from the origin the coordinates are coarser.
+                let margin = Self::MARGIN + 1.0e-5 * p.abs().max_element();
+                for k in 0..2 {
+                    min[k] = min[k].min(uv[k] - margin);
+                    max[k] = max[k].max(uv[k] + margin);
+                }
+            }
+            (min, max)
+        };
+        let rects: Vec<_> = boxes.iter().map(rect).collect();
+        let (mut origin, mut end) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for (min, max) in &rects {
+            for k in 0..2 {
+                origin[k] = origin[k].min(min[k]);
+                end[k] = end[k].max(max[k]);
+            }
+        }
+        let scale = [0, 1].map(|k| Self::SIZE as f32 / (end[k] - origin[k]).max(1.0e-6));
+        let mut cells = vec![false; Self::SIZE * Self::SIZE];
+        // The cell of a coordinate, clamped into the grid (the cast saturates).
+        let cell = |value: f32, k: usize| (((value - origin[k]) * scale[k]) as usize).min(Self::SIZE - 1);
+        for (min, max) in &rects {
+            for y in cell(min[1], 1)..=cell(max[1], 1) {
+                cells[y * Self::SIZE + cell(min[0], 0)..=y * Self::SIZE + cell(max[0], 0)].fill(true);
+            }
+        }
+        Self { axes: [a, b], origin, scale, cells }
+    }
+
+    /// Can a ray from `point` toward the light meet a moving primitive?
+    #[inline]
+    fn covers(&self, point: Vec3) -> bool {
+        let x = (point.dot(self.axes[0]) - self.origin[0]) * self.scale[0];
+        let y = (point.dot(self.axes[1]) - self.origin[1]) * self.scale[1];
+        let size = Self::SIZE as f32;
+        // Also false for coordinates that are not numbers.
+        x >= 0.0 && y >= 0.0 && x < size && y < size && self.cells[y as usize * Self::SIZE + x as usize]
+    }
+}
+
+/// Corner `index` (0..8) of a box.
+#[inline]
+fn box_corner(bounds: &Aabb, index: usize) -> Vec3 {
+    let pick = |axis: usize| if index >> axis & 1 == 0 { bounds.min[axis] } else { bounds.max[axis] };
+    Vec3::new(pick(0), pick(1), pick(2))
+}
+
+impl<'a> PartialCapture<'a> {
+    /// Splits `snap` into `base`, its static part, and what moves in front
+    /// of it. `None` when `snap` is not `base` plus moving primitives (see
+    /// [`SceneSnapshot::moving_parts`]): such a snapshot has to be rendered
+    /// in full.
+    pub fn new(snap: &'a SceneSnapshot, base: &SceneSnapshot) -> Option<Self> {
+        let moving = snap.moving_parts(base)?;
+        let boxes: Vec<Aabb> = moving.padded_boxes().filter(|b| b.min.is_finite() && b.max.is_finite()).collect();
+        let shadow_masks = snap
+            .lighting()
+            .lights
+            .iter()
+            .map(|light| match light.kind {
+                LightKind::Directional { to_light } if light.casts_shadow && !boxes.is_empty() => Some(ShadowMask::new(to_light, &boxes)),
+                _ => None,
+            })
+            .collect();
+        Some(Self { snap, base: base.clone(), moving, boxes, shadow_masks })
+    }
+
+    /// Captures the instant through `cam`: the same frame, bit for bit, as
+    /// [`render_rgbd`]`(snap, cam, opts)`.
+    ///
+    /// `fixed` must be a [`StaticRender`] of the static part this capture
+    /// was split against, through the same camera and with the same shadows
+    /// and range limits as `opts`; otherwise the frame is rendered in full.
+    /// With the `par` feature rows are rendered in parallel.
+    pub fn render(&self, cam: &Camera, opts: &CaptureOptions, fixed: &StaticRender) -> RgbdFrame {
+        if !(fixed.scene.is_same(&self.base) && fixed.serves(cam, opts)) {
+            return render_rgbd(self.snap, cam, opts);
+        }
+        let mut frame = RgbdFrame::new(cam.width, cam.height);
+        let width = cam.width as usize;
+        let screen = self.screen_mask(cam);
+        let forward = cam.forward();
+        for_each_row(&mut frame, |y, rgb, depth| {
+            for x in 0..width {
+                let i = y as usize * width + x;
+                let sample = if self.changes(cam, fixed, &screen, x as u32, y) {
+                    clean_sample(self.snap, cam, forward, opts, x as u32, y)
+                } else {
+                    fixed.sample(i)
+                };
+                if let Some(sample) = sample {
+                    store_sample(opts, i as u32, x, sample, rgb, depth);
+                }
+            }
+        });
+        frame
+    }
+
+    /// Can a moving primitive change pixel `(x, y)` of `fixed`? `screen` is
+    /// the [`Self::screen_mask`] of its camera.
+    #[inline]
+    fn changes(&self, cam: &Camera, fixed: &StaticRender, screen: &[bool], x: u32, y: u32) -> bool {
+        let i = (y * cam.width + x) as usize;
+        let in_front = screen[i] && {
+            let (origin, dir) = cam.ray(x as f32 + 0.5, y as f32 + 0.5);
+            self.moving.occluded(origin, dir, fixed.reach[i])
+        };
+        let rays = &fixed.shadow_rays[fixed.first_ray[i] as usize..fixed.first_ray[i + 1] as usize];
+        in_front
+            || rays.iter().any(|LightRay { ray, light }| {
+                // A light the mask knows nothing about is always tested.
+                let reachable = self.shadow_masks.get(*light as usize).and_then(Option::as_ref).is_none_or(|mask| mask.covers(ray.origin));
+                reachable && self.moving.occluded(ray.origin, ray.dir, ray.t_max)
+            })
+    }
+
+    /// Number of pixels [`PartialCapture::render`] casts again through the
+    /// camera of `fixed`, or `None` when it would render the frame in full.
+    /// For benchmarks and tests.
+    #[doc(hidden)]
+    pub fn recast_pixels(&self, fixed: &StaticRender) -> Option<usize> {
+        if !fixed.scene.is_same(&self.base) {
+            return None;
+        }
+        let cam = &fixed.cam;
+        let screen = self.screen_mask(cam);
+        let count = (0..cam.height).map(|y| (0..cam.width).filter(|&x| self.changes(cam, fixed, &screen, x, y)).count());
+        Some(count.sum())
+    }
+
+    /// Per pixel of `cam`: can its primary ray meet a moving primitive? The
+    /// union of the screen boxes of their bounds.
+    fn screen_mask(&self, cam: &Camera) -> Vec<bool> {
+        let (width, height) = (cam.width, cam.height);
+        let mut mask = vec![false; (width * height) as usize];
+        for bounds in &self.boxes {
+            let (mut min, mut max) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+            let mut behind = false;
+            for corner in 0..8 {
+                match cam.project(box_corner(bounds, corner)) {
+                    // A corner at or behind the camera plane projects nowhere
+                    // useful: the box may cover anything.
+                    Some((u, v, z)) if z > 1.0e-4 && u.is_finite() && v.is_finite() => {
+                        min = [min[0].min(u), min[1].min(v)];
+                        max = [max[0].max(u), max[1].max(v)];
+                    }
+                    _ => behind = true,
+                }
+            }
+            if behind {
+                (min, max) = ([0.0; 2], [width as f32, height as f32]);
+            }
+            // Pixel `x` has its center at `x + 0.5`; the casts saturate.
+            let first = |lo: f32| (lo - SCREEN_MARGIN - 0.5).floor().max(0.0) as u32;
+            let end = |hi: f32, size: u32| ((hi + SCREEN_MARGIN + 0.5).ceil().max(0.0) as u32).min(size);
+            let (x0, x1) = (first(min[0]), end(max[0], width));
+            let (y0, y1) = (first(min[1]), end(max[1], height));
+            if x0 >= x1 {
                 continue;
             }
-            if n.depth_sigma_at_1m > 0.0 {
-                let noisy = z + gaussian(opts.seed, pixel, 1) * n.depth_sigma_at_1m * z * z;
-                if !noisy.is_finite() {
-                    continue;
-                }
-                // Stay a valid return: positive and inside the sensor range.
-                // (`max`/`min` rather than `clamp`, which panics on a NaN limit.)
-                z = noisy.max(opts.min_range.max(MIN_NOISY_DEPTH)).min(opts.max_range);
-            }
-            if n.color_sigma > 0.0 {
-                for (c, channel) in color.iter_mut().enumerate() {
-                    let v = *channel as f32 + gaussian(opts.seed, pixel, 3 + 2 * c as u32) * n.color_sigma;
-                    *channel = v.round().clamp(0.0, 255.0) as u8;
-                }
+            for y in y0..y1 {
+                mask[(y * width + x0) as usize..(y * width + x1) as usize].fill(true);
             }
         }
-        let i = x as usize;
-        depth[i] = z;
-        rgb[i * 3..i * 3 + 3].copy_from_slice(&color);
+        mask
+    }
+}
+
+/// Captures `snap` through the camera of `fixed`, re-casting only the pixels
+/// that its moving primitives can change: the same frame, bit for bit, as
+/// [`render_rgbd`]`(snap, fixed.camera(), opts)`.
+///
+/// For several cameras at the same instant, split the snapshot once with
+/// [`PartialCapture::new`] instead.
+pub fn render_rgbd_partial(snap: &SceneSnapshot, opts: &CaptureOptions, fixed: &StaticRender) -> RgbdFrame {
+    match PartialCapture::new(snap, &fixed.scene) {
+        Some(capture) => capture.render(&fixed.cam, opts, fixed),
+        None => render_rgbd(snap, &fixed.cam, opts),
     }
 }
 
 /// Runs `f(row, rgb_row, depth_row)` for every image row, in parallel when
 /// the `par` feature is enabled.
 fn for_each_row(frame: &mut RgbdFrame, f: impl Fn(u32, &mut [u8], &mut [f32]) + Sync) {
+    for_each_row_collect(frame, f);
+}
+
+/// [`for_each_row`] that also returns what `f` returned, in row order.
+fn for_each_row_collect<T: Send>(frame: &mut RgbdFrame, f: impl Fn(u32, &mut [u8], &mut [f32]) -> T + Sync) -> Vec<T> {
     #[cfg(feature = "par")]
     {
         use rayon::prelude::*;
         let w = frame.width as usize;
         if w == 0 {
-            return;
+            return Vec::new();
         }
         frame
             .rgb
             .par_chunks_mut(w * 3)
             .zip(frame.depth.par_chunks_mut(w))
             .enumerate()
-            .for_each(|(y, (rgb, depth))| f(y as u32, rgb, depth));
+            .map(|(y, (rgb, depth))| f(y as u32, rgb, depth))
+            .collect()
     }
     #[cfg(not(feature = "par"))]
-    for_each_row_serial(frame, f);
+    for_each_row_serial(frame, f)
 }
 
-fn for_each_row_serial(frame: &mut RgbdFrame, f: impl Fn(u32, &mut [u8], &mut [f32])) {
+fn for_each_row_serial<T>(frame: &mut RgbdFrame, f: impl Fn(u32, &mut [u8], &mut [f32]) -> T) -> Vec<T> {
     let w = frame.width as usize;
     if w == 0 {
-        return;
+        return Vec::new();
     }
-    for (y, (rgb, depth)) in frame.rgb.chunks_mut(w * 3).zip(frame.depth.chunks_mut(w)).enumerate() {
-        f(y as u32, rgb, depth);
-    }
+    frame
+        .rgb
+        .chunks_mut(w * 3)
+        .zip(frame.depth.chunks_mut(w))
+        .enumerate()
+        .map(|(y, (rgb, depth))| f(y as u32, rgb, depth))
+        .collect()
 }
 
 /// Integer hash of `(seed, pixel, stream)` (lowbias32-style avalanche).
@@ -279,6 +727,7 @@ fn gaussian(seed: u32, pixel: u32, stream: u32) -> f32 {
 mod tests {
     use super::*;
     use crate::scene::{make_scene, Light, Lighting, Material, Primitive, SceneKind};
+    use crate::types::Aabb;
 
     /// A wall facing the camera at z = -4 and a ball in front of it.
     fn wall_scene() -> SceneSnapshot {
@@ -747,6 +1196,160 @@ mod tests {
             c != wall && c != bg
         });
         assert!(blended.count() >= 1);
+    }
+
+    /// A static floor under a point light confined to a room, with moving
+    /// things chosen to sit on every edge case of the partial capture.
+    fn tricky_scene(t: f32) -> (SceneSnapshot, SceneSnapshot) {
+        let gray = Material::solid(Vec3::splat(0.6));
+        let fixed = vec![
+            Primitive::cuboid(Vec3::new(0.0, -0.5, -3.0), Vec3::new(4.0, 0.5, 4.0), Material::checker(Vec3::X, Vec3::ONE, 0.5)),
+            Primitive::cuboid(Vec3::new(0.0, 1.0, -6.5), Vec3::new(4.0, 2.0, 0.5), gray),
+            // Two coincident static boxes: a tie between static primitives.
+            Primitive::cuboid(Vec3::new(-1.5, 0.3, -3.0), Vec3::splat(0.3), Material::solid(Vec3::X)),
+            Primitive::cuboid(Vec3::new(-1.5, 0.3, -3.0), Vec3::splat(0.3), Material::solid(Vec3::Y)),
+        ];
+        let moving = vec![
+            // Rests exactly on the floor and slides across it.
+            Primitive::cuboid(Vec3::new(t.sin(), 0.2, -3.0), Vec3::splat(0.2), Material::solid(Vec3::Z)).with_dynamic(true),
+            // A slab flush with the floor surface (coplanar with it).
+            Primitive::cuboid(Vec3::new(1.2, -0.25, -2.0 - t.cos()), Vec3::new(0.3, 0.25, 0.3), gray).with_dynamic(true),
+            // Passes behind the wall, behind the camera and right in front of it
+            // (nearer than the sensor's minimum range).
+            Primitive::sphere(Vec3::new(2.0 * t.cos(), 1.0, -7.5), 0.4, gray).with_dynamic(true),
+            Primitive::sphere(Vec3::new(0.3, 1.2, 2.0 + t.sin()), 0.5, gray).with_dynamic(true),
+            Primitive::sphere(Vec3::new(0.05 * t.sin(), 1.0, -0.12), 0.03, gray).with_dynamic(true),
+            // High up: only its shadow is in view.
+            Primitive::sphere(Vec3::new(1.5 * t.sin(), 4.5, -3.0 + t.cos()), 0.5, gray).with_dynamic(true),
+        ];
+        let room = Aabb::new(Vec3::new(-3.0, 0.0, -6.0), Vec3::new(3.0, 5.0, 0.0));
+        let lighting = Lighting {
+            lights: vec![
+                Light::directional(Vec3::new(0.2, 1.0, 0.3), Vec3::splat(0.4)),
+                Light::point(Vec3::new(0.0, 6.0, -3.0), 4.0, Vec3::splat(0.8)).with_region(room),
+                Light::directional(Vec3::new(-0.5, 0.6, 0.7), Vec3::splat(0.1)).with_shadow(false),
+            ],
+            ..Lighting::default()
+        };
+        let base = SceneSnapshot::new(fixed.clone(), lighting.clone());
+        // Moving primitives in between the static ones: the order of the
+        // static ones is what counts.
+        let mut all = vec![moving[0].clone(), fixed[0].clone(), fixed[1].clone()];
+        all.extend_from_slice(&moving[1..4]);
+        all.extend_from_slice(&fixed[2..]);
+        all.extend_from_slice(&moving[4..]);
+        (base, SceneSnapshot::new(all, lighting))
+    }
+
+    #[test]
+    fn partial_capture_is_bit_identical_on_the_stage() {
+        let scene = make_scene(SceneKind::Stage);
+        let empty = scene.snapshot_static();
+        let period = scene.loop_duration().unwrap();
+        let rig = crate::rig::RingRig { width: 120, height: 90, ..Default::default() };
+        let mut cameras = rig.cameras();
+        // One camera inside the capture volume, where the dancer passes
+        // closer than the minimum range and behind the camera.
+        cameras.push(Camera::look_at(Vec3::new(0.3, 1.2, 0.5), Vec3::new(-0.4, 0.6, -0.8), Vec3::Y, 1.2, 96, 72));
+        let instants = 40;
+        let (mut recast, mut pixels) = (0usize, 0usize);
+        for shadows in [true, false] {
+            for noise in [NoiseModel::NONE, NoiseModel::realistic()] {
+                let base = CaptureOptions { shadows, noise, ..Default::default() };
+                let fixed: Vec<StaticRender> = cameras.iter().map(|cam| StaticRender::new(&empty, cam, &base)).collect();
+                for k in 0..instants {
+                    let t = period * (k as f32 + 0.37) / instants as f32;
+                    let snap = scene.snapshot(t);
+                    let capture = PartialCapture::new(&snap, &empty).expect("the stage is its static part plus what moves");
+                    for (i, cam) in cameras.iter().enumerate() {
+                        let opts = CaptureOptions { seed: (k * 31 + i) as u32, ..base };
+                        let partial = capture.render(cam, &opts, &fixed[i]);
+                        assert!(partial == render_rgbd(&snap, cam, &opts), "camera {i} at t = {t}, shadows {shadows}, {noise:?}");
+                        if shadows && noise.is_none() && i < 8 {
+                            recast += capture.recast_pixels(&fixed[i]).unwrap();
+                            pixels += (cam.width * cam.height) as usize;
+                        }
+                    }
+                }
+                // The empty stage itself, exposure by exposure.
+                for (i, cam) in cameras.iter().enumerate() {
+                    let opts = CaptureOptions { seed: 1000 + i as u32, ..base };
+                    assert!(fixed[i].expose(&opts) == render_rgbd(&empty, cam, &opts), "plate of camera {i}");
+                    assert!(render_rgbd_partial(&empty, &opts, &fixed[i]) == render_rgbd(&empty, cam, &opts));
+                }
+            }
+        }
+        // Measured: 5.96 % of the pixels of the ring are cast again, which
+        // is the share that really differs from the empty stage.
+        let share = recast as f32 / pixels as f32;
+        println!("partial capture of the stage casts {:.2} % of the pixels again", 100.0 * share);
+        assert!((0.03..0.12).contains(&share), "{share}");
+    }
+
+    #[test]
+    fn partial_capture_is_bit_identical_in_awkward_scenes() {
+        let cameras = [
+            Camera::look_at(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.5, -3.0), Vec3::Y, 1.2, 96, 72),
+            Camera::look_at(Vec3::new(2.5, 3.0, -0.5), Vec3::new(0.0, 0.0, -3.0), Vec3::Y, 0.9, 80, 60),
+            // Straight down the floor, at a grazing angle.
+            Camera::look_at(Vec3::new(-3.5, 0.05, -3.0), Vec3::new(3.0, 0.0, -3.0), Vec3::Y, 1.0, 96, 48),
+        ];
+        let (base, _) = tricky_scene(0.0);
+        for shadows in [true, false] {
+            for (min_range, max_range) in [(0.1, 20.0), (0.5, 4.0), (0.1, f32::INFINITY), (0.1, f32::NAN)] {
+                let opts = CaptureOptions { shadows, min_range, max_range, noise: NoiseModel::realistic(), seed: 9 };
+                let fixed: Vec<StaticRender> = cameras.iter().map(|cam| StaticRender::new(&base, cam, &opts)).collect();
+                for k in 0..24 {
+                    // The same static part in a snapshot of its own every time.
+                    let (_, snap) = tricky_scene(k as f32 * 0.29);
+                    let capture = PartialCapture::new(&snap, &base).expect("static part plus moving primitives");
+                    for (cam, fixed) in cameras.iter().zip(&fixed) {
+                        let opts = CaptureOptions { seed: k, ..opts };
+                        let full = render_rgbd(&snap, cam, &opts);
+                        assert!(capture.render(cam, &opts, fixed) == full, "t {k}, shadows {shadows}, range {min_range}..{max_range}");
+                        assert!(render_rgbd_partial(&snap, &opts, fixed) == full);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_capture_falls_back_to_a_full_render_when_it_cannot_be_exact() {
+        let (base, snap) = tricky_scene(0.4);
+        let cam = Camera::look_at(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.5, -3.0), Vec3::Y, 1.2, 64, 48);
+        let opts = CaptureOptions::default();
+        let fixed = StaticRender::new(&base, &cam, &opts);
+        let full = render_rgbd(&snap, &cam, &opts);
+        let capture = PartialCapture::new(&snap, &base).unwrap();
+        assert!(capture.recast_pixels(&fixed).is_some_and(|n| n > 0 && n < 64 * 48 / 2));
+        // Other options or another camera than the static render was made for.
+        for other in [
+            CaptureOptions { shadows: false, ..opts },
+            CaptureOptions { max_range: 5.0, ..opts },
+            CaptureOptions { min_range: 1.5, ..opts },
+        ] {
+            assert_eq!(capture.render(&cam, &other, &fixed), render_rgbd(&snap, &cam, &other));
+            assert_eq!(fixed.expose(&other), render_rgbd(&base, &cam, &other));
+        }
+        let wider = cam.resized(80, 60);
+        assert_eq!(capture.render(&wider, &opts, &fixed), render_rgbd(&snap, &wider, &opts));
+        // A static render of an equal but separate scene.
+        let (twin, _) = tricky_scene(0.0);
+        let foreign = StaticRender::new(&twin, &cam, &opts);
+        assert!(capture.recast_pixels(&foreign).is_none());
+        assert_eq!(capture.render(&cam, &opts, &foreign), full);
+        // A snapshot that is not "the static part plus moving primitives".
+        let (_, later) = tricky_scene(1.0);
+        assert!(PartialCapture::new(&base, &later).is_none(), "the base holds moving primitives");
+        let stage = make_scene(SceneKind::Stage).snapshot(1.0);
+        assert!(PartialCapture::new(&stage, &base).is_none(), "another scene");
+        assert_eq!(render_rgbd_partial(&stage, &opts, &fixed), render_rgbd(&stage, &cam, &opts));
+        // A scene without anything moving is all static render.
+        let house = make_scene(SceneKind::House).snapshot(0.0);
+        let still = StaticRender::new(&house, &cam, &opts);
+        assert_eq!(PartialCapture::new(&house, &house).unwrap().recast_pixels(&still), Some(0));
+        assert_eq!(render_rgbd_partial(&house, &opts, &still), render_rgbd(&house, &cam, &opts));
     }
 
     #[test]

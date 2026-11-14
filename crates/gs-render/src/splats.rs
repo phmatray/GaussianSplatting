@@ -1,4 +1,5 @@
-//! Splat storage (CPU + GPU), depth sorting and the splat draw call.
+//! Splat storage (CPU + GPU), depth sorting and the splat draw calls of both
+//! blending modes.
 
 use glam::{Mat4, Vec3};
 use gs_core::codec::{self, LayerHeader, LayerMode};
@@ -10,9 +11,10 @@ use web_sys::{WebGl2RenderingContext as GL, WebGlBuffer, WebGlProgram, WebGlText
 
 use crate::depth::{DepthWarp, RobustBounds};
 use crate::glutil::{link_program, uniform};
+use crate::normalized::{LayerDraw, Normalized, Output, ViewDraw};
 use crate::pack::{pack_splats, TextureLayout, MIN_ROWS, WORDS_PER_SPLAT};
-use crate::params::{RenderParams, LAYER_COUNT};
-use crate::shaders::{SPLAT_FS, SPLAT_VS};
+use crate::params::{BlendQuality, BlendReason, BlendStatus, LayerContent, NormalizedSupport, RenderParams, LAYER_COUNT};
+use crate::shaders::{sorted_vs, SORTED_FS};
 
 /// Splats packed per staging-buffer fill when (re)uploading a large range:
 /// bounds the staging memory to a few megabytes.
@@ -47,6 +49,8 @@ pub(crate) enum SortOutcome {
 }
 
 struct Layer {
+    /// What the splats are: decides the blending mode and the low-pass.
+    content: LayerContent,
     splats: Vec<Splat>,
     /// Centers only, densely packed for the sorter.
     positions: Vec<[f32; 3]>,
@@ -61,6 +65,8 @@ struct Uniforms {
     order_width: WebGlUniformLocation,
     split: WebGlUniformLocation,
     counts: WebGlUniformLocation,
+    layer_scale: WebGlUniformLocation,
+    layer_classic: WebGlUniformLocation,
     spr: WebGlUniformLocation,
     view: WebGlUniformLocation,
     focal: WebGlUniformLocation,
@@ -87,7 +93,8 @@ struct Sorted {
     sorted_last_frame: bool,
 }
 
-/// The layer-independent GL objects (everything but the data textures).
+/// The layer-independent GL objects of the sorted mode, and the quad index
+/// buffer both modes draw with.
 struct Pipeline {
     program: WebGlProgram,
     uniforms: Uniforms,
@@ -120,10 +127,29 @@ pub(crate) struct SplatScene {
     /// Bumped on every change of the splat data.
     version: u64,
     sorted: Sorted,
+    /// The normalised mode, or why this context cannot have it.
+    normalized: Result<Normalized, BlendReason>,
+    /// Splats submitted by the most recent draw.
+    drawn: u32,
     /// Duration of the last sort, milliseconds.
     pub sort_ms: f64,
     /// Number of sorts so far.
     pub sort_count: u64,
+}
+
+/// Sets up the normalised mode where the context supports it; the reason it
+/// does not otherwise (also written to the console, once per context).
+fn create_normalized(gl: &GL) -> Result<Normalized, BlendReason> {
+    if !Normalized::float_targets(gl) {
+        web_sys::console::warn_1(
+            &"gs-render: no EXT_color_buffer_half_float / EXT_color_buffer_float: falling back to sorted blending".into(),
+        );
+        return Err(BlendReason::NoFloatTargets);
+    }
+    Normalized::new(gl).map_err(|e| {
+        web_sys::console::warn_2(&"gs-render: the normalised blending mode is unavailable, falling back to sorted blending:".into(), &e);
+        BlendReason::TargetsFailed
+    })
 }
 
 fn create_data_texture(gl: &GL, layout: &TextureLayout, rows: u32) -> Result<WebGlTexture, JsValue> {
@@ -162,12 +188,14 @@ fn create_order_texture(gl: &GL, width: u32, rows: u32) -> Result<WebGlTexture, 
 
 impl Pipeline {
     fn new(gl: &GL, max_texture_size: u32) -> Result<Self, JsValue> {
-        let program = link_program(gl, SPLAT_VS, SPLAT_FS)?;
+        let program = link_program(gl, &sorted_vs(), SORTED_FS)?;
         let u = |name: &str| uniform(gl, &program, name);
         let uniforms = Uniforms {
             order_width: u("u_order_width")?,
             split: u("u_split")?,
             counts: u("u_counts")?,
+            layer_scale: u("u_layer_scale")?,
+            layer_classic: u("u_layer_classic")?,
             spr: u("u_spr")?,
             view: u("u_view")?,
             focal: u("u_focal")?,
@@ -280,6 +308,7 @@ impl SplatScene {
         let layout = TextureLayout::new(max_texture_size);
         let layer = || -> Result<Layer, JsValue> {
             Ok(Layer {
+                content: LayerContent::default(),
                 splats: Vec::new(),
                 positions: Vec::new(),
                 bounds: None,
@@ -306,6 +335,8 @@ impl SplatScene {
                 instances: 0,
                 sorted_last_frame: false,
             },
+            normalized: create_normalized(gl),
+            drawn: 0,
             sort_ms: 0.0,
             sort_count: 0,
         })
@@ -321,6 +352,8 @@ impl SplatScene {
     /// copy of the splats again.
     pub fn restore(&mut self) -> Result<(), JsValue> {
         self.pipeline = Pipeline::new(&self.gl, self.layout.max_rows)?;
+        // The old programs and targets died with the old context.
+        self.normalized = create_normalized(&self.gl);
         self.detached = false;
         self.sorted.version = 0;
         self.sorted.instances = 0;
@@ -343,9 +376,56 @@ impl SplatScene {
         self.layers.iter().map(|l| l.splats.len()).sum()
     }
 
-    /// Instances the next draw submits.
-    pub fn instances(&self) -> u32 {
-        self.sorted.instances
+    /// Splats the most recent draw submitted.
+    pub fn drawn(&self) -> u32 {
+        self.drawn
+    }
+
+    /// What `layer` holds.
+    pub fn content(&self, layer: usize) -> LayerContent {
+        self.layers[layer].content
+    }
+
+    /// Declares what `layer` holds. Changes how it is drawn, not its data.
+    pub fn set_content(&mut self, layer: usize, content: LayerContent) {
+        self.layers[layer].content = content;
+    }
+
+    /// The blending mode `params` leads to with the current layers, and why.
+    pub fn blend_status(&self, params: &RenderParams) -> BlendStatus {
+        let shown = [params.show_static, params.show_dynamic];
+        let content: [Option<LayerContent>; LAYER_COUNT] =
+            std::array::from_fn(|i| (shown[i] && !self.layers[i].splats.is_empty()).then_some(self.layers[i].content));
+        let support = match &self.normalized {
+            Ok(_) => NormalizedSupport::Available,
+            Err(reason) => NormalizedSupport::Unavailable(*reason),
+        };
+        BlendStatus::resolve(params.blend, params.quality, content, support)
+    }
+
+    /// Size of the off-screen targets of the normalised mode, if allocated.
+    pub fn normalized_target_size(&self) -> Option<(u32, u32)> {
+        self.normalized.as_ref().ok().and_then(Normalized::target_size)
+    }
+
+    /// Frees the off-screen targets of the normalised mode (they come back
+    /// on demand). Cheap when there are none.
+    pub fn release_normalized_targets(&mut self) {
+        if let (Ok(normalized), false) = (&mut self.normalized, self.detached) {
+            normalized.release_targets(&self.gl);
+        }
+    }
+
+    /// Gives the normalised mode up for this context (a render target could
+    /// not be allocated): [`Self::blend_status`] reports the fallback from
+    /// now on.
+    pub fn disable_normalized(&mut self) {
+        if let Ok(normalized) = &mut self.normalized {
+            if !self.detached {
+                normalized.destroy(&self.gl);
+            }
+        }
+        self.normalized = Err(BlendReason::TargetsFailed);
     }
 
     /// Copy of all splats, layer 0 first.
@@ -366,18 +446,23 @@ impl SplatScene {
     }
 
     /// Replaces the content of a layer. O(new size).
-    pub fn replace(&mut self, layer: usize, splats: &[Splat]) -> Result<(), String> {
+    pub fn replace(&mut self, layer: usize, splats: &[Splat], content: LayerContent) -> Result<(), String> {
         self.check_capacity(splats.len())?;
         let l = &mut self.layers[layer];
+        l.content = content;
         l.splats.clear();
         l.splats.extend_from_slice(splats);
         self.refresh(layer, 0)
     }
 
-    /// Adds splats to a layer. O(added), amortized.
-    pub fn append(&mut self, layer: usize, splats: &[Splat]) -> Result<(), String> {
+    /// Adds splats to a layer. O(added), amortized. An empty layer takes
+    /// `content`; a layer that already holds splats keeps what it is.
+    pub fn append(&mut self, layer: usize, splats: &[Splat], content: LayerContent) -> Result<(), String> {
         let start = self.layers[layer].splats.len();
         self.check_capacity(start + splats.len())?;
+        if start == 0 {
+            self.layers[layer].content = content;
+        }
         self.layers[layer].splats.extend_from_slice(splats);
         self.refresh(layer, start)
     }
@@ -417,6 +502,8 @@ impl SplatScene {
                 start
             }
         };
+        // The wire only carries surfels of the capture pipeline.
+        self.layers[layer].content = LayerContent::Surfels;
         self.refresh(layer, start)?;
         Ok((header, self.layers[layer].splats.len()))
     }
@@ -554,12 +641,52 @@ impl SplatScene {
         SortOutcome::Sorted
     }
 
+    /// Draws one view in the normalised mode: off-screen passes, then the
+    /// resolve into `output` (which is left bound, with its viewport set).
+    /// No order is involved, so [`Self::sort`] need not be called.
+    ///
+    /// Fails when the mode is unavailable or a render target cannot be
+    /// allocated; nothing was drawn into `output` then.
+    pub fn draw_normalized(
+        &mut self,
+        vp: &ViewParams,
+        params: &RenderParams,
+        clip_y: f32,
+        quality: BlendQuality,
+        output: Output,
+    ) -> Result<(), String> {
+        self.drawn = 0;
+        if self.detached {
+            return Ok(());
+        }
+        let shown = [params.show_static, params.show_dynamic];
+        let mut layers = Vec::with_capacity(LAYER_COUNT);
+        for (i, layer) in self.layers.iter().enumerate() {
+            if shown[i] && !layer.splats.is_empty() {
+                layers.push(LayerDraw { texture: &layer.texture, count: layer.splats.len() as u32, weight: params.layer_weights[i] });
+            }
+        }
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let most = layers.iter().map(|l| l.count as usize).max().unwrap_or(0);
+        self.pipeline.reserve_quads(&self.gl, most, &mut self.staging);
+        let normalized = self.normalized.as_mut().map_err(|reason| format!("the normalised mode is unavailable ({})", reason.as_str()))?;
+        let view =
+            ViewDraw { vp, params, clip_y, quality, layers: &layers, vao: &self.pipeline.vao, splats_per_row: self.layout.splats_per_row, output };
+        normalized.draw(&self.gl, &view)?;
+        self.drawn = layers.iter().map(|l| l.count).sum();
+        Ok(())
+    }
+
     /// Draws the sorted splats into the bound framebuffer and viewport.
     /// `clip_y` is the height above which splats are hidden (`+∞` = none).
-    pub fn draw(&self, vp: &ViewParams, params: &RenderParams, clip_y: f32) {
+    pub fn draw(&mut self, vp: &ViewParams, params: &RenderParams, clip_y: f32) {
+        self.drawn = 0;
         if self.sorted.instances == 0 || self.detached {
             return;
         }
+        self.drawn = self.sorted.instances;
         let gl = &self.gl;
         let u = &self.pipeline.uniforms;
         gl.use_program(Some(&self.pipeline.program));
@@ -572,6 +699,13 @@ impl SplatScene {
         gl.uniform1i(Some(&u.order_width), self.pipeline.order_width as i32);
         gl.uniform1ui(Some(&u.split), self.sorted.split);
         gl.uniform2ui(Some(&u.counts), self.layers[0].splats.len() as u32, self.layers[1].splats.len() as u32);
+        // Surfels are sized for the normalised mode and get the
+        // energy-conserving low-pass; imported files are drawn as trained.
+        let surfels = |layer: usize| self.layers[layer].content == LayerContent::Surfels;
+        let scale = |layer: usize| if surfels(layer) { params.sorted_surfel_scale } else { 1.0 };
+        let classic = |layer: usize| if surfels(layer) { 0.0 } else { 1.0 };
+        gl.uniform2f(Some(&u.layer_scale), scale(0), scale(1));
+        gl.uniform2f(Some(&u.layer_classic), classic(0), classic(1));
         gl.uniform1i(Some(&u.spr), self.layout.splats_per_row as i32);
         gl.uniform_matrix4fv_with_f32_array(Some(&u.view), false, &vp.view.to_cols_array());
         gl.uniform2f(Some(&u.focal), vp.fx, vp.fy);
@@ -609,6 +743,9 @@ impl SplatScene {
         let gl = &self.gl;
         for layer in &self.layers {
             gl.delete_texture(Some(&layer.texture));
+        }
+        if let Ok(normalized) = &mut self.normalized {
+            normalized.destroy(gl);
         }
         self.pipeline.destroy(gl);
     }

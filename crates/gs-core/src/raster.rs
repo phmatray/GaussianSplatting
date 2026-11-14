@@ -4,8 +4,14 @@
 //! splat is projected with [`crate::splat::project_splat_with_axes`], the
 //! visible ones are sorted back to front with [`DepthSorter`], and composited
 //! with "over" directly on sRGB values. It is the ground truth the WebGL
-//! renderer is compared against, and it produces the images for the tests
-//! (PSNR against the ray-cast scene) — CI has no GPU.
+//! renderer is compared against in its *sorted* blending mode, and it
+//! produces the images for the tests (PSNR against the ray-cast scene) — CI
+//! has no GPU. The reference of the *normalised* blending mode of
+//! `docs/ARCHITECTURE.md` is [`crate::experimental::wblend`].
+//!
+//! The screen-space low-pass conserves the energy of a splat (step 6 of
+//! [`crate::splat`]); [`RasterOptions::classic_dilation`] switches that off
+//! for splat files trained with the plain dilation of 3DGS.
 //!
 //! Like the shader, it evaluates the Gaussian exponent from the quad
 //! coordinate (`m = 9·|q|²`, steps 8–9) rather than from the conic: the two
@@ -119,11 +125,24 @@ pub struct RasterOptions {
     pub point_sigma_px: f32,
     /// Splats whose center is closer than this are not drawn (meters).
     pub near: f32,
+    /// Leave the opacity alone when the low-pass dilates a splat, as the
+    /// reference 3DGS implementation does (and as this rasterizer did before
+    /// the filter was made energy conserving). Right for imported splat files,
+    /// which were trained that way; wrong for sensor surfels, whose far and
+    /// miniature views it turns to mush.
+    pub classic_dilation: bool,
 }
 
 impl Default for RasterOptions {
     fn default() -> Self {
-        Self { background: [0, 0, 0], splat_scale: 1.0, point_mode: false, point_sigma_px: 0.8, near: DEFAULT_NEAR }
+        Self {
+            background: [0, 0, 0],
+            splat_scale: 1.0,
+            point_mode: false,
+            point_sigma_px: 0.8,
+            near: DEFAULT_NEAR,
+            classic_dilation: false,
+        }
     }
 }
 
@@ -150,7 +169,7 @@ struct Draw {
 
 /// Projects one splat and computes the pixel rectangle it can touch.
 fn prepare(splat: &Splat, vp: &ViewParams, opts: &RasterOptions) -> Option<Draw> {
-    let opacity = splat.rgba[3] as f32 / 255.0;
+    let mut opacity = splat.rgba[3] as f32 / 255.0;
     if opacity < MIN_ALPHA {
         return None;
     }
@@ -159,6 +178,12 @@ fn prepare(splat: &Splat, vp: &ViewParams, opts: &RasterOptions) -> Option<Draw>
         let r = p.with_point_footprint(opts.point_sigma_px).radius;
         major = [r, 0.0];
         minor = [0.0, r];
+    } else if !opts.classic_dilation {
+        // Step 6: the low-pass spreads the splat without adding energy.
+        opacity *= p.gain;
+        if opacity < MIN_ALPHA {
+            return None;
+        }
     }
     // Alpha drops below 1/255 where the Mahalanobis distance² exceeds
     // 2·ln(255·opacity), so faint splats need less than the full 3σ box:
@@ -373,15 +398,17 @@ mod tests {
         let cam = camera();
         let bg = [20.0f32, 40.0, 60.0];
         let opts = RasterOptions { background: [20, 40, 60], ..Default::default() };
-        // σ = 0.05 m at 2 m ⇒ variance 25 px² + low-pass.
+        // σ = 0.05 m at 2 m ⇒ variance 25 px² + low-pass, and the amplitude
+        // scaled by the ratio of the areas, 25 / 25.3.
         let center = cam.unproject(100.5, 80.5, 2.0);
         let var = 25.0 + LOW_PASS_PX2;
+        let gain = 25.0 / var;
         let color = [250.0f32, 10.0, 130.0];
         let opacity = 204u8; // 0.8
         let img = rasterize(&[ball(center, 0.05, [250, 10, 130, opacity])], &cam, &opts);
         for (dx, dy) in [(0i32, 0i32), (3, 0), (0, -4), (5, 5), (-7, 2), (10, -9), (14, 0), (16, 0), (0, 15), (0, 16)] {
             let m = (dx * dx + dy * dy) as f32 / var;
-            let mut alpha = opacity as f32 / 255.0 * (-0.5 * m).exp();
+            let mut alpha = gain * opacity as f32 / 255.0 * (-0.5 * m).exp();
             if m > 9.0 || alpha < 1.0 / 255.0 {
                 alpha = 0.0;
             }
@@ -467,10 +494,45 @@ mod tests {
         let s = ball(cam.unproject(100.5, 80.5, 2.0), 0.1, [255, 255, 255, 255]);
         let full = rasterize(&[s], &cam, &RasterOptions::default());
         let half = rasterize(&[s], &cam, &RasterOptions { splat_scale: 0.5, ..Default::default() });
-        assert_eq!(full.pixel(100, 80), half.pixel(100, 80));
+        // The centers differ only by the gain of the low-pass: 100 / 100.3
+        // against 25 / 25.3.
+        assert_close(full.pixel(100, 80), [255.0 * 100.0 / 100.3; 3], 0.75, "full center");
+        assert_close(half.pixel(100, 80), [255.0 * 25.0 / 25.3; 3], 0.75, "half center");
         // 10 px = 1σ at full size, 2σ at half size.
-        assert_close(full.pixel(110, 80), [255.0 * (-0.5 * 100.0 / 100.3f32).exp(); 3], 0.75, "full");
-        assert_close(half.pixel(110, 80), [255.0 * (-0.5 * 100.0 / 25.3f32).exp(); 3], 0.75, "half");
+        assert_close(full.pixel(110, 80), [255.0 * 100.0 / 100.3 * (-0.5 * 100.0 / 100.3f32).exp(); 3], 0.75, "full");
+        assert_close(half.pixel(110, 80), [255.0 * 25.0 / 25.3 * (-0.5 * 100.0 / 25.3f32).exp(); 3], 0.75, "half");
+    }
+
+    /// Sum of the red channel over the image, in units of full pixels.
+    fn energy(img: &Image) -> f32 {
+        img.rgb.chunks_exact(3).map(|p| p[0] as f32 / 255.0).sum()
+    }
+
+    #[test]
+    fn low_pass_conserves_the_energy_of_small_splats() {
+        let cam = camera();
+        // σ from a tenth of a pixel to five pixels: the picture of the splat
+        // integrates to its true area 2πσ², wherever its center falls
+        // between the pixel centers.
+        for sigma_px in [0.1f32, 0.25, 0.5, 1.0, 2.0, 5.0] {
+            let exact = std::f32::consts::TAU * sigma_px * sigma_px;
+            let (mut lo, mut hi) = (f32::INFINITY, 0.0f32);
+            for k in 0..16 {
+                let center = cam.unproject(100.0 + (k % 4) as f32 / 4.0, 80.0 + (k / 4) as f32 / 4.0, 2.0);
+                let e = energy(&rasterize(&[ball(center, sigma_px * 0.01, [255; 4])], &cam, &RasterOptions::default()));
+                (lo, hi) = (lo.min(e), hi.max(e));
+            }
+            // 8-bit output: a faint splat loses up to half a level per pixel.
+            let slack = 0.06 * exact + 0.03;
+            assert!(lo > exact - slack && hi < exact + slack, "σ = {sigma_px} px: {lo}..{hi} vs {exact}");
+            // No shimmer: the sum barely depends on the sub-pixel position.
+            assert!(hi - lo < 0.05 * exact + 0.03, "σ = {sigma_px} px: {lo}..{hi}");
+        }
+        // The plain dilation inflates a sub-pixel splat to the area of the
+        // filter: 2π·(0.01 + 0.3) px² instead of 2π·0.01.
+        let tiny = ball(cam.unproject(100.5, 80.5, 2.0), 0.001, [255; 4]);
+        let classic = energy(&rasterize(&[tiny], &cam, &RasterOptions { classic_dilation: true, ..Default::default() }));
+        assert!(classic > 25.0 * std::f32::consts::TAU * 0.01, "{classic}");
     }
 
     #[test]
@@ -603,8 +665,10 @@ mod tests {
             rgba: [255; 4],
         };
         let img = rasterize(&[needle], &cam, &RasterOptions::default());
-        assert!(img.pixel(100 + 15, 80 - 16)[0] > 150, "{:?}", img.pixel(115, 64));
-        assert!(img.pixel(100 - 16, 80 + 15)[0] > 150, "{:?}", img.pixel(84, 95));
+        // Half a pixel thin: the low-pass spreads it over a pixel and dims it
+        // to about two thirds (step 6), 0.77 of which is left 22 px out.
+        assert!(img.pixel(100 + 15, 80 - 16)[0] > 110, "{:?}", img.pixel(115, 64));
+        assert!(img.pixel(100 - 16, 80 + 15)[0] > 110, "{:?}", img.pixel(84, 95));
         assert_eq!(img.pixel(100 + 15, 80 + 15), [0, 0, 0]);
         assert_eq!(img.pixel(100 - 15, 80 - 15), [0, 0, 0]);
     }
@@ -620,7 +684,13 @@ mod tests {
             };
             if depth >= DEFAULT_NEAR as f64 {
                 let lp = LOW_PASS_PX2 as f64;
-                items.push((depth, center, [cov[0] + lp, cov[1], cov[2] + lp], s.rgba.map(f64::from)));
+                let filtered = [cov[0] + lp, cov[1], cov[2] + lp];
+                // Energy-conserving low-pass: the opacity shrinks by the
+                // ratio of the areas before and after the dilation.
+                let area = |c: [f64; 3]| (c[0] * c[2] - c[1] * c[1]).max(0.0).sqrt();
+                let mut rgba = s.rgba.map(f64::from);
+                rgba[3] *= area(cov) / area(filtered);
+                items.push((depth, center, filtered, rgba));
             }
         }
         items.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -688,8 +758,16 @@ mod tests {
         // White at opacity 128/255 over grey 100: at most 100 + 155·0.502 = 177.8.
         let (min, max) = img.rgb.iter().fold((255u8, 0u8), |(lo, hi), &v| (lo.min(v), hi.max(v)));
         assert!(min == 100 && max <= 178, "range {min}..={max}");
-        // And it is drawn: a thin line crossing the image, not a blob.
-        let lit = img.rgb.chunks_exact(3).filter(|p| p[0] > 110).count();
+        // It is a few hundredths of a pixel wide: the energy-conserving
+        // low-pass leaves it a few grey levels at most, and at this aspect
+        // ratio (80 000 : 1) its width, hence its gain, is rounding noise
+        // (see "Numerical limits" in `crate::splat`). So only the bound
+        // above is asserted for it. With the plain dilation it is drawn as
+        // before: a pixel-wide line crossing the image, not a blob.
+        let classic = rasterize(&[needle], &cam, &RasterOptions { classic_dilation: true, ..opts });
+        let (min, max) = classic.rgb.iter().fold((255u8, 0u8), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(min == 100 && max <= 178 && max > 150, "range {min}..={max}");
+        let lit = classic.rgb.chunks_exact(3).filter(|p| p[0] > 110).count();
         assert!((100..4000).contains(&lit), "{lit} lit pixels");
     }
 
@@ -726,8 +804,11 @@ mod tests {
         ] {
             assert_eq!(rasterize(&odd, &camera(), &opts).rgb.len(), 200 * 160 * 3, "{opts:?}");
         }
-        // A zero-scale splat is still a (low-pass sized) dot of its color.
-        let img = rasterize(&[Splat { pos: [0.0, 0.0, -1.0], ..odd[0] }], &camera(), &d);
+        // A zero-scale splat has no area and therefore no energy; with the
+        // plain dilation it is a (low-pass sized) dot of its color.
+        let point = [Splat { pos: [0.0, 0.0, -1.0], ..odd[0] }];
+        assert!(rasterize(&point, &camera(), &d).rgb.iter().all(|&v| v == 0));
+        let img = rasterize(&point, &camera(), &RasterOptions { classic_dilation: true, ..d });
         assert!(img.pixel(100, 80)[0] > 100 && img.pixel(104, 80) == [0; 3]);
         // Nonsensical intrinsics.
         for (fx, cx) in [(0.0, 100.0), (f32::NAN, f32::INFINITY), (-200.0, 100.0)] {

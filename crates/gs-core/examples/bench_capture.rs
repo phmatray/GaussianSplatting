@@ -8,7 +8,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use gs_core::capture::{render_rgbd, CaptureOptions, NoiseModel};
+use gs_core::capture::{render_rgbd, CaptureOptions, NoiseModel, PartialCapture, StaticRender};
 use gs_core::pipeline::{scan_frame, scan_frame_count, scan_sensor};
 use gs_core::protocol::ScanConfig;
 use gs_core::rig::{RingRig, ScanPath};
@@ -46,33 +46,58 @@ fn main() {
         build
     );
 
-    let cams = RingRig::default().cameras();
-    for (label, noise) in [("clean", NoiseModel::NONE), ("noisy", NoiseModel::realistic())] {
-        let mut worst = 0.0f64;
-        let mut sum = 0.0;
-        let instants = 24;
-        for k in 0..instants {
-            let snap = stage.snapshot(9.6 * k as f32 / instants as f32);
-            let opts = CaptureOptions {
-                noise,
-                ..Default::default()
-            };
-            let ms = time_ms(9, || {
-                for cam in &cams {
-                    black_box(render_rgbd(&snap, cam, &opts));
+    // The ring at the three stage resolutions: every ray cast again (what a
+    // tick cost before), and the partial capture the pipeline uses, which
+    // casts only the pixels the dancer and the balls can change.
+    let empty = stage.snapshot_static();
+    let instants = 24;
+    for (width, height) in [(160, 120), (240, 180), (320, 240)] {
+        let cams = RingRig { width, height, ..RingRig::default() }.cameras();
+        let pixels = (cams.len() as u32 * width * height) as f64;
+        for (label, noise, shadows) in
+            [("clean", NoiseModel::NONE, true), ("noisy", NoiseModel::realistic(), true), ("clean, no shadows", NoiseModel::NONE, false)]
+        {
+            let opts = CaptureOptions { noise, shadows, ..Default::default() };
+            let fixed: Vec<StaticRender> = cams.iter().map(|cam| StaticRender::new(&empty, cam, &opts)).collect();
+            let plate = time_ms(9, || {
+                for fixed in &fixed {
+                    black_box(fixed.expose(&opts));
                 }
             });
-            worst = worst.max(ms);
-            sum += ms;
+            let (mut full, mut partial, mut worst, mut recast) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+            for k in 0..instants {
+                let snap = stage.snapshot(9.6 * k as f32 / instants as f32);
+                // The full render is only timed at every fourth instant: it
+                // does not depend on the pose.
+                if k % 4 == 0 {
+                    full += time_ms(3, || {
+                        for cam in &cams {
+                            black_box(render_rgbd(&snap, cam, &opts));
+                        }
+                    });
+                }
+                let ms = time_ms(9, || {
+                    let capture = PartialCapture::new(&snap, &empty).expect("the stage splits into static and moving parts");
+                    for (cam, fixed) in cams.iter().zip(&fixed) {
+                        black_box(capture.render(cam, &opts, fixed));
+                    }
+                });
+                let capture = PartialCapture::new(&snap, &empty).expect("the stage splits into static and moving parts");
+                recast += fixed.iter().map(|f| capture.recast_pixels(f).unwrap_or(0)).sum::<usize>();
+                worst = worst.max(ms);
+                partial += ms;
+            }
+            let (full, partial) = (full / (instants / 4) as f64, partial / instants as f64);
+            println!(
+                "stage {} x {width}x{height}, {label}: full {full:.2} ms ({:.0} ns per pixel); \
+                 partial mean {partial:.2} ms, worst {worst:.2} ms ({:.0} ns per pixel, {:.2} % of the pixels cast again); \
+                 empty stage from the static render {plate:.2} ms",
+                cams.len(),
+                full * 1e6 / pixels,
+                partial * 1e6 / pixels,
+                100.0 * recast as f64 / (pixels * instants as f64),
+            );
         }
-        println!(
-            "stage {} x {}x{} with shadows, {label}: mean {:.2} ms, worst {:.2} ms",
-            cams.len(),
-            cams[0].width,
-            cams[0].height,
-            sum / instants as f64,
-            worst
-        );
     }
 
     // House: build once, then sensor frames along the tour.

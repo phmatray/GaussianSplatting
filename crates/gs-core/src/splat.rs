@@ -44,13 +44,20 @@
 //!    `T = J · Wm` (2×3), `M = k² · T·Σ·Tᵀ = [[ma, mb], [mb, mc]]`,
 //!    `Σ' = M + 0.3·I = [[a, b], [b, c]]`, i.e. `a = ma + 0.3`, `b = mb`,
 //!    `c = mc + 0.3`. The `0.3 px²` term ([`LOW_PASS_PX2`]) is the
-//!    anti-aliasing low-pass of the reference 3DGS implementation; it is
+//!    anti-aliasing low-pass (a Gaussian pixel filter); it is
 //!    added *after* the `k²` scaling. `M` is positive semi-definite, so
 //!    `ma` and `mc` are clamped to `≥ 0` (rounding noise only).
 //! 6. Determinant, written so that 32-bit cancellation can never make it
 //!    negative or smaller than the low-pass allows:
-//!    `det = max(ma·mc − mb², 0) + 0.3·(ma + mc) + 0.09`
+//!    `detM = max(ma·mc − mb², 0)`, `det = detM + 0.3·(ma + mc) + 0.09`
 //!    (algebraically `a·c − b²`). Cull when `det` is not finite.
+//!    The filter must not add energy: the amplitude of the splat is scaled
+//!    by `g = √(detM / det)` ([`Projected::gain`]), the ratio of the areas
+//!    before and after the dilation (the 2D filter of Mip-Splatting). A
+//!    splat much larger than a pixel keeps `g ≈ 1`; one much smaller than a
+//!    pixel becomes a pixel-sized blob as faint as its share of the pixel.
+//!    See [the section below](#the-low-pass-filter) for why and for the one
+//!    exception.
 //! 7. Eigen-decomposition of `Σ'`:
 //!    `mid = (a + c)/2`, `rad = length(((a − c)/2, b))`,
 //!    `λ1 = mid + rad`, `λ2 = det/λ1` (stable form of `mid − rad`; `≥ 0.3`),
@@ -77,12 +84,12 @@
 //!    `m = δᵀ·conic·δ = conic.xx·δx² + 2·conic.xy·δx·δy + conic.yy·δy²`.
 //!    On the quad of step 8 the interpolated corner coordinate gives the same
 //!    number without a matrix: `m = 9·dot(q, q)`.
-//! 10. Discard when `m > 9` (outside 3σ). `α = o · exp(−0.5·m)`. Discard when
-//!     `α < 1/255` ([`MIN_ALPHA`]). There is no 0.99 clamp on `α`: a fully
-//!     opaque splat shows exactly its color at its center. (`m ≥ 0`, so
-//!     `α ≤ o`; the CPU code enforces this bound explicitly because the
-//!     conic form of `m` can cancel to a negative number for extreme
-//!     needles.)
+//! 10. Discard when `m > 9` (outside 3σ). `α = o·g · exp(−0.5·m)` with the
+//!     gain `g` of step 6. Discard when `α < 1/255` ([`MIN_ALPHA`]). There
+//!     is no 0.99 clamp on `α`: a fully opaque splat that is large on screen
+//!     shows its color at its center. (`m ≥ 0`, so `α ≤ o·g`; the CPU code
+//!     enforces this bound explicitly because the conic form of `m` can
+//!     cancel to a negative number for extreme needles.)
 //! 11. Splats are drawn **back to front** ([`crate::sort`]) and composited
 //!     with "over" on premultiplied alpha, directly on sRGB values:
 //!     `dst.rgb = c·α + dst.rgb·(1 − α)`
@@ -111,7 +118,9 @@
 //! float mb = k * k * dot(T0, S * T1);
 //! float mc = max(k * k * dot(T1, S * T1), 0.0);
 //! float a = ma + 0.3, b = mb, c = mc + 0.3;
-//! float det = max(ma * mc - mb * mb, 0.0) + 0.3 * (ma + mc) + 0.09;
+//! float detM = max(ma * mc - mb * mb, 0.0);
+//! float det = detM + 0.3 * (ma + mc) + 0.09;
+//! float gain = sqrt(detM / det);                   // energy-conserving low-pass
 //! float mid = 0.5 * (a + c);
 //! float rad = length(vec2(0.5 * (a - c), b));
 //! float l1 = mid + rad;
@@ -128,10 +137,35 @@
 //! // ---- fragment ----
 //! float r2 = dot(vCorner, vCorner);
 //! if (r2 > 1.0) discard;                           // outside 3 sigma
-//! float alpha = o * exp(-4.5 * r2);
+//! float alpha = o * gain * exp(-4.5 * r2);
 //! if (alpha < 1.0 / 255.0) discard;
 //! fragColor = vec4(color * alpha, alpha);          // blendFunc(ONE, ONE_MINUS_SRC_ALPHA)
 //! ```
+//!
+//! # The low-pass filter
+//!
+//! Adding `0.3 px²` to the screen covariance band-limits a splat to what the
+//! pixel grid can represent. The reference 3DGS implementation stops there,
+//! which makes every splat *brighter* in total by the area it gained: a
+//! surface sampled by many sub-pixel splats (a far or miniature view, a
+//! finer sensor) turns into an opaque smear and thin structures get fat.
+//! Scaling the amplitude by `g = √(detM / det)` keeps the integral of the
+//! splat over the image unchanged (Mip-Splatting's 2D filter). The lab of
+//! this project measured +4.4 dB on far views of the stage with it and
+//! nothing at close range, where `g ≈ 1`.
+//!
+//! The variance stays at `0.3 px²` rather than the `0.1 px²` of
+//! Mip-Splatting: with `σ = 0.55 px` the sum of a sub-pixel splat over the
+//! pixel grid varies by about ±1 % with its sub-pixel position, with
+//! `σ = 0.32 px` by ±50 % (a unit test pins this down), which shows as
+//! shimmer under the slightest camera or scene motion. The lab's still
+//! images scored the two within 0.4 dB of each other on far views.
+//!
+//! Splat files trained by 3DGS implementations were optimized *with* the
+//! plain dilation: their opacities already account for it, and compensating
+//! it would make their fine detail too faint. Renderers therefore keep the
+//! plain dilation for such content (`classic_dilation` of
+//! `raster::RasterOptions`; imported layers in the viewer).
 //!
 //! # Numerical limits
 //!
@@ -143,7 +177,10 @@
 //! thicker: it is never culled and never thinner than the low-pass, and its
 //! conic is assembled from two positive eigenvalues. (Evaluating the conic
 //! form of step 9 can still cancel at that point, which is why the shader
-//! and the CPU rasterizer use the quad form.)
+//! and the CPU rasterizer use the quad form.) The gain of step 6 needs the
+//! thin axis itself and is therefore noise for such a splat, anywhere between
+//! zero and the true value of a splat a pixel thick; sensor surfels are
+//! nowhere near that regime (a few centimeters, axis ratios below ten).
 //!
 //! # Intrinsics from a projection matrix
 //!
@@ -157,6 +194,8 @@ use glam::{Mat3, Mat4, Quat, Vec3};
 use crate::types::{Camera, Splat};
 
 /// Anti-aliasing low-pass added to the diagonal of the 2D covariance, pixel².
+/// The amplitude of the splat is scaled so that the filter conserves its
+/// energy ([`Projected::gain`]); see the module documentation for the value.
 pub const LOW_PASS_PX2: f32 = 0.3;
 
 /// A splat is cut off at this many standard deviations from its center.
@@ -204,6 +243,14 @@ pub fn cov6(splat: &Splat) -> [f32; 6] {
         m0.y * m0.z + m1.y * m1.z + m2.y * m2.z,
         m0.z * m0.z + m1.z * m1.z + m2.z * m2.z,
     ]
+}
+
+/// Unit normal of a surfel: the third local axis of the splat, the one
+/// `Splat::surfel` makes thin. Its sign is the side the surface was seen
+/// from. A zero or non-finite quaternion counts as the identity.
+#[inline]
+pub fn surfel_normal(splat: &Splat) -> Vec3 {
+    rotation_matrix(splat.rot).z_axis
 }
 
 /// Computes [`cov6`] for a batch of splats into `out`.
@@ -299,6 +346,10 @@ pub struct Projected {
     pub conic: [f32; 3],
     /// Radius in pixels of the circle bounding the 3σ ellipse.
     pub radius: f32,
+    /// Amplitude factor of the energy-conserving low-pass, in `0..=1`: the
+    /// opacity of the splat is multiplied by it (step 6 of the module
+    /// documentation). Renderers that keep the plain dilation ignore it.
+    pub gain: f32,
 }
 
 impl Projected {
@@ -330,6 +381,8 @@ impl Projected {
         self.cov = [var, 0.0, var];
         self.conic = [1.0 / var, 0.0, 1.0 / var];
         self.radius = CUTOFF_SIGMA * var.sqrt();
+        // A dot has the size it is asked to have: nothing was dilated.
+        self.gain = 1.0;
         self
     }
 }
@@ -413,7 +466,8 @@ pub fn project_splat_with_axes(pos: Vec3, cov6: &[f32; 6], vp: &ViewParams) -> O
 
     // 6. det(M + 0.3·I) = det(M) + 0.3·tr(M) + 0.09, with det(M) ≥ 0. In this
     //    form cancellation in det(M) cannot produce a negative determinant.
-    let det = clamp_non_negative(ma * mc - mb * mb) + LOW_PASS_PX2 * (ma + mc) + LOW_PASS_PX2 * LOW_PASS_PX2;
+    let det_m = clamp_non_negative(ma * mc - mb * mb);
+    let det = det_m + LOW_PASS_PX2 * (ma + mc) + LOW_PASS_PX2 * LOW_PASS_PX2;
     if !(det > 0.0 && det.is_finite() && px.is_finite() && py.is_finite()) {
         return None;
     }
@@ -433,6 +487,8 @@ pub fn project_splat_with_axes(pos: Vec3, cov6: &[f32; 6], vp: &ViewParams) -> O
         cov: [a, b, c],
         conic: [vx * vx * inv1 + vy * vy * inv2, vx * vy * (inv1 - inv2), vy * vy * inv1 + vx * vx * inv2],
         radius: l1,
+        // det_m <= det, so the gain is at most 1.
+        gain: (det_m / det).sqrt(),
     };
     Some((projected, [vx * l1, vy * l1], [-vy * l2, vx * l2]))
 }
@@ -655,6 +711,42 @@ mod tests {
                 assert!((c[i] - expect[i]).abs() < 1e-7, "{bad:?} -> {c:?}");
             }
         }
+    }
+
+    #[test]
+    fn low_pass_gain_is_the_ratio_of_the_areas() {
+        // Looking straight at an isotropic Gaussian of σ pixels: the dilated
+        // variance is σ² + 0.3 on both axes, the gain σ² / (σ² + 0.3).
+        let cam = Camera::look_at(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y, 1.0, 400, 400);
+        let vp = ViewParams::from_camera(&cam);
+        for sigma_px in [0.05f32, 0.3, 1.0, 4.0, 40.0] {
+            let sigma = sigma_px * 2.0 / cam.fx;
+            let s = splat(Vec3::new(0.0, 0.0, -2.0), [sigma; 3], Quat::IDENTITY);
+            let p = project_splat(s.position(), &cov6(&s), &vp).unwrap();
+            let expected = sigma_px * sigma_px / (sigma_px * sigma_px + LOW_PASS_PX2);
+            assert!((p.gain - expected).abs() < 1e-3, "σ = {sigma_px} px: {} vs {expected}", p.gain);
+            // The integral of the footprint, 2π·√det(Σ')·gain, is the area of
+            // the undilated splat.
+            let area = std::f32::consts::TAU * (p.cov[0] * p.cov[2] - p.cov[1] * p.cov[1]).sqrt() * p.gain;
+            assert!((area / (std::f32::consts::TAU * sigma_px * sigma_px) - 1.0).abs() < 1e-3);
+        }
+        // A flat disc seen edge-on has no area, a point neither.
+        let edge_on = Splat::surfel(Vec3::new(0.0, 0.0, -2.0), Vec3::X, 0.1, 0.0, [255; 4]);
+        assert!(project_splat(edge_on.position(), &cov6(&edge_on), &vp).unwrap().gain < 1e-3);
+        let point = splat(Vec3::new(0.0, 0.0, -2.0), [0.0; 3], Quat::IDENTITY);
+        assert_eq!(project_splat(point.position(), &cov6(&point), &vp).unwrap().gain, 0.0);
+        // Dots of the point mode are not dimmed.
+        let dot = project_splat(point.position(), &cov6(&point), &vp).unwrap().with_point_footprint(1.0);
+        assert_eq!(dot.gain, 1.0);
+    }
+
+    #[test]
+    fn surfel_normal_is_the_thin_axis() {
+        let n = Vec3::new(0.3, -0.8, 0.5).normalize();
+        let s = Splat::surfel(Vec3::ZERO, n, 0.1, 0.01, [255; 4]);
+        assert!(surfel_normal(&s).abs_diff_eq(n, 1e-5));
+        assert_eq!(surfel_normal(&Splat { rot: [0.0; 4], ..s }), Vec3::Z);
+        assert_eq!(surfel_normal(&Splat { rot: [f32::NAN; 4], ..s }), Vec3::Z);
     }
 
     #[test]
@@ -981,7 +1073,7 @@ mod tests {
 
     /// Literal transcription of the GLSL sketch in the module documentation.
     /// Returns `(px, [a, b, c], major, minor)`.
-    fn glsl_sketch(p: Vec3, c: &[f32; 6], vp: &ViewParams) -> Option<(Vec2, [f32; 3], Vec2, Vec2)> {
+    fn glsl_sketch(p: Vec3, c: &[f32; 6], vp: &ViewParams) -> Option<(Vec2, [f32; 3], Vec2, Vec2, f32)> {
         let (fx, fy, cx, cy, w, h, k) = (vp.fx, vp.fy, vp.cx, vp.cy, vp.width, vp.height, vp.splat_scale);
         let t = vp.view * p.extend(1.0);
         let d = -t.z;
@@ -1002,7 +1094,9 @@ mod tests {
         let mb = k * k * t0.dot(s * t1);
         let mc = (k * k * t1.dot(s * t1)).max(0.0);
         let (a, b, c) = (ma + 0.3, mb, mc + 0.3);
-        let det = (ma * mc - mb * mb).max(0.0) + 0.3 * (ma + mc) + 0.09;
+        let det_m = (ma * mc - mb * mb).max(0.0);
+        let det = det_m + 0.3 * (ma + mc) + 0.09;
+        let gain = (det_m / det).sqrt();
         let mid = 0.5 * (a + c);
         let rad = Vec2::new(0.5 * (a - c), b).length();
         let l1 = mid + rad;
@@ -1010,7 +1104,7 @@ mod tests {
         let mut v1 = if a >= c { Vec2::new(0.5 * (a - c) + rad, b) } else { Vec2::new(b, 0.5 * (c - a) + rad) };
         let len = v1.length();
         v1 = if len > 1e-12 { v1 / len } else { Vec2::X };
-        Some((px, [a, b, c], 3.0 * l1.sqrt() * v1, 3.0 * l2.sqrt() * Vec2::new(-v1.y, v1.x)))
+        Some((px, [a, b, c], 3.0 * l1.sqrt() * v1, 3.0 * l2.sqrt() * Vec2::new(-v1.y, v1.x), gain))
     }
 
     #[test]
@@ -1030,9 +1124,10 @@ mod tests {
             let reference = project_splat_with_axes(s.position(), &cov, &vp);
             let sketch = glsl_sketch(s.position(), &cov, &vp);
             assert_eq!(reference.is_some(), sketch.is_some());
-            let (Some((p, major, minor)), Some((px, abc, g_major, g_minor))) = (reference, sketch) else { continue };
+            let (Some((p, major, minor)), Some((px, abc, g_major, g_minor, gain))) = (reference, sketch) else { continue };
             compared += 1;
             assert!((p.px - px.x).abs() < 1e-2 && (p.py - px.y).abs() < 1e-2);
+            assert!((p.gain - gain).abs() < 1e-3 && (0.0..=1.0).contains(&p.gain), "{} vs {gain}", p.gain);
             let size = abc[0] + abc[2];
             for i in 0..3 {
                 assert!((p.cov[i] - abc[i]).abs() < 1e-4 * size, "{p:?} vs {abc:?}");

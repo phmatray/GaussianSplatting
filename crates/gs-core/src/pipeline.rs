@@ -43,7 +43,7 @@ use glam::{Affine3A, Quat, Vec3};
 use rayon::prelude::*;
 use web_time::Instant;
 
-use crate::capture::{render_rgbd, CaptureOptions};
+use crate::capture::{render_rgbd, CaptureOptions, PartialCapture, StaticRender};
 use crate::codec::{self, Body, LayerMode, Message};
 use crate::protocol::{
     CameraInfo, ControlMsg, PipelineConfig, ScanConfig, ScanHead, ScanInfo, ScanState, ScanStats, SessionState, Stats,
@@ -97,6 +97,9 @@ pub struct Outgoing {
 /// Live stage state.
 struct Stage {
     cameras: Vec<Camera>,
+    /// The simulated sensors' view of the empty stage, one per camera: what
+    /// makes capturing a tick cost the moving pixels only.
+    fixed: Vec<StaticRender>,
     /// One plate per camera; empty without background subtraction.
     plates: Vec<BackgroundPlate>,
     static_splats: Vec<Splat>,
@@ -174,11 +177,28 @@ fn capture_options(config: &PipelineConfig, seed: u32) -> CaptureOptions {
 }
 
 /// Captures every camera at the same scene instant.
-fn capture_ring(snap: &SceneSnapshot, cameras: &[Camera], config: &PipelineConfig, exposure: u32) -> Vec<RgbdFrame> {
+///
+/// `fixed` holds what each camera sees of the static part of the scene:
+/// only the pixels that the moving objects of `snap` can change are cast
+/// again, the frames are the same bit for bit (see [`PartialCapture`]).
+/// Cameras without one, or a snapshot that is not that static part plus
+/// moving objects, are rendered in full.
+fn capture_ring(
+    snap: &SceneSnapshot,
+    cameras: &[Camera],
+    fixed: &[StaticRender],
+    config: &PipelineConfig,
+    exposure: u32,
+) -> Vec<RgbdFrame> {
+    let partial = fixed.first().and_then(|first| PartialCapture::new(snap, first.scene()));
     let shoot = |(i, cam): (usize, &Camera)| {
         // Distinct noise per camera and per exposure.
         let seed = exposure.wrapping_mul(0x0001_0001).wrapping_add(i as u32).wrapping_mul(0x9E37_79B1);
-        render_rgbd(snap, cam, &capture_options(config, seed))
+        let opts = capture_options(config, seed);
+        match (&partial, fixed.get(i)) {
+            (Some(partial), Some(fixed)) => partial.render(cam, &opts, fixed),
+            _ => render_rgbd(snap, cam, &opts),
+        }
     };
     #[cfg(feature = "par")]
     return cameras.par_iter().enumerate().map(shoot).collect();
@@ -424,8 +444,16 @@ impl Stage {
     /// Captures the empty stage, builds the plates and the static layer, and
     /// reconstructs the live layer at `time`.
     fn new(scene: &dyn Scene, config: &PipelineConfig, time: f64) -> Self {
+        let cameras = config.rig.cameras();
+        let empty = scene.snapshot_static();
+        let render = |cam: &Camera| StaticRender::new(&empty, cam, &capture_options(config, 0));
+        #[cfg(feature = "par")]
+        let fixed = cameras.par_iter().map(render).collect();
+        #[cfg(not(feature = "par"))]
+        let fixed = cameras.iter().map(render).collect();
         let mut stage = Self {
-            cameras: config.rig.cameras(),
+            cameras,
+            fixed,
             plates: Vec::new(),
             static_splats: Vec::new(),
             dynamic_splats: Vec::new(),
@@ -435,12 +463,11 @@ impl Stage {
             preview_cursor: 0,
         };
         if config.background_subtraction {
-            let empty = scene.snapshot_static();
             // A noisy sensor gets a plate averaged over several exposures.
             let exposures = if config.noise.is_none() { 1 } else { PLATE_EXPOSURES };
             let mut per_camera: Vec<Vec<RgbdFrame>> = stage.cameras.iter().map(|_| Vec::new()).collect();
             for _ in 0..exposures {
-                let frames = capture_ring(&empty, &stage.cameras, config, stage.exposures);
+                let frames = capture_ring(&empty, &stage.cameras, &stage.fixed, config, stage.exposures);
                 stage.exposures = stage.exposures.wrapping_add(1);
                 for (list, frame) in per_camera.iter_mut().zip(frames) {
                     list.push(frame);
@@ -460,7 +487,7 @@ impl Stage {
     fn refresh(&mut self, scene: &dyn Scene, config: &PipelineConfig, work: &mut TickWork) {
         let start = Instant::now();
         let snap = scene.snapshot(self.time as f32);
-        self.frames = capture_ring(&snap, &self.cameras, config, self.exposures);
+        self.frames = capture_ring(&snap, &self.cameras, &self.fixed, config, self.exposures);
         self.exposures = self.exposures.wrapping_add(1);
         work.capture_ms += ms_since(start);
         work.pixels += self.frames.iter().map(|f| f.width as u64 * f.height as u64).sum::<u64>();

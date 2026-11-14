@@ -1,5 +1,9 @@
 //! Evaluation harness of the quality lab: evaluation views with cached
 //! references, scoring, Markdown rows, PNG output.
+//!
+//! Shared with `examples/quality_report.rs`, which uses a part of it.
+
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::time::Instant;

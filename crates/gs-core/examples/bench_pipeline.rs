@@ -183,6 +183,11 @@ fn main() {
         PipelineConfig { background_subtraction: false, ..PipelineConfig::for_scene(SceneKind::Stage) },
     );
     stage("stage light", PipelineConfig::light(SceneKind::Stage));
+    for (width, height) in [(160, 120), (240, 180), (320, 240)] {
+        let mut config = PipelineConfig::for_scene(SceneKind::Stage);
+        (config.rig.width, config.rig.height) = (width, height);
+        stage(&format!("stage 8x{width}x{height}"), config);
+    }
     house("house default", PipelineConfig::for_scene(SceneKind::House));
     house("house light", PipelineConfig::light(SceneKind::House));
     let mut single = PipelineConfig::for_scene(SceneKind::House);

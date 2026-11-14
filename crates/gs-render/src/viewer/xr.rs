@@ -20,9 +20,9 @@ use web_sys::{
 
 use super::{Inner, FAR, NEAR};
 use crate::gizmo::LineBatch;
+use crate::normalized::Output;
 use crate::params::{XrInfo, XrViewInfo};
 use crate::rig::{Locomotion, LocomotionContext, PadState, Rig, NOMINAL_EYE_HEIGHT};
-use crate::splats::SortKey;
 
 /// A button counts as pressed above this analog value.
 const BUTTON_THRESHOLD: f64 = 0.5;
@@ -374,7 +374,8 @@ impl Inner {
         let clip_y = self.clip_y(&params, x.locomotion.is_miniature());
         let gl = &self.gl;
         // An opaque framebuffer on a headset; emulators may hand out null (the canvas).
-        gl.bind_framebuffer(GL::FRAMEBUFFER, layer.framebuffer().as_ref());
+        let framebuffer = layer.framebuffer();
+        gl.bind_framebuffer(GL::FRAMEBUFFER, framebuffer.as_ref());
         let [r, g, b] = params.background;
         gl.clear_color(r, g, b, 1.0);
         gl.clear(GL::COLOR_BUFFER_BIT);
@@ -382,11 +383,15 @@ impl Inner {
         let mut scene = self.scene.borrow_mut();
         let mut lines = self.lines.borrow_mut();
         lines.set_overlay(&x.overlay);
-        // One sort per frame for both eyes, along the head direction. Eyes
-        // look (almost) the same way, so the order is right for both.
+        // Sorted mode: one sort per frame for both eyes, along the head
+        // direction. Eyes look (almost) the same way, so the order is right
+        // for both. The normalised mode has no order; it runs its passes
+        // once per eye, in off-screen targets of the eye's size, and
+        // resolves into the layer's framebuffer (which needs no depth and
+        // may be multisampled).
         let head_view = x.rig_from_head.inverse() * rig_from_world;
-        let key = SortKey { show: [params.show_static, params.show_dynamic], clip_y };
-        scene.sort(&head_view, key, &|| self.now(), false);
+        let status = scene.blend_status(&params);
+        self.prepare_order(&mut scene, status, &head_view, &params, clip_y, false);
 
         x.views.clear();
         let mut size = (0, 0);
@@ -404,7 +409,11 @@ impl Inner {
             // inverse, followed by the rig (which carries the world scale).
             let view_matrix = Mat4::from_cols_slice(&view.transform().inverse().matrix()) * rig_from_world;
             let vp = ViewParams::from_projection(view_matrix, &projection, width as f32, height as f32);
-            scene.draw(&vp, &params, clip_y);
+            // Re-evaluated per eye: a failure in the first eye switches the
+            // second one to the sorted fallback as well.
+            let status = scene.blend_status(&params);
+            let output = Output { framebuffer: framebuffer.as_ref(), viewport: [viewport.x(), viewport.y(), width, height] };
+            self.draw_splats(&mut scene, status, &vp, &params, clip_y, output);
             let px_scale = (height as f32 / LINE_REFERENCE_HEIGHT).max(1.0);
             lines.draw(&(projection * view_matrix), [width as f32, height as f32], vp.near, px_scale, params.show_gizmos);
             x.views.push(XrViewInfo { viewport: [viewport.x(), viewport.y(), width, height], view: view_matrix, projection });

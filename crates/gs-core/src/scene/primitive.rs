@@ -28,7 +28,7 @@ pub enum Shape {
 }
 
 /// One shape instance: transform, material and the "moves over time" flag.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Primitive {
     pub shape: Shape,
     pub material: Material,
