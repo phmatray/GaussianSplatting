@@ -30,4 +30,4 @@ console_error_panic_hook.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 workspace = true
-features = ["DedicatedWorkerGlobalScope", "WorkerGlobalScope", "MessageEvent", "Performance"]
+features = ["DedicatedWorkerGlobalScope", "WorkerGlobalScope", "MessageEvent", "Performance", "WebSocket", "BinaryType"]

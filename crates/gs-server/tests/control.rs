@@ -215,15 +215,20 @@ async fn oversized_text_closes_only_the_offender() {
 
     let mut flooder = Client::connect(server.port()).await;
     flooder.snapshot().await;
-    // The server may hang up while this megabyte is still being written.
+    // The server refuses the message at its header and may hang up while
+    // this megabyte is still being written; the reason must still arrive.
     let _ = flooder.ws.send(Message::Text("x".repeat(1 << 20).into())).await;
-    flooder.closed().await;
+    assert_eq!(flooder.closed().await.map(|(code, _)| code), Some(1009), "a megabyte of text");
     let mut binary_flooder = Client::connect(server.port()).await;
     binary_flooder.snapshot().await;
     let _ = binary_flooder.ws.send(Message::Binary(vec![0u8; 1 << 20].into())).await;
-    binary_flooder.closed().await;
+    assert_eq!(binary_flooder.closed().await.map(|(code, _)| code), Some(1009), "a megabyte of binary");
 
     eventually("the offenders to be gone", || server.handle.metrics().clients == 3).await;
+    // The three viewers were not read while the offenders were dealt with:
+    // what waits in their socket buffers would arrive in one burst and
+    // pass for a higher rate.
+    futures_util::future::join_all(clients.iter_mut().map(|c| c.pump(Duration::from_millis(400)))).await;
     // The refused message was not applied, and the others are untouched.
     let start = Instant::now();
     futures_util::future::join_all(clients.iter_mut().map(|c| c.pump(Duration::from_millis(1200)))).await;

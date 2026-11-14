@@ -17,7 +17,7 @@ pub fn Panel() -> impl IntoView {
                 <StatsSection />
                 <VrSection />
                 <FileSection />
-                <p class="panel-foot">"Raccourcis: H masque l'interface, P met en pause."</p>
+                <p class="panel-foot">"Raccourcis\u{a0}: H masque l'interface, P met en pause."</p>
             </div>
         </aside>
     }

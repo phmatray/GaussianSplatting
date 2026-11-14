@@ -1,16 +1,35 @@
 //! Entry point of the `splat-worker` Web Worker: glue between
-//! [`gs_worker::Driver`] and the worker's `postMessage` and `setTimeout`.
+//! [`gs_worker::Driver`] (local pipeline) or [`gs_worker::Relay`] (WebSocket
+//! of a native server) and the worker's `postMessage` and `setTimeout`.
 //! See the library documentation for the protocol.
 
 #[cfg(target_arch = "wasm32")]
 mod glue {
     use std::cell::{Cell, RefCell};
 
-    use gs_worker::{Batch, Driver, WorkerEvent};
-    use js_sys::{Array, Uint8Array};
+    use gs_worker::{Batch, Driver, Relay, WorkerEvent, WorkerRequest};
+    use js_sys::{Array, ArrayBuffer, Uint8Array};
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
-    use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
+    use web_sys::{BinaryType, DedicatedWorkerGlobalScope, MessageEvent, WebSocket};
+
+    /// The relayed WebSocket and its event handlers.
+    struct Link {
+        socket: WebSocket,
+        _on_open: Closure<dyn FnMut()>,
+        _on_message: Closure<dyn FnMut(MessageEvent)>,
+        _on_close: Closure<dyn FnMut()>,
+    }
+
+    impl Link {
+        /// Closes the socket without any further event.
+        fn shut(self) {
+            self.socket.set_onopen(None);
+            self.socket.set_onmessage(None);
+            self.socket.set_onclose(None);
+            let _ = self.socket.close();
+        }
+    }
 
     struct Worker {
         scope: DedicatedWorkerGlobalScope,
@@ -18,6 +37,12 @@ mod glue {
         /// Handle of the pending `setTimeout`, if any.
         timer: Cell<Option<i32>>,
         on_timer: Closure<dyn FnMut()>,
+        relay: RefCell<Relay>,
+        link: RefCell<Option<Link>>,
+        /// True from the first `connect`: text messages go to the server.
+        relaying: Cell<bool>,
+        /// Number of the latest `connect`, echoed by the link events.
+        link_id: Cell<u32>,
     }
 
     thread_local! {
@@ -56,7 +81,27 @@ mod glue {
 
         fn on_message(&self, event: &MessageEvent) {
             let Some(text) = event.data().as_string() else { return };
-            let result = self.driver.borrow_mut().handle_text(&text, self.now());
+            match serde_json::from_str::<WorkerRequest>(&text) {
+                Ok(WorkerRequest::Connect { url, link }) => self.connect(&url, link),
+                Ok(WorkerRequest::Ack { batch }) if self.relaying.get() => {
+                    self.relay.borrow_mut().ack(batch);
+                    self.flush_relay();
+                }
+                Ok(WorkerRequest::Start { .. }) => {
+                    // Back to a local pipeline.
+                    self.relaying.set(false);
+                    self.disconnect();
+                    self.drive(&text);
+                }
+                Ok(_) | Err(_) if self.relaying.get() => self.send_to_server(&text),
+                Ok(_) | Err(_) => self.drive(&text),
+            }
+        }
+
+        // ------------------------------------------------- local pipeline
+
+        fn drive(&self, text: &str) {
+            let result = self.driver.borrow_mut().handle_text(text, self.now());
             match result {
                 Ok(Some(batch)) => self.post_batch(batch),
                 Ok(None) => {}
@@ -90,6 +135,79 @@ mod glue {
                 .set_timeout_with_callback_and_timeout_and_arguments_0(self.on_timer.as_ref().unchecked_ref(), wait_ms.ceil() as i32);
             self.timer.set(handle.ok());
         }
+
+        // ---------------------------------------------------------- relay
+
+        fn disconnect(&self) {
+            if let Some(link) = self.link.borrow_mut().take() {
+                link.shut();
+            }
+            self.relay.borrow_mut().clear();
+        }
+
+        /// The relayed connection is over (closed by the server, refused,
+        /// or dropped here): the page decides when to try again.
+        fn link_lost(&self) {
+            self.disconnect();
+            self.post_event(&WorkerEvent::Link { open: false, link: self.link_id.get() });
+        }
+
+        fn connect(&self, url: &str, link: u32) {
+            self.relaying.set(true);
+            self.link_id.set(link);
+            self.disconnect();
+            // No local pipeline next to a relayed one.
+            *self.driver.borrow_mut() = Driver::new();
+            self.schedule(None);
+            let Ok(socket) = WebSocket::new(url) else {
+                // A refused URL is a failed attempt like any other.
+                self.post_event(&WorkerEvent::Link { open: false, link });
+                return;
+            };
+            socket.set_binary_type(BinaryType::Arraybuffer);
+            // The handlers of a replaced socket are detached, so whatever
+            // fires belongs to the current link.
+            let on_open = Closure::<dyn FnMut()>::new(move || worker().post_event(&WorkerEvent::Link { open: true, link }));
+            let on_message = Closure::<dyn FnMut(MessageEvent)>::new(|event: MessageEvent| worker().on_frame(&event));
+            let on_close = Closure::<dyn FnMut()>::new(|| worker().link_lost());
+            socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+            socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+            socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+            *self.link.borrow_mut() = Some(Link { socket, _on_open: on_open, _on_message: on_message, _on_close: on_close });
+        }
+
+        /// One frame of the server. Text frames are not part of the
+        /// protocol in this direction.
+        fn on_frame(&self, event: &MessageEvent) {
+            let Ok(buffer) = event.data().dyn_into::<ArrayBuffer>() else { return };
+            let pushed = self.relay.borrow_mut().push(Uint8Array::new(&buffer).to_vec());
+            if pushed.is_err() {
+                // The page took nothing for too long. A new connection
+                // starts from a fresh snapshot instead of this backlog.
+                self.link_lost();
+                return;
+            }
+            self.flush_relay();
+        }
+
+        fn flush_relay(&self) {
+            let batch = self.relay.borrow_mut().next_batch();
+            if let Some(batch) = batch {
+                self.post_batch(batch);
+            }
+        }
+
+        /// A control message of the page, on its way to the server.
+        fn send_to_server(&self, text: &str) {
+            let link = self.link.borrow();
+            let sent = link
+                .as_ref()
+                .filter(|link| link.socket.ready_state() == WebSocket::OPEN)
+                .is_some_and(|link| link.socket.send_with_str(text).is_ok());
+            if !sent {
+                self.post_event(&WorkerEvent::Error { message: "the server connection is not open".into() });
+            }
+        }
     }
 
     pub fn run() {
@@ -104,6 +222,10 @@ mod glue {
                 worker().timer.set(None);
                 worker().pump();
             }),
+            relay: RefCell::new(Relay::new()),
+            link: RefCell::new(None),
+            relaying: Cell::new(false),
+            link_id: Cell::new(0),
         }));
         WORKER.with(|w| *w.borrow_mut() = Some(instance));
 

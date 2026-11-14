@@ -11,8 +11,8 @@ use crate::dom;
 use crate::state::Ui;
 use crate::ui::{Overlays, Panel, TopBar};
 
-/// Below this window width the panel starts closed and becomes a sheet at
-/// the bottom (the same breakpoint as in `style.css`).
+/// Up to this window width the panel starts closed and is a sheet at the
+/// bottom (the same breakpoint as in `style.css`).
 const NARROW_WIDTH: f64 = 760.0;
 
 /// True when a key press belongs to a text field.
@@ -86,7 +86,7 @@ fn install_window_listeners(ui: Ui) {
 
 #[component]
 pub fn App() -> impl IntoView {
-    let ui = Ui::new(dom::window_width() >= NARROW_WIDTH);
+    let ui = Ui::new(dom::window_width() > NARROW_WIDTH);
     provide_context(ui);
     install_window_listeners(ui);
 

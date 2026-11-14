@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Query, Request, State};
+use axum::extract::{FromRequest, Query, Request, State};
 use axum::http::header::{self, HeaderMap, HeaderValue};
 use axum::http::{Method, StatusCode, Uri};
 use axum::middleware::Next;
@@ -123,8 +123,10 @@ fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
 
 fn is_loopback_host(host: &str) -> bool {
     let name = match host.rsplit_once(':') {
-        // `[::1]:7878` and `127.0.0.1:7878`, but not the colons of `[::1]`.
-        Some((name, port)) if !port.contains(']') => name,
+        // `[::1]:7878` and `127.0.0.1:7878`. Only digits make a port: the
+        // colons of `[::1]` do not, and neither does whatever follows the
+        // colon in `127.0.0.1:7878@evil.example`.
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
         _ => host,
     };
     name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost") || name == "[::1]"
@@ -134,13 +136,19 @@ fn is_loopback_host(host: &str) -> bool {
 ///
 /// * No `Origin` header: not a browser (browsers always send one on these
 ///   requests), nothing to protect against.
+/// * Several `Origin` headers: refused, there is no telling which one an
+///   intermediary or the browser meant.
 /// * A Tauri origin, or one the configuration adds: accepted.
 /// * Otherwise the origin must be the server itself: same scheme and same
 ///   host and port as the request was addressed to. On the loopback
 ///   listener that host must also be a loopback name, which stops a page
 ///   that points its own domain at 127.0.0.1 (DNS rebinding).
 pub(crate) fn origin_allowed(state: &AppState, headers: &HeaderMap, uri: &Uri) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN) else { return true };
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(origin) = origins.next() else { return true };
+    if origins.next().is_some() {
+        return false;
+    }
     let Ok(origin) = origin.to_str() else { return false };
     let known = TAURI_ORIGINS.iter().copied().chain(state.core.settings.extra_origins.iter().map(String::as_str));
     if known.into_iter().any(|allowed| allowed.eq_ignore_ascii_case(origin)) {
@@ -174,23 +182,24 @@ struct LanRequest {
     enabled: bool,
 }
 
-async fn api_lan(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    body: Result<Json<LanRequest>, JsonRejection>,
-) -> Response {
+async fn api_lan(State(state): State<AppState>, request: Request) -> Response {
     // Opening the machine to the network is decided at the machine, never
     // from the network.
     if state.listener != Listener::Loopback {
         return json_error(StatusCode::FORBIDDEN, "LAN access can only be changed from the machine itself");
     }
-    if !origin_allowed(&state, &headers, &uri) {
+    if !origin_allowed(&state, request.headers(), request.uri()) {
         return json_error(StatusCode::FORBIDDEN, "origin not allowed");
     }
+    // The body is read only for a request that may ask, and not for ever: a
+    // client that announces a body and never sends it must not keep its
+    // connection open.
+    let body: Result<Result<Json<LanRequest>, JsonRejection>, _> =
+        tokio::time::timeout(state.core.settings.request_timeout, Json::from_request(request, &())).await;
     let Json(request) = match body {
-        Ok(body) => body,
-        Err(rejection) => return json_error(rejection.status(), rejection.body_text()),
+        Ok(Ok(body)) => body,
+        Ok(Err(rejection)) => return json_error(rejection.status(), rejection.body_text()),
+        Err(_) => return json_error(StatusCode::REQUEST_TIMEOUT, "the request body did not arrive in time"),
     };
     // On its own task: a client that hangs up must not cancel the switch
     // half-way.
@@ -251,6 +260,13 @@ mod tests {
             "127.0.0.1.evil.example",
             "192.168.1.20:7878",
             "localhost.evil.example",
+            // What follows the colon is not a port: the name is not
+            // `127.0.0.1` but the whole thing.
+            "127.0.0.1:7878@evil.example",
+            "localhost:evil.example",
+            "127.0.0.1:",
+            "[::1]evil",
+            "",
         ] {
             assert!(!is_loopback_host(host), "{host}");
         }

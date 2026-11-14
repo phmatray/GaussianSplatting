@@ -6,8 +6,10 @@
 //   SKIP_BUILD=1        use the existing crates/gs-app/dist
 //   GS_APP_OUT=dir      where screenshots and reports go (default: out/app-e2e)
 //   GS_APP_PORT=8110    first port tried by the static server (8100-8199)
-//   ONLY=stage,vr       run a subset (stage, house, files, vr, narrow, subpath, server, perf)
-//   GS_SERVER_BIN=path  gs-server binary for the server suite
+//   ONLY=stage,vr       run a subset (stage, house, files, vr, narrow, layout, subpath,
+//                       server, shared, lanvr, soak, perf)
+//   SOAK_S=180          length of the memory soak in seconds (default 40)
+//   GS_SERVER_BIN=path  gs-server binary for the server, shared, lanvr and soak suites
 //                       (default: target/release/gs-server; skipped when missing)
 //   GS_NPM_TOOLS / IWER_BUNDLE   where to find the IWER WebXR emulator if it is
 //                       not installed with `npm install` in e2e/render
@@ -16,7 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const lib = require('./lib.cjs');
 
-const SUITES = ['stage', 'house', 'files', 'vr', 'narrow', 'subpath', 'server', 'perf'];
+const SUITES = ['stage', 'house', 'files', 'vr', 'narrow', 'layout', 'subpath', 'server', 'shared', 'lanvr', 'soak', 'perf'];
 
 (async () => {
   const only = process.env.ONLY ? process.env.ONLY.split(',') : SUITES;

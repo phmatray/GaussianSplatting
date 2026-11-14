@@ -5,6 +5,7 @@
 
 pub mod capture;
 pub mod codec;
+pub mod experimental;
 pub mod io;
 pub mod pipeline;
 pub mod protocol;

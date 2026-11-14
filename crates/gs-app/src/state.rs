@@ -81,6 +81,9 @@ pub struct Ui {
     pub camera_ids: RwSignal<Vec<u32>>,
     /// Latest pipeline statistics (refreshed a few times per second).
     pub stats: RwSignal<Option<Stats>>,
+    /// Pipeline ticks per second, measured from the tick counter; `None`
+    /// until a first second of statistics has been seen.
+    pub pipeline_hz: RwSignal<Option<f32>>,
     pub scan: RwSignal<Option<ScanView>>,
     pub viewer_stats: RwSignal<ViewerStats>,
     /// Bytes received per second.
@@ -102,6 +105,9 @@ pub struct Ui {
     pub fatal: RwSignal<Option<String>>,
     /// Info of the native server, when it is the source.
     pub server: RwSignal<Option<ServerInfo>>,
+    /// The page talks to the server over loopback, the only side from
+    /// which LAN sharing can be switched.
+    pub lan_admin: RwSignal<bool>,
     pub lan_busy: RwSignal<bool>,
     pub lan_error: RwSignal<Option<String>>,
     /// `data:` URL of the QR code of the LAN address.
@@ -119,6 +125,7 @@ impl Ui {
             state_epoch: RwSignal::new(0),
             camera_ids: RwSignal::new(Vec::new()),
             stats: RwSignal::new(None),
+            pipeline_hz: RwSignal::new(None),
             scan: RwSignal::new(None),
             viewer_stats: RwSignal::new(ViewerStats::default()),
             transfer_rate: RwSignal::new(0.0),
@@ -135,6 +142,7 @@ impl Ui {
             notice: RwSignal::new(None),
             fatal: RwSignal::new(None),
             server: RwSignal::new(None),
+            lan_admin: RwSignal::new(false),
             lan_busy: RwSignal::new(false),
             lan_error: RwSignal::new(None),
             qr: RwSignal::new(None),

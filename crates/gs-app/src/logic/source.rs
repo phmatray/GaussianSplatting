@@ -96,13 +96,13 @@ impl ServerInfo {
     /// Parses an info document, rejecting answers of other services (a
     /// static host that serves its index page for unknown paths, say).
     pub fn parse(json: &str) -> Result<Self, String> {
-        let info: Self = serde_json::from_str(json).map_err(|e| format!("réponse illisible: {e}"))?;
+        let info: Self = serde_json::from_str(json).map_err(|e| format!("réponse illisible\u{a0}: {e}"))?;
         if info.name != Self::NAME {
             return Err("ce n'est pas un serveur Splat Live".to_string());
         }
         if info.protocol != gs_core::protocol::PROTOCOL_VERSION {
             return Err(format!(
-                "version de protocole {} incompatible (attendu: {})",
+                "version de protocole {} incompatible (attendu\u{a0}: {})",
                 info.protocol,
                 gs_core::protocol::PROTOCOL_VERSION
             ));
@@ -135,6 +135,26 @@ pub fn ws_url(base: &str, ws_path: &str) -> Option<String> {
         None => format!("ws://{}", base.strip_prefix("http://")?),
     };
     Some(format!("{rest}/{}", ws_path.trim_start_matches('/')))
+}
+
+/// True when `base` is the server's loopback listener (plain HTTP on a
+/// loopback address, such as `http://127.0.0.1:7878`): the page then runs
+/// on the machine of the server and may switch LAN sharing. The server
+/// refuses that on its LAN listener, which is the HTTPS one, from whatever
+/// address it is reached.
+pub fn is_loopback_base(base: &str) -> bool {
+    let Some(rest) = base.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // No user info in our URLs; an IPv6 host is bracketed.
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.rsplit_once(':').map_or(authority, |(host, _port)| host),
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "::1"
+        || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Value of the `?source=` query parameter.
@@ -191,6 +211,16 @@ mod tests {
         assert_eq!(ws_url("tauri://localhost", "/ws"), None);
         assert_eq!(api_url("http://127.0.0.1:7878/", "/api/lan"), "http://127.0.0.1:7878/api/lan");
         assert_eq!(api_url("http://127.0.0.1:7878", "api/qr.svg?i=1"), "http://127.0.0.1:7878/api/qr.svg?i=1");
+    }
+
+    #[test]
+    fn loopback_bases() {
+        for base in ["http://127.0.0.1:7878", "http://127.0.0.1", "http://localhost:7878/", "http://LOCALHOST", "http://[::1]:7878", "http://127.8.9.10:1", "http://127.0.0.1:7878/x?y"] {
+            assert!(is_loopback_base(base), "{base}");
+        }
+        for base in ["https://192.168.1.20:7879", "https://127.0.0.1:7879", "https://localhost:7879/", "http://10.0.0.1:7878", "http://example.com", "http://127.0.0.1.example.com:7878", "http://localhost.example.com", "tauri://localhost", "", "http://", "http://[fe80::1]:7878", "http://1270.0.0.1"] {
+            assert!(!is_loopback_base(base), "{base}");
+        }
     }
 
     #[test]

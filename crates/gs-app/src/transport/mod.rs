@@ -75,6 +75,17 @@ impl Transport {
         }
     }
 
+    /// How the bytes reach the page: `worker` (local pipeline), `relay`
+    /// (WebSocket in the relay worker) or `direct` (WebSocket on the main
+    /// thread). For the debug hook.
+    pub fn channel(&self) -> &'static str {
+        match self {
+            Self::Server(ws) if ws.relayed() => "relay",
+            Self::Server(_) => "direct",
+            Self::Worker(_) => "worker",
+        }
+    }
+
     /// Batches or frames received so far (for the debug hook).
     pub fn received(&self) -> u64 {
         match self {

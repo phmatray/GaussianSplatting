@@ -3,13 +3,37 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { check, newPage, consoleErrors, state, waitState, open, shot, sleep } = require('./lib.cjs');
+const { check, newPage, consoleErrors, state, waitState, open, shot, viewShot, content, sleep } = require('./lib.cjs');
 
 async function exportFile(page, button, dir) {
   const [download] = await Promise.all([page.waitForEvent('download'), page.click(button)]);
   const file = path.join(dir, download.suggestedFilename());
   await download.saveAs(file);
   return file;
+}
+
+// A point cloud in the format of the INRIA 3D Gaussian Splatting trainer
+// (62 float properties per point): a torus knot coloured along its length.
+function inriaPly(count) {
+  const names = ['x', 'y', 'z', 'nx', 'ny', 'nz', 'f_dc_0', 'f_dc_1', 'f_dc_2', ...Array.from({ length: 45 }, (_, i) => `f_rest_${i}`), 'opacity', 'scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3'];
+  const header = Buffer.from(`ply\nformat binary_little_endian 1.0\nelement vertex ${count}\n${names.map((n) => `property float ${n}`).join('\n')}\nend_header\n`);
+  const data = Buffer.alloc(count * names.length * 4);
+  const SH_C0 = 0.28209479177387814;
+  let first = null;
+  for (let i = 0; i < count; i++) {
+    const t = (i / count) * Math.PI * 2;
+    const jitter = (k) => Math.sin(i * 12.9898 + k * 78.233) * 0.03;
+    const r = 1 + 0.4 * Math.cos(3 * t);
+    const pos = [r * Math.cos(2 * t) + jitter(1), 1.2 + 0.4 * Math.sin(3 * t) + jitter(2), r * Math.sin(2 * t) + jitter(3)];
+    const rgb = [0.5 + 0.5 * Math.cos(t), 0.5 + 0.5 * Math.cos(t + 2.1), 0.5 + 0.5 * Math.cos(t + 4.2)];
+    const alpha = 0.9;
+    const scale = [0.03, 0.02, 0.01];
+    const half = t / 2;
+    const values = [...pos, 0, 0, 1, ...rgb.map((c) => (c - 0.5) / SH_C0), ...Array.from({ length: 45 }, (_, k) => 0.05 * Math.sin(i + k)), Math.log(alpha / (1 - alpha)), ...scale.map(Math.log), Math.cos(half), 0, Math.sin(half), 0];
+    values.forEach((v, k) => data.writeFloatLE(v, (i * names.length + k) * 4));
+    if (i === 0) first = { pos, scale, rgba: [...rgb.map((c) => Math.round(c * 255)), Math.round(alpha * 255)] };
+  }
+  return { bytes: Buffer.concat([header, data]), count, first };
 }
 
 async function run({ browser, url }) {
@@ -98,6 +122,36 @@ async function run({ browser, url }) {
   await page.click('#mode-house');
   s = await waitState(page, (s) => s.scene === 'house' && !s.fileMode && s.layers.static > 0 && !s.config.paused, 60000);
   check('files: a mode switch leaves the imported file', s.file === null && s.scan !== null);
+
+  // ---- a file as the INRIA trainer writes it: normals, spherical harmonics
+  // of degree 3 (45 f_rest_* values), opacity as a logit, log scales,
+  // rotation as (w, x, y, z)
+  await page.click('#mode-stage');
+  await waitState(page, (s) => s.scene === 'stage' && s.layers.dynamic > 0, 60000);
+  const trained = inriaPly(20000);
+  const trainedFile = path.join(dir, 'point_cloud.ply');
+  fs.writeFileSync(trainedFile, trained.bytes);
+  await page.setInputFiles('#import-input', trainedFile);
+  s = await waitState(page, (s) => s.fileMode && s.file && s.file.name === 'point_cloud.ply');
+  check('files: an INRIA .ply with spherical harmonics imports completely', s.file.splats === trained.count && s.layers.static === trained.count && s.fileError === null, `${s.file.splats} of ${trained.count} splats, ${trained.bytes.length} bytes`);
+  await sleep(500);
+  const trainedView = await viewShot(page, 'file-inria-sh.png');
+  const trainedContent = await content(page, trainedView);
+  check('files: the imported cloud is on screen, in colour', trainedContent.colors > 100 && trainedContent.bright > 0.02, `colours ${trainedContent.colors}, covered ${(trainedContent.bright * 100).toFixed(1)} %`);
+  // Out again as .splat: positions, colours, opacity and scales of the
+  // first splat survive the two conversions.
+  const reexported = fs.readFileSync(await exportFile(page, '#export-splat', dir));
+  const first = { pos: [0, 4, 8].map((o) => reexported.readFloatLE(o)), scale: [12, 16, 20].map((o) => reexported.readFloatLE(o)), rgba: [...reexported.subarray(24, 28)] };
+  const close = (a, b, eps) => a.every((v, i) => Math.abs(v - b[i]) <= eps);
+  check('files: values survive .ply (SH) to .splat', reexported.length === trained.count * 32 && close(first.pos, trained.first.pos, 1e-5) && close(first.scale, trained.first.scale, 1e-5) && close(first.rgba, trained.first.rgba, 2),
+    `pos ${first.pos.map((v) => v.toFixed(3))}, rgba ${first.rgba} (expected ${trained.first.rgba})`);
+  // And the exported .ply of that cloud comes back identical in count.
+  const second = await exportFile(page, '#export-ply', dir);
+  await page.setInputFiles('#import-input', second);
+  s = await waitState(page, (s, name) => s.fileMode && s.file && s.file.name === name, 30000, path.basename(second));
+  check('files: re-exporting an imported file and importing it again keeps every splat', s.file.splats === trained.count && /splat-live-import-20000\.ply/.test(second), path.basename(second));
+  await page.click('#back-live');
+  await waitState(page, (s) => !s.fileMode && !s.config.paused && s.layers.dynamic > 0, 30000);
 
   check('files: no console error', consoleErrors(logs).length === 0, consoleErrors(logs).join(' | '));
   await ctx.close();

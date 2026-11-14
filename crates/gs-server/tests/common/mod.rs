@@ -220,6 +220,17 @@ pub struct Viewer {
     pub replaced: Vec<(u32, Vec<Splat>)>,
     /// Size of layer 0 after each of its messages, with the `seq`.
     pub static_sizes: Vec<(u32, usize)>,
+    /// The latest layer-0 `Replace` exactly as it came off the wire.
+    pub static_replace_wire: Vec<u8>,
+}
+
+impl Viewer {
+    /// The latest layer-0 `Replace` without the message header (`seq` and
+    /// time differ between a broadcast and a snapshot of the same layer):
+    /// layer header, bounds and the quantized splats, byte for byte.
+    pub fn static_replace_payload(&self) -> &[u8] {
+        &self.static_replace_wire[codec::HEADER_SIZE..]
+    }
 }
 
 impl Viewer {
@@ -242,6 +253,7 @@ impl Viewer {
                         let previous = std::mem::replace(target, layer.splats);
                         if layer.layer_id == LAYER_STATIC {
                             self.replaced.push((message.seq, previous));
+                            self.static_replace_wire = bytes.to_vec();
                         }
                     }
                     LayerMode::Append => target.extend_from_slice(&layer.splats),

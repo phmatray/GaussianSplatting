@@ -310,11 +310,13 @@ pub fn scan_camera(path: &ScanPath, time: f32, scan: &ScanConfig) -> Camera {
 /// the head does not have as sensor 0).
 ///
 /// The head rides along `path` at eye height and faces the walking direction
-/// ([`ScanPath::heading_at`], which the walker never lets swing faster than
-/// about 32 degrees per second), with the slow, small sway of something
+/// ([`ScanPath::heading_at`], which the walker keeps from swinging faster
+/// than about 35 degrees per second), with the slow, small sway of something
 /// carried by hand: [`SCAN_PAN_AMPLITUDE`] of yaw and [`SCAN_TILT_AMPLITUDE`]
 /// of pitch. Every sensor is rigidly mounted on it at its
-/// [`ScanHead::mounts`] angles, so all of them turn at the same, calm rate.
+/// [`ScanHead::mounts`] angles, so all of them turn at the same, calm rate:
+/// 20 degrees per second on average and never more than 38 on the house
+/// tour.
 ///
 /// The coverage comes from the number of sensors, not from sweeping one
 /// camera about: [`ScanHead::Surround`] sees floor, ceiling and both side
@@ -821,8 +823,8 @@ impl Pipeline {
     /// parameters of the stage rebuilds the background plates and both
     /// layers. In the house, changing the voxel size, the walking speed, the
     /// frame rate or the sensor head restarts the scan; other changes apply
-    /// to the frames still to come. A [`ControlMsg::PatchConfig`] that does not describe a
-    /// configuration is ignored.
+    /// to the frames still to come. A [`ControlMsg::PatchConfig`] that does
+    /// not describe a configuration is ignored.
     pub fn handle_control(&mut self, msg: ControlMsg) -> Vec<Outgoing> {
         self.try_control(msg).unwrap_or_default()
     }

@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use gs_core::codec::LayerMode;
+use gs_core::codec::{self, LayerMode};
 use gs_core::pipeline::LAYER_STATIC;
 use gs_core::protocol::{PipelineConfig, ScanState};
 use serde_json::json;
@@ -154,6 +154,13 @@ async fn appends_reach_everyone_in_order_and_late_joiners_hold_the_same_layer() 
     let took = start.elapsed();
     assert_eq!(&e.viewer.layers[0], finished);
     assert_eq!(scan_state(&e.viewer), Some(ScanState::Done));
+    // Not merely equal once decoded: the layer of its snapshot is, byte for
+    // byte, the `Replace` that closed the scan for the early viewers.
+    let wire = a.viewer.static_replace_payload();
+    assert!(wire.len() > finished.len() * codec::SPLAT_WIRE_SIZE);
+    for (name, client) in [("b", &b), ("c", &c), ("d", &d), ("e (late)", &e)] {
+        assert!(client.viewer.static_replace_payload() == wire, "viewer {name} holds other layer-0 bytes");
+    }
     eprintln!(
         "house: {} splats, {total_appends} Appends, late joiner synchronised in {took:?} ({} bytes)",
         finished.len(),
@@ -229,6 +236,10 @@ async fn backlog_overflow_resynchronises_and_converges() {
     // ...and still ends with exactly the same house.
     assert!(healthy.viewer.layers[0].len() > 5000);
     assert_eq!(stalled.viewer.layers[0], healthy.viewer.layers[0], "the resynchronised viewer ends with another house");
+    assert!(
+        stalled.viewer.static_replace_payload() == healthy.viewer.static_replace_payload(),
+        "the resynchronised viewer holds other layer-0 bytes"
+    );
     // When its last Replace is the one that closed the scan (and not a
     // snapshot that came after it), what it held right before was already
     // complete: snapshot plus Appends had the size the healthy viewer had.

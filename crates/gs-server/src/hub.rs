@@ -34,10 +34,16 @@ const MAX_TICK_DT: Duration = Duration::from_secs(1);
 /// without letting a flood of commands starve the ticks.
 const LATE_COMMAND_BUDGET: Duration = Duration::from_millis(4);
 
-/// How many times the pipeline is rebuilt after a panic before the thread
-/// gives up. A panic is a bug; restarting keeps the server usable, the cap
-/// keeps a bug that strikes at every start from spinning forever.
+/// How many times in a row the pipeline is rebuilt after a panic before the
+/// thread gives up. A panic is a bug; restarting keeps the server usable,
+/// the cap keeps a bug that strikes at every start from spinning forever.
 const MAX_RESTARTS: u32 = 5;
+
+/// A pipeline that ran this long before it panicked was not in a crash
+/// loop: the count of restarts starts again from zero. A rare bug then
+/// costs a reconnection each time it strikes, not the stream for good on
+/// its sixth occurrence, days later.
+const STABLE_RUN: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 60 });
 
 /// A request to the pipeline thread.
 pub(crate) enum Command {
@@ -71,6 +77,9 @@ pub(crate) struct HubMetrics {
     pub scene_time: AtomicU32,
     /// Clients registered with the pipeline thread.
     pub registered: AtomicU64,
+    /// Bytes held in the outboxes of all clients right after the latest
+    /// broadcast or snapshot.
+    pub queued_bytes: AtomicU64,
 }
 
 /// Owner side of the pipeline thread.
@@ -93,6 +102,7 @@ impl Hub {
                 let mut clients = Vec::new();
                 let mut restarts = 0;
                 loop {
+                    let started = Instant::now();
                     let outcome = catch_unwind(AssertUnwindSafe(|| run(config, &rx, &metrics, &mut clients)));
                     // However the run ended, its viewers are let go: no
                     // socket may wait forever on a pipeline that is gone,
@@ -101,6 +111,10 @@ impl Hub {
                         client.close();
                     }
                     metrics.registered.store(0, Ordering::Relaxed);
+                    metrics.queued_bytes.store(0, Ordering::Relaxed);
+                    if started.elapsed() >= STABLE_RUN {
+                        restarts = 0;
+                    }
                     match outcome {
                         Ok(()) => break,
                         // Start again from the initial configuration (the
@@ -172,6 +186,14 @@ impl Loop<'_> {
                 log::debug!("client {}: reliable backlog over its bound, resynchronising", client.id());
             }
         }
+        self.publish_queued();
+    }
+
+    /// A handful of short locks per broadcast: the price of being able to
+    /// see that a viewer which reads nothing holds next to nothing.
+    fn publish_queued(&self) {
+        let queued: usize = self.clients.iter().map(|client| client.held().1).sum();
+        self.metrics.queued_bytes.store(queued as u64, Ordering::Relaxed);
     }
 
     fn sync(&mut self, client: &Outbox) -> bool {
@@ -193,17 +215,20 @@ impl Loop<'_> {
                 self.sync(&client);
                 self.clients.push(client);
                 self.metrics.registered.store(self.clients.len() as u64, Ordering::Relaxed);
+                self.publish_queued();
             }
             Command::Resync(id) => {
                 if let Some(client) = self.clients.iter().find(|c| c.id() == id).cloned() {
                     if self.sync(&client) {
                         self.metrics.resyncs.fetch_add(1, Ordering::Relaxed);
+                        self.publish_queued();
                     }
                 }
             }
             Command::Leave(id) => {
                 self.clients.retain(|c| c.id() != id);
                 self.metrics.registered.store(self.clients.len() as u64, Ordering::Relaxed);
+                self.publish_queued();
             }
             Command::Control(msg, permit) => {
                 let out = self.pipeline.handle_control(msg);
@@ -411,5 +436,40 @@ mod tests {
         hub.stop().unwrap().join().unwrap();
         assert!(matches!(second.next().await, Next::Closed));
         assert!(!hub.send(Command::Leave(2)));
+    }
+
+    /// Whether the pipeline thread still serves: a new client gets its
+    /// snapshot.
+    async fn serves(hub: &Hub, id: u64) -> bool {
+        let outbox = Arc::new(Outbox::new(id, QueueLimits::default()));
+        if !hub.send(Command::Join(outbox.clone())) {
+            return false;
+        }
+        let first = tokio::time::timeout(Duration::from_secs(20), outbox.next()).await.expect("nothing arrived");
+        hub.send(Command::Leave(id));
+        matches!(first, Next::Message(_))
+    }
+
+    #[tokio::test]
+    async fn only_panics_in_a_row_count_towards_giving_up() {
+        let hub = Hub::start(small_stage(50.0)).unwrap();
+        // Many more panics than the cap in total, but never more than four
+        // in a row without a stable run in between: the thread carries on.
+        for round in 0..3 {
+            for _ in 0..MAX_RESTARTS - 1 {
+                hub.send(Command::Panic);
+            }
+            assert!(serves(&hub, round).await, "gave up in round {round}");
+            tokio::time::sleep(STABLE_RUN + Duration::from_millis(200)).await;
+        }
+        assert!(serves(&hub, 10).await);
+
+        // A crash loop is still a crash loop: one panic more than the cap,
+        // back to back, and it is over.
+        for _ in 0..=MAX_RESTARTS {
+            hub.send(Command::Panic);
+        }
+        hub.stop().unwrap().join().unwrap();
+        assert!(!serves(&hub, 11).await);
     }
 }

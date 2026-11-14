@@ -45,7 +45,7 @@ fn SourceBadge() -> impl IntoView {
             data-source=move || ui.source.get().map_or("", |s| s.id())
             title=move || {
                 let state = state();
-                if state.is_empty() { format!("Source: {}", name()) } else { format!("Source: {} ({state})", name()) }
+                if state.is_empty() { format!("Source\u{a0}: {}", name()) } else { format!("Source\u{a0}: {} ({state})", name()) }
             }
         >
             <span class="badge-dot" aria-hidden="true"></span>
@@ -92,7 +92,7 @@ pub fn TopBar() -> impl IntoView {
                     id="btn-vr"
                     class="btn vr-btn"
                     class:ready=vr_ready
-                    title=move || if vr_ready() { "Entrer en réalité virtuelle" } else { "Réalité virtuelle: voir le panneau Casque VR" }
+                    title=move || if vr_ready() { "Entrer en réalité virtuelle" } else { "Réalité virtuelle\u{a0}: voir le panneau Casque VR" }
                     // Synchronous on purpose: the browser only grants an
                     // immersive session inside the click itself.
                     on:click=move |_| {

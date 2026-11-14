@@ -148,11 +148,12 @@ const LOOK_AHEAD: f32 = 0.9;
 const STATION: f32 = 0.02;
 /// The walker slows down so that the path never turns faster than this (rad/s).
 const MAX_TURN_RATE: f32 = 0.75;
-/// The walker also slows down so that [`ScanPath::heading_at`], the direction
-/// a handheld camera faces, never swings faster than this (rad/s, about 32
-/// degrees per second). The heading aims at a point ahead on the path, so it
-/// starts to swing before the walker reaches a bend and can turn faster than
-/// the path under his feet.
+/// The walker also slows down to keep [`ScanPath::heading_at`], the
+/// direction a handheld camera faces, from swinging faster than this (rad/s,
+/// 32 degrees per second; where the speed floor applies it reaches 35 on the
+/// house tour). The heading aims at a point ahead on the path, so it starts
+/// to swing before the walker reaches a bend and can turn faster than the
+/// path underfoot: up to 59 degrees per second without this limit.
 const MAX_HEADING_RATE: f32 = 0.56;
 /// Slowest walking speed in tight turns, as a fraction of the cruise speed.
 const MIN_SPEED_FRACTION: f32 = 0.3;

@@ -90,6 +90,20 @@ pub(crate) async fn upgrade(
         .on_upgrade(move |socket| session(socket, state))
 }
 
+/// Takes a viewer off the pipeline thread's list when the session ends,
+/// however it ends: a viewer left registered would keep the pipeline
+/// ticking for nobody.
+struct Membership<'a> {
+    core: &'a crate::Core,
+    id: u64,
+}
+
+impl Drop for Membership<'_> {
+    fn drop(&mut self) {
+        self.core.hub.send(Command::Leave(self.id));
+    }
+}
+
 async fn session(socket: WebSocket, state: AppState) {
     let core = &state.core;
     let (id, _guard) = core.enter_session();
@@ -97,6 +111,7 @@ async fn session(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
     let end = if core.hub.send(Command::Join(outbox.clone())) {
+        let _member = Membership { core, id };
         log::debug!("client {id} connected ({:?})", state.listener);
         let heard = Heard::default();
         let mut stop = state.stop.clone();
@@ -105,8 +120,16 @@ async fn session(socket: WebSocket, state: AppState) {
             end = read(&mut stream, &state, &heard) => end,
             _ = stop.wait_for(|stop| *stop) => End::ListenerStopped,
         };
-        core.hub.send(Command::Leave(id));
-        end
+        // A server that stops tells its sessions first and its pipeline
+        // thread second, but a session busy sending may notice the closed
+        // outbox before it looks at the stop signal again. The viewer is
+        // told what really happened: the server is going away (1001), not
+        // that the pipeline broke (1011).
+        if end == End::PipelineGone && *stop.borrow() {
+            End::ListenerStopped
+        } else {
+            end
+        }
     } else {
         End::PipelineGone
     };
@@ -123,6 +146,15 @@ async fn session(socket: WebSocket, state: AppState) {
         match farewell {
             Some(frame) => {
                 let _ = sink.send(frame).await;
+                if end == End::TooBig {
+                    // The client is probably still sending the rest of its
+                    // oversized message. Hanging up at once would answer
+                    // that with a TCP reset, and a browser that gets a
+                    // reset reports an abnormal closure (1006) instead of
+                    // the close frame it had not read yet. The connection
+                    // is kept, unread, for the rest of the grace period.
+                    std::future::pending::<()>().await;
+                }
             }
             // The reply to the client's close frame is queued by the
             // protocol layer; it still has to be flushed.

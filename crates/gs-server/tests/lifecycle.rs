@@ -268,6 +268,29 @@ async fn dropping_the_handle_stops_the_server() {
     }
 }
 
+/// Dropping the handle stops the listeners and the pipeline at the same
+/// moment. Whichever a session notices first, the viewer is told that the
+/// server is going away (1001), never that the pipeline broke (1011).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn viewers_of_a_dropped_server_are_never_told_of_an_internal_error() {
+    let _serial = serial().await;
+    for round in 0..25 {
+        let config = ServerConfig { pipeline: small_stage(60.0), port: 0, ..ServerConfig::default() };
+        let handle = gs_server::start(config).await.unwrap();
+        let port = handle.http_addr().port();
+        let mut viewers = Vec::new();
+        for _ in 0..4 {
+            let mut viewer = Client::connect(port).await;
+            viewer.snapshot().await;
+            viewers.push(viewer);
+        }
+        drop(handle);
+        for viewer in &mut viewers {
+            assert_eq!(viewer.closed().await.map(|(code, _)| code), Some(1001), "round {round}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keepalive_drops_dead_clients_and_keeps_quiet_ones() {
     let _serial = serial().await;

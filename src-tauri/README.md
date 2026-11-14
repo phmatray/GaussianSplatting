@@ -118,6 +118,28 @@ e2e/server/tauri-smoke.sh            # binaire de débogage
 e2e/server/tauri-smoke.sh --release  # binaire optimisé
 ```
 
+## Essai avec l'interface réelle
+
+`e2e/server/tauri-real.sh` compile la coquille avec une copie de l'interface
+construite (`crates/gs-app/dist`) et la fonctionnalité `probe`, la lance sous
+Xvfb et vérifie que la fenêtre affiche l'interface, qu'elle a trouvé le
+serveur embarqué par la commande `server_info` (source « Serveur natif »),
+que le flux arrive par le WebSocket et que les splats sont dessinés en
+WebGL2. Une capture d'écran est enregistrée à côté du journal :
+
+```bash
+(cd crates/gs-app && trunk build --release)
+e2e/server/tauri-real.sh             # binaire optimisé
+e2e/server/tauri-real.sh --debug     # binaire de débogage
+```
+
+La fonctionnalité `probe` ne sert qu'à cet essai : une fois par seconde, la
+coquille demande à la fenêtre ce qu'elle affiche (source, couches reçues,
+images dessinées) et l'écrit dans le journal. Elle n'est jamais activée dans
+une construction normale. Le script laisse dans `target/` un binaire compilé
+avec `probe` : reconstruisez-le ensuite avec la commande de la section
+« Version finale ».
+
 À noter : WebKitGTK n'expose pas WebXR. La réalité virtuelle passe par le
 navigateur du casque, qui ouvre l'adresse HTTPS affichée dans l'application
 (ou son QR code).

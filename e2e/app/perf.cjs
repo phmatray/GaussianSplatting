@@ -40,7 +40,8 @@ async function sample(page, seconds) {
   const elapsed = (Date.now() - t0) / 1000;
   const mean = (v) => v.reduce((x, y) => x + y, 0) / v.length;
   return {
-    tick_hz: +mean(ticks).toFixed(1),
+    tick_hz_reported: +mean(ticks).toFixed(1),
+    tick_hz_shown: b.pipelineHz === null ? null : +b.pipelineHz.toFixed(1),
     ticks_per_s: +((b.stats.tick - a.stats.tick) / elapsed).toFixed(1),
     animation_fps: +mean(fps).toFixed(1),
     redraw_fps: +((b.viewer.framesRendered - a.viewer.framesRendered) / elapsed).toFixed(1),

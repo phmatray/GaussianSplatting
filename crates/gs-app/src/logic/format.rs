@@ -54,6 +54,16 @@ pub fn rate(bytes_per_second: f32) -> String {
     }
 }
 
+/// A colon-separated fingerprint cut into groups of `per_group` bytes for
+/// display, each group ending with its colon. The groups joined together
+/// are the fingerprint again, so that a copy of the text stays exact.
+pub fn fingerprint_groups(fingerprint: &str, per_group: usize) -> Vec<String> {
+    let bytes: Vec<&str> = fingerprint.split(':').collect();
+    let groups = bytes.chunks(per_group.max(1));
+    let last = groups.len().saturating_sub(1);
+    groups.enumerate().map(|(i, group)| if i == last { group.join(":") } else { format!("{}:", group.join(":")) }).collect()
+}
+
 /// A fraction in `0..=1` as a whole percentage.
 pub fn percent(fraction: f32) -> String {
     let clamped = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
@@ -98,6 +108,20 @@ mod tests {
         assert_eq!(percent(1.0), "100 %");
         assert_eq!(percent(7.0), "100 %");
         assert_eq!(percent(f32::NAN), "0 %");
+    }
+
+    #[test]
+    fn fingerprints_break_between_bytes() {
+        let fingerprint = (0..32).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+        let groups = fingerprint_groups(&fingerprint, 8);
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0], "00:01:02:03:04:05:06:07:");
+        assert_eq!(groups[3], "18:19:1A:1B:1C:1D:1E:1F");
+        assert_eq!(groups.concat(), fingerprint);
+        // Odd inputs are shown as they are.
+        assert_eq!(fingerprint_groups("", 8), [""]);
+        assert_eq!(fingerprint_groups("AB:CD", 0).concat(), "AB:CD");
+        assert_eq!(fingerprint_groups("no colons here", 8), ["no colons here"]);
     }
 
     #[test]

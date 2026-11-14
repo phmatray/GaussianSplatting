@@ -5,34 +5,10 @@
 // The server gets a COPY of the dist (Trunk wipes the original when it
 // rebuilds) and ports of our range.
 const { chromium } = require('playwright');
-const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { check, REPO, DIST, PORT, MIME, newPage, consoleErrors, glWarnings, state, waitState, open, shot, viewShot, diff, content, setSlider, sleep } = require('./lib.cjs');
-
-const BIN = process.env.GS_SERVER_BIN || path.join(REPO, 'target/release/gs-server');
-
-// Starts the server and resolves with its loopback URL once it answers.
-async function startServer(dist, certs, port) {
-  const child = spawn(BIN, ['--port', String(port), '--lan-port', String(port + 1), '--dist', dist, '--cert-dir', certs, '--light'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  let output = '';
-  child.stdout.on('data', (d) => (output += d));
-  child.stderr.on('data', (d) => (output += d));
-  const exited = new Promise((resolve) => child.on('exit', resolve));
-  for (let i = 0; i < 150; i++) {
-    for (const candidate of [port, port + 2, port + 3]) {
-      try {
-        const info = await (await fetch(`http://127.0.0.1:${candidate}/api/info`)).json();
-        if (info.name === 'splat-live') return { child, exited, url: info.http_url, info, output: () => output };
-      } catch {}
-    }
-    if (child.exitCode !== null) break;
-    await sleep(100);
-  }
-  child.kill('SIGKILL');
-  throw new Error(`gs-server did not start:\n${output}`);
-}
+const { check, REPO, DIST, PORT, MIME, newPage, consoleErrors, glWarnings, state, waitState, open, shot, viewShot, diff, content, setSlider, sleep, startServer, SERVER_BIN: BIN } = require('./lib.cjs');
 
 async function run({ browser }) {
   if (!fs.existsSync(BIN)) {
@@ -43,7 +19,7 @@ async function run({ browser }) {
   const dist = path.join(tmp, 'dist');
   fs.cpSync(DIST, dist, { recursive: true });
   const port = PORT + 50;
-  let server = await startServer(dist, path.join(tmp, 'certs'), port);
+  let server = await startServer({ dist, certs: path.join(tmp, 'certs'), port });
   const measurements = {};
   try {
     const url = `${server.url}/`;
@@ -119,11 +95,13 @@ async function run({ browser }) {
       try {
         const hs = await open(hp, `${lan.urls[0]}/`);
         check('server: the LAN https address serves the same application over wss', hs.source === 'server' && hs.connected && hs.layers.static > 0, lan.urls[0]);
+        // Sharing is the business of the machine that runs the server: the
+        // LAN side is not offered the switch, and the server refuses it.
         await hp.locator('#section-vr').scrollIntoViewIfNeeded();
-        await hp.click('#lan-toggle');
-        await hp.waitForFunction(() => document.querySelector('#lan-error'), null, { timeout: 15000 });
-        const refused = await hp.locator('#lan-error').innerText();
-        check('server: LAN sharing cannot be changed from the LAN side', /ordinateur/.test(refused) && (await state(page)).server.lan.enabled, refused);
+        await hp.waitForSelector('#vr-lan-help');
+        const help = await hp.locator('#vr-lan-help').innerText();
+        const refused = await hp.evaluate(async () => (await fetch('/api/lan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"enabled":false}' })).status);
+        check('server: LAN sharing cannot be changed from the LAN side', (await hp.locator('#lan-toggle').count()) === 0 && /même adresse/.test(help) && /casque/.test(help) && refused === 403 && (await state(page)).server.lan.enabled, `${help} (POST /api/lan: ${refused})`);
       } catch (e) {
         check('server: the LAN https address serves the same application over wss', false, String(e).split('\n')[0]);
       }
@@ -204,7 +182,7 @@ async function run({ browser }) {
     const lost = await page.locator('#source-badge').getAttribute('data-link');
     check('server: a lost connection is shown', lost === 'reconnecting' && !s.connected, lost);
     await shot(page, 'server-reconnecting.png');
-    server = await startServer(dist, path.join(tmp, 'certs'), port);
+    server = await startServer({ dist, certs: path.join(tmp, 'certs'), port });
     s = await waitState(page, (s, n) => s.connected && s.counts.states > n && s.layers.dynamic > 0 && s.layers.static > 0, 60000, states);
     const tick = s.stats.tick;
     s = await waitState(page, (s, tick) => s.stats.tick > tick + 3, 20000, tick);

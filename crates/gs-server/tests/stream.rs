@@ -155,13 +155,19 @@ async fn stalled_client_resumes_with_the_latest_layer_and_others_are_unaffected(
     stalled.pump(Duration::from_millis(500)).await;
     let frame_bytes = stalled.viewer.log.iter().rev().find(|m| m.is_dynamic()).unwrap().bytes;
     assert!(frame_bytes > 400_000, "live layers of {frame_bytes} bytes are too small for this test");
+
     let before_stall = stalled.viewer.dynamic_frames();
 
-    // The stalled viewer stops reading altogether.
+    // The stalled viewer stops reading altogether. Meanwhile, watch what
+    // the server holds for its three viewers.
     let ticks_before = server.handle.metrics().ticks;
     let memory_before = resident_bytes();
     let stall_start = Instant::now();
-    tokio::time::sleep(STALL).await;
+    let mut most_queued = 0;
+    while stall_start.elapsed() < STALL {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        most_queued = most_queued.max(server.handle.metrics().queued_bytes as usize);
+    }
     let stall_end = Instant::now();
     let memory_after = resident_bytes();
     let ticks_during = server.handle.metrics().ticks - ticks_before;
@@ -171,11 +177,22 @@ async fn stalled_client_resumes_with_the_latest_layer_and_others_are_unaffected(
     let tick_rate = ticks_during as f64 / STALL.as_secs_f64();
     assert!((HZ * 0.85..=HZ * 1.1).contains(&tick_rate), "pipeline ticked at {tick_rate:.1} Hz during the stall");
 
-    // Nothing was queued for it: memory did not follow the 45 or so
-    // megabytes produced meanwhile.
+    // Nothing piled up for it while some 45 megabytes were produced: every
+    // viewer, stalled or not, holds at most the messages of one tick (one
+    // live layer and a few small ones).
     let growth = memory_after.saturating_sub(memory_before) as usize;
+    eprintln!(
+        "stall: {tick_rate:.1} Hz, {produced} bytes produced, at most {most_queued} bytes queued, \
+         resident memory grew by {growth} bytes"
+    );
     assert!(produced > 30 << 20, "only {produced} bytes produced during the stall");
-    assert!(growth < produced / 4, "memory grew by {growth} bytes while {produced} bytes were produced");
+    assert!(most_queued > 0, "the queue metric does not move");
+    assert!(most_queued <= 3 * frame_bytes * 3 / 2, "{most_queued} bytes were queued for three viewers");
+    // The memory of the process agrees. It is a coarse witness: it also
+    // counts the two fast viewers of this test, whose decoding of a few
+    // megabytes of splats per tick moves it by 2 to 17 megabytes from one
+    // run to the next. A backlog would be everything that was produced.
+    assert!(growth < produced * 3 / 4, "memory grew by {growth} bytes while {produced} bytes were produced");
 
     // What it gets when it reads again: at most the few frames that were
     // already in the kernel's socket buffers, then the newest one.

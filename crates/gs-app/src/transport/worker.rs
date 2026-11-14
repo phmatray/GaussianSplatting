@@ -1,6 +1,7 @@
 //! Transport to the local pipeline worker (`crates/gs-worker`): batches of
 //! transferred `ArrayBuffer`s in, JSON strings out. See the protocol in the
-//! `gs_worker` crate documentation.
+//! `gs_worker` crate documentation. The same worker binary also relays the
+//! WebSocket of a native server (`super::ws`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -18,6 +19,14 @@ use crate::logic::source::Link;
 /// Loader of the worker, next to the page (relative: the application may be
 /// served from any sub-path). The build id keeps stale cached copies out.
 const WORKER_URL: &str = concat!("./worker-boot.js?v=", env!("GS_APP_BUILD_ID"));
+
+/// Starts a `splat-worker` instance. It posts `{"type":"ready"}` once it
+/// takes requests.
+pub(super) fn spawn_worker() -> Result<Worker, JsValue> {
+    let options = WorkerOptions::new();
+    options.set_type(WorkerType::Module);
+    Worker::new_with_options(WORKER_URL, &options)
+}
 
 struct Inner {
     worker: Worker,
@@ -40,10 +49,7 @@ pub struct WorkerTransport {
 
 impl WorkerTransport {
     pub fn start(scene: SceneKind, sink: Sink) -> Result<Self, String> {
-        let options = WorkerOptions::new();
-        options.set_type(WorkerType::Module);
-        let worker = Worker::new_with_options(WORKER_URL, &options)
-            .map_err(|e| format!("le worker n'a pas pu être créé ({})", describe(&e)))?;
+        let worker = spawn_worker().map_err(|e| format!("le worker n'a pas pu être créé ({})", describe(&e)))?;
         let inner = Rc::new(Inner {
             worker,
             sink,
@@ -138,8 +144,9 @@ impl Inner {
                 Ok(WorkerEvent::Error { message }) if !self.ready.get() => {
                     self.fail(format!("Le calcul local n'a pas pu démarrer ({message})."));
                 }
-                Ok(WorkerEvent::Error { message }) => self.sink.on_error.as_ref()(format!("Commande refusée: {message}")),
-                Err(_) => {}
+                Ok(WorkerEvent::Error { message }) => self.sink.on_error.as_ref()(format!("Commande refusée\u{a0}: {message}")),
+                // Link events belong to the relay mode.
+                Ok(WorkerEvent::Link { .. }) | Err(_) => {}
             }
             return;
         }

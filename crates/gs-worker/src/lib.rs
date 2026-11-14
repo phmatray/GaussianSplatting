@@ -18,19 +18,21 @@
 //! | Message | Meaning |
 //! |---|---|
 //! | `{"type":"start","scene":"stage"}` | Build the pipeline from `PipelineConfig::light(scene)` and start ticking. Answered with a batch holding `Pipeline::snapshot()`. A second `start` rebuilds the pipeline. |
+//! | `{"type":"connect","url":"ws://...","link":N}` | Relay mode (see below): open a WebSocket to a native server, replacing the previous one, and forward its frames. |
 //! | `{"type":"ack","batch":N}` | The page has applied every batch up to id `N`. |
-//! | `{"type":"snapshot"}` | Ask for a fresh `Pipeline::snapshot()` (full resynchronisation). |
-//! | anything else | A `gs_core::protocol::ControlMsg`, exactly as it would be sent over the WebSocket. The reply messages, if any, come back as a batch. |
+//! | `{"type":"snapshot"}` | Ask for a fresh `Pipeline::snapshot()` (full resynchronisation). Local pipeline only. |
+//! | anything else | A `gs_core::protocol::ControlMsg`, exactly as it would be sent over the WebSocket. With a local pipeline the reply messages, if any, come back as a batch; in relay mode the text is sent to the server as it is. |
 //!
 //! Worker to page: either a **string** holding a JSON [`WorkerEvent`]
 //! (`{"type":"ready"}` once the WebAssembly module is initialised and
 //! messages can be received, `{"type":"error","message":"..."}` for a
-//! rejected request; the loader script posts the same error event when the
-//! module cannot be loaded at all), or a **batch**: a JavaScript array
-//! `[id, buffer, buffer, ...]` where `id` is a number and every `buffer` is
-//! an `ArrayBuffer` holding one `gs_core::codec` message. The buffers are
-//! transferred, not copied. One tick of the pipeline is one batch, so the
-//! messages of a tick always arrive together and in order.
+//! rejected request, `{"type":"link","open":true|false,"link":N}` when the
+//! WebSocket of `connect` number `N` opens or closes; the loader script posts the same error event
+//! when the module cannot be loaded at all), or a **batch**: a JavaScript
+//! array `[id, buffer, buffer, ...]` where `id` is a number and every
+//! `buffer` is an `ArrayBuffer` holding one `gs_core::codec` message. The
+//! buffers are transferred, not copied. One tick of the pipeline is one
+//! batch, so the messages of a tick always arrive together and in order.
 //!
 //! # Flow control
 //!
@@ -41,11 +43,24 @@
 //! animation jumps ahead instead of megabytes queueing up in the page's
 //! message queue. Replies to control messages and snapshots are reliable
 //! and are sent regardless; they count as outstanding until acknowledged.
+//!
+//! # Relay mode
+//!
+//! With a native server the pipeline does not run here, but its WebSocket
+//! does: see [`relay`]. The page gets the server's frames in the same
+//! acknowledged batches, coalesced while it is busy, so a slow page shows a
+//! lower rate instead of an ever older picture. After a `connect` the page
+//! ignores batches until the `link` event that opens it: they belong to the
+//! connection that was replaced.
+
+pub mod relay;
 
 use gs_core::pipeline::{Outgoing, Pipeline};
 use gs_core::protocol::PipelineConfig;
 use gs_core::scene::SceneKind;
 use serde::{Deserialize, Serialize};
+
+pub use relay::{Delivery, Relay, RelayOverflow, MAX_RELAY_BYTES};
 
 /// A tick is skipped while this many batches are waiting for their
 /// acknowledgement.
@@ -61,11 +76,15 @@ const STALL_POLL_MS: f64 = 50.0;
 
 /// Requests of the page that are addressed to the worker itself rather than
 /// to the pipeline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerRequest {
     /// Build the pipeline for `scene` and start ticking.
     Start { scene: SceneKind },
+    /// Relay the WebSocket at `url` (replacing the one relayed so far).
+    /// `link` is echoed by the [`WorkerEvent::Link`] events of this
+    /// connection, which tells them from those of a replaced one.
+    Connect { url: String, link: u32 },
     /// Every batch up to `batch` has been applied.
     Ack { batch: u32 },
     /// Send a full snapshot again.
@@ -86,6 +105,9 @@ pub enum WorkerEvent {
     Ready,
     /// A request was rejected; the pipeline is unchanged.
     Error { message: String },
+    /// The relayed WebSocket of `connect` number `link` opened (`open`) or
+    /// closed.
+    Link { open: bool, link: u32 },
 }
 
 impl WorkerEvent {
@@ -210,6 +232,8 @@ impl Driver {
                     let snapshot = self.pipeline.as_ref().ok_or("the pipeline is not started")?.snapshot();
                     Ok(self.batch(snapshot))
                 }
+                // The relay is the business of the glue, which owns the socket.
+                WorkerRequest::Connect { .. } => Err("this worker runs a local pipeline".to_string()),
             };
         }
         let pipeline = self.pipeline.as_mut().ok_or("the pipeline is not started")?;
@@ -278,6 +302,11 @@ mod tests {
         assert_eq!(WorkerRequest::Start { scene: SceneKind::House }.to_json(), r#"{"type":"start","scene":"house"}"#);
         assert_eq!(WorkerRequest::Ack { batch: 7 }.to_json(), r#"{"type":"ack","batch":7}"#);
         assert_eq!(WorkerRequest::Snapshot.to_json(), r#"{"type":"snapshot"}"#);
+        assert_eq!(
+            WorkerRequest::Connect { url: "ws://127.0.0.1:7878/ws".into(), link: 3 }.to_json(),
+            r#"{"type":"connect","url":"ws://127.0.0.1:7878/ws","link":3}"#
+        );
+        assert_eq!(WorkerEvent::Link { open: true, link: 3 }.to_json(), r#"{"type":"link","open":true,"link":3}"#);
         assert_eq!(WorkerEvent::Ready.to_json(), r#"{"type":"ready"}"#);
         assert_eq!(
             serde_json::from_str::<WorkerEvent>(r#"{"type":"error","message":"x"}"#).unwrap(),

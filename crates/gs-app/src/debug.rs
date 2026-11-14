@@ -3,7 +3,8 @@
 //!
 //! * `state()` returns a plain JSON-serialisable object: source, link,
 //!   scene, configuration summary, layer counts, viewer statistics, camera,
-//!   display settings, VR session, last Stats, message counters, thumbnails,
+//!   display settings, VR session, last Stats, measured tick rate, message
+//!   counters, the transport channel, thumbnails,
 //!   scan progress, imported file, errors.
 //! * `viewerEye()` returns the desktop camera position `[x, y, z]`.
 
@@ -41,6 +42,7 @@ fn state(core: &Core) -> Value {
     });
     json!({
         "source": core.source().map(|s| s.id()),
+        "channel": core.channel(),
         "link": link.id(),
         "connected": link == crate::logic::source::Link::Connected,
         "scene": ui.scene.get_untracked().map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
@@ -90,6 +92,7 @@ fn state(core: &Core) -> Value {
             "error": viewer.xr_error(),
             "session": xr_session,
         },
+        "pipelineHz": ui.pipeline_hz.get_untracked(),
         "stats": core.last_stats().map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
         "counts": {
             "messages": counters.messages,

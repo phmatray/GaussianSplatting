@@ -10,7 +10,9 @@
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230a0d13'/%3E%3Ccircle cx='12' cy='13' r='7' fill='%2338bdf8' fill-opacity='.85'/%3E%3Ccircle cx='20' cy='15' r='6' fill='%23a78bfa' fill-opacity='.8'/%3E%3Ccircle cx='15' cy='21' r='5' fill='%2334d399' fill-opacity='.8'/%3E%3C/svg%3E" />
     <link data-trunk rel="css" href="style.css" />
     <link data-trunk rel="copy-file" href="worker-boot.js" />
-    <link data-trunk rel="rust" href="Cargo.toml" data-bin="gs-app" data-wasm-opt="2" />
+    <!-- No integrity hashes on the script and its WebAssembly module: Chromium ignores the one on the
+         WebAssembly preload and says so with a console warning on every load, and everything is same-origin. -->
+    <link data-trunk rel="rust" href="Cargo.toml" data-bin="gs-app" data-wasm-opt="2" data-integrity="none" />
     <!-- The pipeline worker: emitted as splat-worker.js + splat-worker_bg.wasm and started by worker-boot.js. -->
     <link data-trunk rel="rust" href="../gs-worker/Cargo.toml" data-bin="splat-worker" data-type="worker" data-bindgen-target="web" data-wasm-opt="3" />
   </head>

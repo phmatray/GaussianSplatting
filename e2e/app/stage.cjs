@@ -49,6 +49,16 @@ async function run({ browser, url }) {
   const s2 = await waitState(page, (s, tick) => s.stats && s.stats.tick > tick + 5, 20000, s.stats.tick);
   check('stage: Stats keep arriving', s2.stats.tick > s.stats.tick && s2.stats.tick_hz > 1 && s2.stats.capture_ms > 0 && s2.stats.splats_dynamic > 0, `tick ${s.stats.tick} -> ${s2.stats.tick}, ${s2.stats.tick_hz.toFixed(1)} Hz`);
   await page.waitForFunction(() => /Hz/.test(document.getElementById('stat-hz').textContent) && /ms/.test(document.getElementById('stat-capture').textContent));
+  // The rate on screen is counted from the ticks that ran. The pipeline's
+  // own figure averages instantaneous rates, which the worker's bursts
+  // (two ticks, then a wait for the page) can double.
+  const rate0 = await waitState(page, (s) => s.pipelineHz !== null, 20000);
+  const rateStart = Date.now();
+  await sleep(4000);
+  const rate1 = await state(page);
+  const counted = (rate1.stats.tick - rate0.stats.tick) / ((Date.now() - rateStart) / 1000);
+  const rateShown = await page.locator('#stat-hz').innerText();
+  check('stage: the pipeline rate shown is the number of ticks per second', Math.abs(rate1.pipelineHz - counted) < 0.25 * counted + 1 && Math.abs(parseFloat(rateShown.replace(',', '.')) - rate1.pipelineHz) < 3, `${rateShown} shown, ${counted.toFixed(1)} ticks/s counted, pipeline says ${rate1.stats.tick_hz.toFixed(1)} Hz`);
   const shown = await page.evaluate(() => Object.fromEntries(['fps', 'hz', 'capture', 'recon', 'encode', 'static', 'dynamic', 'rate'].map((k) => [k, document.getElementById(`stat-${k}`).textContent])));
   check('stage: the statistics panel shows every figure', /i\/s/.test(shown.fps) && /Hz/.test(shown.hz) && /ms/.test(shown.recon) && /ms/.test(shown.encode) && /\d/.test(shown.static) && /\d/.test(shown.dynamic) && /o\/s/.test(shown.rate), JSON.stringify(shown));
   await page.waitForFunction(() => window.__splatLive.state().transferBytesPerSecond > 1000, null, { timeout: 10000 });

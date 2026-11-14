@@ -77,16 +77,42 @@ pub fn check_size(bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The reason `gs_core::io` gives for a refused PLY file, in French. A
+/// reason this table does not know yet is shown as it is.
+fn ply_reason(what: &str) -> &str {
+    match what {
+        "missing end_header" => "la fin de l'en-tête est introuvable",
+        "header is not text" => "l'en-tête n'est pas du texte",
+        "missing ply magic" => "le fichier ne commence pas par le mot «\u{a0}ply\u{a0}»",
+        "unknown format" => "format inconnu",
+        "missing format line" => "la ligne «\u{a0}format\u{a0}» manque",
+        "element without a name" => "un élément n'a pas de nom",
+        "element without a valid count" => "le nombre d'éléments est invalide",
+        "element size overflows" => "les tailles annoncées sont démesurées",
+        "property before any element" => "une propriété précède le premier élément",
+        "property without a type" => "une propriété n'a pas de type",
+        "property without a name" => "une propriété n'a pas de nom",
+        "unknown property type" => "type de propriété inconnu",
+        "no vertex element" => "il n'y a pas d'élément «\u{a0}vertex\u{a0}»",
+        "vertex element without x, y, z" => "les points n'ont pas de position x, y, z",
+        "ascii PLY" => "PLY au format texte\u{a0}; enregistrez-le en binaire",
+        "big-endian PLY" => "PLY binaire gros-boutiste",
+        "list element before the vertices" => "une liste précède les points",
+        "list property in the vertex element" => "les points portent une propriété de type liste",
+        other => other,
+    }
+}
+
 fn describe(error: &IoError) -> String {
     match error {
         IoError::Truncated { needed, available } => format!(
-            "Le fichier est incomplet: son en-tête annonce {needed} octets, il n'en contient que {available}."
+            "Le fichier est incomplet\u{a0}: son en-tête annonce {needed} octets, il n'en contient que {available}."
         ),
         IoError::BadLength(len) => {
-            format!("Ce n'est pas un fichier .splat valide: sa taille ({len} octets) n'est pas un multiple de 32.")
+            format!("Ce n'est pas un fichier .splat valide\u{a0}: sa taille ({len} octets) n'est pas un multiple de 32.")
         }
-        IoError::BadHeader(what) => format!("L'en-tête PLY est invalide ({what})."),
-        IoError::Unsupported(what) => format!("Ce fichier PLY n'est pas pris en charge ({what})."),
+        IoError::BadHeader(what) => format!("L'en-tête PLY est invalide ({}).", ply_reason(what)),
+        IoError::Unsupported(what) => format!("Ce fichier PLY n'est pas pris en charge ({}).", ply_reason(what)),
     }
 }
 
@@ -95,7 +121,7 @@ fn describe(error: &IoError) -> String {
 pub fn parse_import(name: &str, bytes: &[u8]) -> Result<Vec<Splat>, String> {
     check_size(bytes.len() as u64)?;
     let format = FileFormat::from_name(name)
-        .ok_or_else(|| "Format non pris en charge: choisissez un fichier .ply ou .splat.".to_string())?;
+        .ok_or_else(|| "Format non pris en charge\u{a0}: choisissez un fichier .ply ou .splat.".to_string())?;
     let mut splats = match format {
         FileFormat::Ply => io::read_ply(bytes),
         FileFormat::Splat => io::read_splat(bytes),
@@ -177,6 +203,31 @@ mod tests {
         for message in [cut, fake, odd] {
             assert!(!message.contains('\u{2014}'));
         }
+    }
+
+    #[test]
+    fn ply_refusals_are_explained_in_french() {
+        let header = |body: &str| format!("ply\nformat binary_little_endian 1.0\n{body}end_header\n").into_bytes();
+        let cases: [(Vec<u8>, &str); 8] = [
+            (b"ply\nformat binary_little_endian 1.0\nelement vertex 1\n".to_vec(), "la fin de l'en-tête est introuvable"),
+            (b"plz\nformat binary_little_endian 1.0\nend_header\n".to_vec(), "ne commence pas par le mot «\u{a0}ply\u{a0}»"),
+            (b"ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n".to_vec(), "format texte"),
+            (b"ply\nformat binary_big_endian 1.0\nelement vertex 0\nproperty float x\nend_header\n".to_vec(), "gros-boutiste"),
+            (header("element camera 0\nproperty float focal\n"), "pas d'élément «\u{a0}vertex\u{a0}»"),
+            (header("element face 2\nproperty list uchar int vertex_indices\n"), "une liste précède les points"),
+            (header("element vertex 1\nproperty float x\nproperty float y\n"), "pas de position x, y, z"),
+            (header("element vertex 1\nproperty quaternion x\n"), "type de propriété inconnu"),
+        ];
+        for (bytes, expected) in cases {
+            let message = parse_import("x.ply", &bytes).unwrap_err();
+            assert!(message.contains(expected), "{message}");
+            // No English fragment of the decoder leaks into the interface.
+            for english in ["missing", "header is", "unknown", "without", "element ", "PLY file", "list "] {
+                assert!(!message.contains(english), "{message}");
+            }
+        }
+        // A reason the table does not know is still shown.
+        assert_eq!(ply_reason("something new"), "something new");
     }
 
     #[test]

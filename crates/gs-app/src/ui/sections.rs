@@ -11,7 +11,7 @@ use super::widgets::{Section, Segmented, Slider, StatRow, Toggle};
 use crate::core::with_core;
 use crate::logic::config::{self, CAMERA_COUNT_RANGE, RESOLUTIONS, WALK_SPEED_RANGE};
 use crate::logic::files::FileFormat;
-use crate::logic::format;
+use crate::logic::{format, present};
 use crate::logic::source::SourceKind;
 use crate::state::{use_ui, Display, ScanView, Ui};
 
@@ -295,17 +295,20 @@ pub fn CamerasSection() -> impl IntoView {
                 selected=Signal::derive(move || Some(usize::from(ui.preview_depth.get())))
                 on_select=Callback::new(|index: usize| with_core(|core| core.set_preview_depth(index == 1)))
             />
-            <div class="tiles" class:single=house id="tiles">
+            <div class="tiles" class:head=house id="tiles">
                 <For each=move || ui.camera_ids.get() key=|id| *id let:id>
                     <button
                         type="button"
                         class="tile"
-                        title=move || if house() { "Caméra portée à la main" } else { "Voir depuis cette caméra" }
+                        title=move || if house() { "Voir depuis la caméra du scan" } else { "Voir depuis cette caméra" }
                         on:click=move |_| with_core(|core| core.view_from_camera(id))
                     >
                         <canvas id=format!("preview-{id}") width="4" height="3"></canvas>
                         <span class="tile-label">
-                            {move || if house() { "Caméra mobile".to_string() } else { format!("Cam {}", id + 1) }}
+                            {move || match ui.config.get() {
+                                Some(config) if house() => present::sensor_label(config.scan.head, id).to_string(),
+                                _ => format!("Cam {}", id + 1),
+                            }}
                         </span>
                     </button>
                 </For>
@@ -325,12 +328,19 @@ pub fn StatsSection() -> impl IntoView {
     let stat = move |read: fn(&gs_core::protocol::Stats) -> String| {
         Signal::derive(move || ui.stats.with(|s| s.as_ref().map_or_else(|| "-".to_string(), read)))
     };
+    // Ticks per second as the page counts them; the pipeline's own figure
+    // until a first second has been measured.
+    let pipeline_hz = move || match (ui.pipeline_hz.get(), ui.stats.get()) {
+        (Some(hz), Some(_)) => format::hz(hz),
+        (None, Some(stats)) => format::hz(stats.tick_hz),
+        (_, None) => "-".to_string(),
+    };
     let transfer_label = move || if ui.source.get() == Some(SourceKind::Server) { "Réseau" } else { "Transfert" };
     view! {
         <Section id="section-stats" title="Statistiques" icon="chart">
             <dl class="stats">
                 <StatRow id="stat-fps" label="Affichage" value=Signal::derive(move || format::fps(ui.viewer_stats.get().fps)) />
-                <StatRow id="stat-hz" label="Pipeline" value=stat(|s| format::hz(s.tick_hz)) />
+                <StatRow id="stat-hz" label="Pipeline" value=Signal::derive(pipeline_hz) />
                 <StatRow id="stat-capture" label="Capture" value=stat(|s| format::ms(s.capture_ms)) />
                 <StatRow id="stat-recon" label="Reconstruction" value=stat(|s| format::ms(s.reconstruct_ms)) />
                 <StatRow id="stat-encode" label="Encodage" value=stat(|s| format::ms(s.encode_ms)) />
@@ -378,11 +388,19 @@ fn LanSharing() -> impl IntoView {
                     "Ouvrez cette adresse dans le navigateur du casque, ou scannez le QR code, puis appuyez sur Entrer en VR."
                 </p>
                 <p class="hint">
-                    "Le navigateur affichera un avertissement de certificat: vérifiez que l'empreinte est la même que ci-dessous, puis acceptez-le une seule fois."
+                    "Le navigateur affichera un avertissement de certificat\u{a0}: vérifiez que l'empreinte est la même que ci-dessous, puis acceptez-le une seule fois."
                 </p>
                 <p class="fingerprint">
                     <span class="field-label">"Empreinte SHA-256 du certificat"</span>
-                    <code id="lan-fingerprint">{move || lan().fingerprint}</code>
+                    // Eight bytes per line; `<wbr>` adds nothing to the text.
+                    <code id="lan-fingerprint">
+                        {move || {
+                            format::fingerprint_groups(&lan().fingerprint, 8)
+                                .into_iter()
+                                .map(|group| view! { {group} <wbr /> })
+                                .collect_view()
+                        }}
+                    </code>
                 </p>
             </div>
         </Show>
@@ -393,6 +411,7 @@ fn LanSharing() -> impl IntoView {
 pub fn VrSection() -> impl IntoView {
     let ui = use_ui();
     let supported = move || ui.xr_supported.get();
+    let server = move || ui.source.get() == Some(SourceKind::Server);
     view! {
         <Section id="section-vr" title="Casque VR" icon="vr">
             <Show when=move || supported().is_none()>
@@ -419,23 +438,28 @@ pub fn VrSection() -> impl IntoView {
             </Show>
             <Show when=move || ui.xr_error.get().is_some()>
                 <p class="error" id="xr-error">
-                    "La session VR n'a pas pu démarrer: " {move || ui.xr_error.get()}
+                    "La session VR n'a pas pu démarrer\u{a0}: " {move || ui.xr_error.get()}
                 </p>
             </Show>
             <Show when=move || supported() == Some(false)>
                 <p class="hint" id="vr-unsupported">"Ce navigateur ne peut pas ouvrir de session de réalité virtuelle."</p>
-                <Show
-                    when=move || ui.source.get() == Some(SourceKind::Server)
-                    fallback=|| {
-                        view! {
-                            <p class="hint" id="vr-worker-help">
-                                "Pour voir la scène en VR, ouvrez cette page depuis le navigateur du casque, en https: WebXR exige une connexion sécurisée."
-                            </p>
-                        }
-                    }
-                >
-                    <LanSharing />
+                <Show when=move || ui.source.get() == Some(SourceKind::Worker)>
+                    <p class="hint" id="vr-worker-help">
+                        "Pour voir la scène en VR, ouvrez cette page depuis le navigateur du casque, en https\u{a0}: WebXR exige une connexion sécurisée."
+                    </p>
                 </Show>
+                // A device on the LAN side without WebXR (a phone, a laptop):
+                // the address it already has is the one the headset needs.
+                <Show when=move || server() && !ui.lan_admin.get()>
+                    <p class="hint" id="vr-lan-help">
+                        "Pour voir la scène en VR, ouvrez cette même adresse dans le navigateur du casque."
+                    </p>
+                </Show>
+            </Show>
+            // Sharing is switched from the machine that runs the server,
+            // whether or not that machine has a headset of its own.
+            <Show when=move || server() && ui.lan_admin.get()>
+                <LanSharing />
             </Show>
         </Section>
     }

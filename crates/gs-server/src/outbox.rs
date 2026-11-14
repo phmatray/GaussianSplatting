@@ -247,8 +247,8 @@ impl Outbox {
     }
 
     /// Messages and bytes currently held for this client (ordered queue
-    /// plus mailboxes).
-    #[cfg(test)]
+    /// plus mailboxes): what was produced for it and not yet handed to its
+    /// socket.
     pub fn held(&self) -> (usize, usize) {
         let state = self.lock();
         let messages = state.ordered.len() + state.latest.len();

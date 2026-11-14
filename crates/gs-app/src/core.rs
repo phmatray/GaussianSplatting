@@ -19,7 +19,8 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
 use crate::logic::config::PatchQueue;
 use crate::logic::files::{self, FileFormat};
-use crate::logic::source::{api_url, forced_source, ws_url, Link, ServerInfo, SourceKind};
+use crate::logic::rate::RateMeter;
+use crate::logic::source::{api_url, forced_source, is_loopback_base, ws_url, Link, ServerInfo, SourceKind};
 use crate::logic::{depth, present};
 use crate::state::{Display, FileInfo, Notice, ScanView, Ui};
 use crate::transport::{Sink, Transport};
@@ -91,6 +92,8 @@ pub struct Core {
     session: RefCell<Option<SessionState>>,
     last_stats: Cell<Option<Stats>>,
     stats_pushed_ms: Cell<f64>,
+    /// Ticks per second, from the tick counter of the Stats messages.
+    tick_rate: Cell<RateMeter>,
     previews: RefCell<BTreeMap<u8, PreviewTile>>,
     counters: Cell<Counters>,
     /// Start of the current data-rate window and the bytes counted then.
@@ -120,7 +123,7 @@ pub fn start(canvas: HtmlCanvasElement, ui: Ui) {
         Ok(viewer) => viewer,
         Err(error) => {
             let detail = error.as_string().unwrap_or_else(|| format!("{error:?}"));
-            ui.fatal.set(Some(format!("L'affichage 3D n'a pas pu démarrer: ce navigateur ne propose pas WebGL2 ({detail}).")));
+            ui.fatal.set(Some(format!("L'affichage 3D n'a pas pu démarrer\u{a0}: ce navigateur ne propose pas WebGL2 ({detail}).")));
             ui.link.set(Link::Failed);
             return;
         }
@@ -133,6 +136,7 @@ pub fn start(canvas: HtmlCanvasElement, ui: Ui) {
         session: RefCell::new(None),
         last_stats: Cell::new(None),
         stats_pushed_ms: Cell::new(f64::NEG_INFINITY),
+        tick_rate: Cell::new(RateMeter::default()),
         previews: RefCell::new(BTreeMap::new()),
         counters: Cell::new(Counters::default()),
         rate_window: Cell::new((dom::now_ms(), 0)),
@@ -236,9 +240,10 @@ impl Core {
         self.ui.source.set(Some(SourceKind::Server));
         let Some(url) = ws_url(&base, info.ws_path()) else {
             self.ui.link.set(Link::Failed);
-            self.report_error(format!("Adresse de serveur inattendue: {base}"));
+            self.report_error(format!("Adresse de serveur inattendue\u{a0}: {base}"));
             return;
         };
+        self.ui.lan_admin.set(is_loopback_base(&base));
         *self.server_base.borrow_mut() = Some(base);
         self.ui.server.set(Some(info));
         self.ui.link.set(Link::Connecting);
@@ -252,7 +257,7 @@ impl Core {
             Ok(transport) => *self.transport.borrow_mut() = Some(transport),
             Err(error) => {
                 self.ui.link.set(Link::Failed);
-                self.report_error(format!("Le calcul local n'a pas pu démarrer: {error}."));
+                self.report_error(format!("Le calcul local n'a pas pu démarrer\u{a0}: {error}."));
             }
         }
     }
@@ -330,7 +335,7 @@ impl Core {
             Ok(Applied::Stats(json)) => self.on_stats(&json),
             Ok(Applied::Preview(preview)) => self.on_preview(preview),
             Ok(Applied::Layer { .. }) => {}
-            Err(error) => self.report_error(format!("Message illisible: {error}")),
+            Err(error) => self.report_error(format!("Message illisible\u{a0}: {error}")),
         }
     }
 
@@ -338,23 +343,21 @@ impl Core {
         let state: SessionState = match serde_json::from_str(json) {
             Ok(state) => state,
             Err(error) => {
-                self.report_error(format!("État de session illisible: {error}"));
+                self.report_error(format!("État de session illisible\u{a0}: {error}"));
                 return;
             }
         };
         let scene = state.config.scene;
         let previous = self.session.borrow().as_ref().map(|s| s.config.scene);
         let scene_changed = previous != Some(scene);
-        let camera_ids: Vec<u32> = match scene {
-            SceneKind::Stage => state.cameras.iter().map(|c| c.id).collect(),
-            // The handheld camera.
-            SceneKind::House => vec![0],
-        };
+        let camera_ids = present::camera_ids(&state);
         if scene_changed {
             // Statistics and thumbnails of the other scene are stale.
             self.last_stats.set(None);
             self.handheld.set(None);
             self.previews.borrow_mut().clear();
+            self.tick_rate.set(RateMeter::default());
+            self.ui.pipeline_hz.set(None);
             self.ui.stats.set(None);
             self.ui.scan.set(None);
         } else {
@@ -402,7 +405,7 @@ impl Core {
         let stats: Stats = match serde_json::from_str(json) {
             Ok(stats) => stats,
             Err(error) => {
-                self.report_error(format!("Statistiques illisibles: {error}"));
+                self.report_error(format!("Statistiques illisibles\u{a0}: {error}"));
                 return;
             }
         };
@@ -431,9 +434,13 @@ impl Core {
         }
 
         let now = dom::now_ms();
+        let mut tick_rate = self.tick_rate.get();
+        let pipeline_hz = tick_rate.push(now, stats.tick);
+        self.tick_rate.set(tick_rate);
         if scan_changed || now - self.stats_pushed_ms.get() >= STATS_INTERVAL_MS {
             self.stats_pushed_ms.set(now);
             self.ui.stats.set(Some(stats));
+            Ui::set_if_changed(self.ui.pipeline_hz, pipeline_hz);
         }
     }
 
@@ -597,17 +604,26 @@ impl Core {
         });
     }
 
-    /// Looks at the scene from a rig camera.
+    /// Looks at the scene from the camera of a thumbnail: a rig camera
+    /// of the stage (in orbit around what it aims at), or a sensor of the
+    /// scan head where the scan last saw it (in fly mode).
     pub fn view_from_camera(&self, id: u32) {
-        let view = self.session.borrow().as_ref().and_then(|state| {
-            let info = state.cameras.iter().find(|c| c.id == id)?;
-            let (eye, _) = present::camera_view(info, 1.0);
-            Some(present::camera_view(info, (state.config.rig.target - eye).length().max(0.5)))
-        });
+        let house = self.ui.scene.get_untracked() == Some(SceneKind::House);
+        let view = if house {
+            let camera = self.last_stats.get().and_then(|stats| stats.scan).and_then(|scan| present::sensor_camera(&scan, id));
+            camera.map(|camera| present::camera_view(&camera, 1.0))
+        } else {
+            self.session.borrow().as_ref().and_then(|state| {
+                let info = state.cameras.iter().find(|c| c.id == id)?;
+                let (eye, _) = present::camera_view(info, 1.0);
+                Some(present::camera_view(info, (state.config.rig.target - eye).length().max(0.5)))
+            })
+        };
         if let Some((eye, target)) = view {
+            let nav = if house { NavMode::Fly } else { NavMode::Orbit };
             self.set_display(|d| {
                 d.dollhouse = false;
-                d.nav = NavMode::Orbit;
+                d.nav = nav;
             });
             self.viewer.set_view(eye, target);
         }
@@ -655,7 +671,7 @@ impl Core {
         let bytes = format.encode(&splats);
         match dom::download(&name, &bytes) {
             Ok(()) => self.notify(false, format!("{} splats exportés dans {name}.", crate::logic::format::count(splats.len() as u64))),
-            Err(error) => self.notify(true, format!("L'export a échoué: {error}.")),
+            Err(error) => self.notify(true, format!("L'export a échoué\u{a0}: {error}.")),
         }
     }
 
@@ -887,6 +903,10 @@ impl Core {
     /// Paint counts of the thumbnails, by camera id.
     pub fn preview_paints(&self) -> BTreeMap<u8, u32> {
         self.previews.borrow().iter().map(|(id, tile)| (*id, tile.painted)).collect()
+    }
+
+    pub fn channel(&self) -> Option<&'static str> {
+        self.transport.borrow().as_ref().map(Transport::channel)
     }
 
     pub fn batches_received(&self) -> u64 {

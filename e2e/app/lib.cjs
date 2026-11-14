@@ -3,7 +3,7 @@
 //
 // The check recorder, the IWER (WebXR emulator) injection and the image
 // statistics are the ones of e2e/render.
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -159,8 +159,40 @@ const setSlider = (page, selector, value) =>
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// The native server of the server-mode suites.
+const SERVER_BIN = process.env.GS_SERVER_BIN || path.join(REPO, 'target/release/gs-server');
+
+// Starts gs-server on `port` (LAN listener on `port + 1`) serving `dist`,
+// which must be a COPY of the build (Trunk wipes the original when it
+// rebuilds). Resolves once `/api/info` answers. `args` are extra command
+// line options (`--lan`, `--scene house`); the light preset is the default.
+async function startServer({ dist, certs, port, args = ['--light'] }) {
+  const child = spawn(SERVER_BIN, ['--port', String(port), '--lan-port', String(port + 1), '--dist', dist, '--cert-dir', certs, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', (d) => (output += d));
+  child.stderr.on('data', (d) => (output += d));
+  const exited = new Promise((resolve) => child.on('exit', resolve));
+  const stop = async () => {
+    child.kill('SIGKILL');
+    await exited;
+  };
+  for (let i = 0; i < 150; i++) {
+    // The server takes the next free port when its own is busy.
+    for (const candidate of [port, port + 2, port + 3]) {
+      try {
+        const info = await (await fetch(`http://127.0.0.1:${candidate}/api/info`)).json();
+        if (info.name === 'splat-live') return { child, exited, stop, url: info.http_url, info, output: () => output };
+      } catch {}
+    }
+    if (child.exitCode !== null) break;
+    await sleep(100);
+  }
+  await stop();
+  throw new Error(`gs-server did not start:\n${output}`);
+}
+
 module.exports = {
   REPO, APP, DIST, OUT, PORT, MIME,
   check, results, failures, iwerBundle, imageStats, hasContent,
-  build, serve, newPage, consoleErrors, glWarnings, state, eye, waitState, open, shot, viewShot, diff, content, openPanel, setSlider, sleep,
+  SERVER_BIN, startServer, build, serve, newPage, consoleErrors, glWarnings, state, eye, waitState, open, shot, viewShot, diff, content, openPanel, setSlider, sleep,
 };

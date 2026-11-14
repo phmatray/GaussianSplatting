@@ -8,4 +8,5 @@ pub mod depth;
 pub mod files;
 pub mod format;
 pub mod present;
+pub mod rate;
 pub mod source;

@@ -30,13 +30,19 @@ async function run({ browser, url }) {
   const bar = await page.evaluate(() => document.querySelector('.progress-fill').getBoundingClientRect().width / document.querySelector('.progress').getBoundingClientRect().width);
   check('house: the progress bar follows', Math.abs(bar - s.scan.progress) < 0.08, `bar ${(bar * 100).toFixed(0)} %, scan ${(s.scan.progress * 100).toFixed(0)} %`);
 
-  // The handheld camera: one larger tile, live.
-  await waitState(page, (s) => s.previews.ids.length === 1 && s.previews.painted['0'] > 2, 20000);
-  const tile = await page.evaluate(() => document.querySelector('#tiles .tile').getBoundingClientRect().width);
+  // The scan head: every sensor has its tile, the one that looks ahead is
+  // the large one, and all of them are live.
+  s = await waitState(page, (s) => s.previews.ids.length === 5 && Object.keys(s.previews.painted).length === 5 && s.previews.painted['0'] > 2, 30000);
+  const tiles = await page.evaluate(() => [...document.querySelectorAll('#tiles .tile')].map((t) => ({ width: t.getBoundingClientRect().width, label: t.querySelector('.tile-label').textContent.trim() })));
   const t1 = await thumb(page, 0);
   await waitState(page, (s, n) => s.previews.painted['0'] > n + 3, 20000, (await state(page)).previews.painted['0']);
   const t2 = await thumb(page, 0);
-  check('house: one large live thumbnail for the handheld camera', (await page.locator('#tiles canvas').count()) === 1 && tile > 200 && t1.colors > 8 && t1.hash !== t2.hash, `tile ${tile.toFixed(0)} px wide, ${t1.width}x${t1.height}`);
+  check('house: a live thumbnail for every sensor of the scan head, the forward one large', tiles.length === 5 && tiles[0].width > 200 && tiles.slice(1).every((t) => t.width > 100 && t.width < tiles[0].width) && tiles.map((t) => t.label).join('|') === 'Avant|Arrière gauche|Arrière droite|Haut|Bas' && t1.colors > 8 && t1.hash !== t2.hash,
+    tiles.map((t) => `${t.label} ${t.width.toFixed(0)} px`).join(', '));
+  const side = await thumb(page, 3);
+  check('house: the other sensors show their own picture', side.colors > 2 && side.hash !== t2.hash, `sensor 3: ${side.width}x${side.height}, ${side.colors} colours`);
+  await page.locator('#tiles').scrollIntoViewIfNeeded();
+  await shot(page, 'house-sensors.png');
   await shot(page, 'house-mid-scan.png');
 
   // ---- pause and resume the scan
@@ -46,6 +52,15 @@ async function run({ browser, url }) {
   await sleep(700);
   s = await state(page);
   check('house: Pause stops the scan and keeps the map', s.scan.state === 'paused' && s.layers.static === paused && paused > 0 && (await page.locator('#scan-start').innerText()).trim() === 'Reprendre', `${paused} splats`);
+  // A click on a thumbnail looks through that sensor, where the scan stands.
+  const sensor = s.stats.scan.camera.world_from_cam.slice(12, 15);
+  await page.click('#tiles .tile >> nth=0');
+  s = await waitState(page, (s) => s.nav === 'fly' && !s.display.dollhouse);
+  check('house: a thumbnail click looks through the sensor of the scan head', dist(s.eye, sensor) < 0.01 && s.display.clipY === null && (await page.locator('#toggle-dollhouse').getAttribute('aria-checked')) === 'false', `eye ${s.eye.map((x) => x.toFixed(2)).join(', ')}, sensor ${sensor.map((x) => x.toFixed(2)).join(', ')}`);
+  await sleep(300);
+  await viewShot(page, 'house-through-sensor.png');
+  await page.click('#toggle-dollhouse');
+  await waitState(page, (s) => s.display.dollhouse && s.nav === 'orbit');
   await page.click('#scan-start');
   await waitState(page, (s, n) => s.scan.state === 'scanning' && s.layers.static > n, 30000, paused);
   check('house: Reprendre continues from where it stopped', true);

@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
@@ -127,10 +128,23 @@ fn pem(label: &str, der: &[u8]) -> String {
 /// never leaves half a certificate behind. `private` restricts the file to
 /// its owner where the platform has such a notion.
 fn write_atomic(path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    // A name of its own: two servers started together on the same
+    // directory (the desktop application and a headless one) must not write
+    // through each other's temporary file.
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = format!("{}-{}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    let tmp = path.with_extension(unique);
+    let result = write_then_rename(&tmp, path, contents, private);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_then_rename(tmp: &Path, path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
     {
         let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         if private {
             use std::os::unix::fs::OpenOptionsExt;
@@ -138,11 +152,11 @@ fn write_atomic(path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
         }
         #[cfg(not(unix))]
         let _ = private;
-        let mut file = options.open(&tmp)?;
+        let mut file = options.open(tmp)?;
         file.write_all(contents)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    fs::rename(tmp, path)
 }
 
 fn store(dir: &Path, identity: &Identity) -> io::Result<()> {
@@ -259,7 +273,12 @@ mod tests {
         for name in [CERT_FILE, KEY_FILE, META_FILE] {
             assert!(dir.path().join(name).is_file(), "{name} was not written");
         }
-        assert!(!dir.path().join("key.tmp").exists());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
 
         let (second, fresh) = load_or_create(Some(dir.path()), &[ip(20)], now()).unwrap();
         assert!(!fresh);
@@ -342,6 +361,32 @@ mod tests {
         assert!(load_or_create(Some(dir.path()), &[], now()).unwrap().1);
         fs::remove_file(dir.path().join(KEY_FILE)).unwrap();
         assert!(load_or_create(Some(dir.path()), &[], now()).unwrap().1);
+    }
+
+    #[test]
+    fn servers_started_together_do_not_spoil_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Eight "processes" find the directory empty at the same moment.
+        let racers: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.path().to_path_buf();
+                std::thread::spawn(move || load_or_create(Some(&dir), &[ip(20)], now()).unwrap().0)
+            })
+            .collect();
+        for racer in racers {
+            // Whatever is on disk, each one has an identity it can serve.
+            racer.join().unwrap().server_config().unwrap();
+        }
+        let mut names: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, [META_FILE, CERT_FILE, KEY_FILE], "unexpected files in the certificate directory");
+        // The files may come from different racers (then the set is
+        // replaced once), but from here on the certificate is stable.
+        let (first, _) = load_or_create(Some(dir.path()), &[ip(20)], now()).unwrap();
+        let (second, fresh) = load_or_create(Some(dir.path()), &[ip(20)], now()).unwrap();
+        assert!(!fresh);
+        assert_eq!(second.fingerprint(), first.fingerprint());
     }
 
     #[test]

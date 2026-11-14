@@ -3,7 +3,7 @@
 //! imported file, the view of one rig camera).
 
 use glam::{Mat4, Vec3};
-use gs_core::protocol::{CameraInfo, ScanState, ScanStats, SessionState};
+use gs_core::protocol::{CameraInfo, ScanHead, ScanState, ScanStats, SessionState};
 use gs_core::scene::SceneKind;
 use gs_core::{Aabb, Splat};
 use gs_render::{FrustumGizmo, GizmoScene, GridGizmo, NavMode, SceneHints};
@@ -57,14 +57,54 @@ pub fn dollhouse_clip(state: &SessionState) -> Option<f32> {
     state.ceiling_height.filter(|h| h.is_finite()).map(|h| h - DOLLHOUSE_CLIP_MARGIN)
 }
 
+/// Ids of the cameras that have a thumbnail: the ring cameras of the
+/// stage, the sensors of the scan head in the house (their previews carry
+/// the sensor id).
+pub fn camera_ids(state: &SessionState) -> Vec<u32> {
+    match state.config.scene {
+        SceneKind::Stage => state.cameras.iter().map(|c| c.id).collect(),
+        SceneKind::House => (0..state.config.scan.head.sensor_count()).collect(),
+    }
+}
+
+/// Name of one sensor of the scan head, from the way it is mounted. A
+/// head with a single sensor is simply the mobile camera.
+pub fn sensor_label(head: ScanHead, id: u32) -> &'static str {
+    let mounts = head.mounts();
+    let Some(mount) = mounts.get(id as usize) else { return "Capteur" };
+    if mounts.len() == 1 {
+        "Caméra mobile"
+    } else if mount.pitch_deg > 1.0 {
+        "Haut"
+    } else if mount.pitch_deg < -1.0 {
+        "Bas"
+    } else if mount.yaw_deg > 1.0 {
+        "Arrière gauche"
+    } else if mount.yaw_deg < -1.0 {
+        "Arrière droite"
+    } else {
+        "Avant"
+    }
+}
+
+/// Current pose of sensor `id` of the scan head.
+pub fn sensor_camera(scan: &ScanStats, id: u32) -> Option<CameraInfo> {
+    if id == 0 {
+        Some(scan.camera)
+    } else {
+        scan.extra_cameras.as_slice().iter().find(|c| c.id == id).copied()
+    }
+}
+
 fn frustum(info: &CameraInfo, color: [f32; 3], size: f32) -> FrustumGizmo {
     let aspect = if info.height > 0 { info.width as f32 / info.height as f32 } else { 4.0 / 3.0 };
     FrustumGizmo { world_from_cam: Mat4::from_cols_array(&info.world_from_cam), fov_y: info.fov_y, aspect, color, size }
 }
 
 /// The gizmos of a session: the rig cameras and a floor grid on the stage;
-/// the scan path and the handheld camera in the house while it is being
-/// scanned. Once the scan is done the house is shown bare, for walking
+/// the scan path and the sensor head in the house while it is being
+/// scanned (the sensor that looks ahead stands out, the others are drawn
+/// smaller). Once the scan is done the house is shown bare, for walking
 /// through it.
 pub fn gizmos(state: &SessionState, scan: Option<&ScanStats>) -> GizmoScene {
     match state.config.scene {
@@ -79,10 +119,10 @@ pub fn gizmos(state: &SessionState, scan: Option<&ScanStats>) -> GizmoScene {
                 return GizmoScene::default();
             }
             let path = state.scan.as_ref().map(|s| s.path.iter().map(|p| Vec3::from_array(*p)).collect()).unwrap_or_default();
-            let handheld = scan
-                .filter(|s| matches!(s.state, ScanState::Scanning | ScanState::Paused))
-                .map(|s| frustum(&s.camera, HANDHELD_COLOR, 0.35));
-            GizmoScene { path, handheld, ..GizmoScene::default() }
+            let head = scan.filter(|s| matches!(s.state, ScanState::Scanning | ScanState::Paused));
+            let handheld = head.map(|s| frustum(&s.camera, HANDHELD_COLOR, 0.35));
+            let frusta = head.map(|s| s.extra_cameras.as_slice().iter().map(|c| frustum(c, HANDHELD_COLOR, 0.18)).collect()).unwrap_or_default();
+            GizmoScene { path, handheld, frusta, ..GizmoScene::default() }
         }
     }
 }
@@ -265,6 +305,71 @@ mod tests {
         assert_eq!(default_nav(SceneKind::House), NavMode::Fly);
         assert!(default_splat_scale(SceneKind::House) > default_splat_scale(SceneKind::Stage));
         assert_eq!(default_splat_scale(SceneKind::Stage), 1.0);
+    }
+
+    /// Statistics of a house whose scan has just started.
+    fn scanning_stats(head: ScanHead) -> (SessionState, ScanStats) {
+        let mut config = PipelineConfig::light(SceneKind::House);
+        config.scan.head = head;
+        config.scan.width = 32;
+        config.scan.height = 24;
+        let mut pipeline = Pipeline::new(config);
+        let state = pipeline.state();
+        for _ in 0..20 {
+            let stats = pipeline.tick(0.05).into_iter().rev().find_map(|m| match gs_core::codec::decode(&m.bytes).unwrap().body {
+                gs_core::codec::Body::Stats(json) => serde_json::from_str::<gs_core::protocol::Stats>(&json).ok(),
+                _ => None,
+            });
+            if let Some(scan) = stats.and_then(|s| s.scan).filter(|s| s.state == ScanState::Scanning && s.progress > 0.0) {
+                return (state, scan);
+            }
+        }
+        panic!("the scan did not start");
+    }
+
+    #[test]
+    fn every_sensor_of_the_scan_head_has_a_tile_a_name_and_a_gizmo() {
+        let (state, scan) = scanning_stats(ScanHead::Surround);
+        let ids = camera_ids(&state);
+        assert_eq!(ids, [0, 1, 2, 3, 4]);
+        let labels: Vec<&str> = ids.iter().map(|id| sensor_label(ScanHead::Surround, *id)).collect();
+        assert_eq!(labels, ["Avant", "Arrière gauche", "Arrière droite", "Haut", "Bas"]);
+
+        // The names say where the sensors really look, relative to the one
+        // that looks ahead.
+        let axes = |info: &CameraInfo| {
+            let m = Mat4::from_cols_array(&info.world_from_cam);
+            (m.transform_vector3(Vec3::NEG_Z), m.transform_vector3(Vec3::X))
+        };
+        let (ahead, right) = axes(&sensor_camera(&scan, 0).unwrap());
+        for id in 1..5 {
+            let camera = sensor_camera(&scan, id).expect("pose of every sensor");
+            assert_eq!(camera.id, id);
+            let (forward, _) = axes(&camera);
+            match sensor_label(ScanHead::Surround, id) {
+                "Arrière gauche" => assert!(forward.dot(ahead) < 0.0 && forward.dot(right) < -0.5, "{id}: {forward}"),
+                "Arrière droite" => assert!(forward.dot(ahead) < 0.0 && forward.dot(right) > 0.5, "{id}: {forward}"),
+                "Haut" => assert!(forward.y > ahead.y + 0.5, "{id}: {forward}"),
+                "Bas" => assert!(forward.y < ahead.y - 0.5, "{id}: {forward}"),
+                other => panic!("unexpected label {other}"),
+            }
+        }
+        assert_eq!(sensor_camera(&scan, 9), None);
+
+        let scene = gizmos(&state, Some(&scan));
+        assert!(scene.handheld.is_some());
+        assert_eq!(scene.frusta.len(), 4);
+        assert!(scene.frusta.iter().all(|f| f.size < scene.handheld.unwrap().size));
+
+        // A head with one sensor is the mobile camera, alone.
+        let (state, scan) = scanning_stats(ScanHead::Single);
+        assert_eq!(camera_ids(&state), [0]);
+        assert_eq!(sensor_label(ScanHead::Single, 0), "Caméra mobile");
+        assert_eq!(sensor_label(ScanHead::Single, 3), "Capteur");
+        let scene = gizmos(&state, Some(&scan));
+        assert!(scene.handheld.is_some() && scene.frusta.is_empty());
+        // The stage lists its ring cameras.
+        assert_eq!(camera_ids(&stage_state()), [0, 1, 2, 3, 4]);
     }
 
     #[test]
