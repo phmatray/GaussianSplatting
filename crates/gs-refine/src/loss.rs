@@ -55,7 +55,14 @@ fn kernel() -> [f32; TAPS] {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct LossWeights {
-    /// `λ`: share of the structural term in the photometric loss.
+    /// `λ`: share of the structural term in the photometric loss. The
+    /// usual 0.2 is a trade: measured on two simulated rooms (1 500
+    /// iterations at 480 px), `0` scored 0.4 to 0.5 dB higher from
+    /// viewpoints a meter from the phone's path, with a third fewer
+    /// Gaussians and a quarter less time, and 0.5 to 0.6 dB lower at the
+    /// phone's own poses (0.2 to 0.3 dB lower 27 cm beside them). To the
+    /// eye the two were equally sharp, and without the structural term the
+    /// halos around what lies beyond the sensor's range were larger.
     pub ssim: f32,
     pub depth: f32,
     pub alpha: f32,

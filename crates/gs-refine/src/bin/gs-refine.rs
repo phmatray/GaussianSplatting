@@ -286,6 +286,15 @@ impl Reporter {
     }
 }
 
+/// Writes a file through a temporary one beside it, so that a second
+/// Ctrl-C (which quits at once) never leaves half a result under its name.
+fn write_whole(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)).map_err(|e| format!("impossible d'écrire {} : {e}", path.display()))
+}
+
 fn refine(args: &Args) -> Result<ExitCode, String> {
     let quiet = args.flag(&["--silencieux"]);
     let resume = args.value(&["--reprise"]).map(PathBuf::from);
@@ -349,15 +358,14 @@ fn refine(args: &Args) -> Result<ExitCode, String> {
     reporter.end_line();
 
     let splats = job.splats();
-    std::fs::write(&output, gs_core::io::write_ply(&splats)).map_err(|e| format!("impossible d'écrire {} : {e}", output.display()))?;
+    write_whole(&output, &gs_core::io::write_ply(&splats))?;
     if args.flag(&["--splat"]) {
-        let path = output.with_extension("splat");
-        std::fs::write(&path, gs_core::io::write_splat(&splats)).map_err(|e| format!("impossible d'écrire {} : {e}", path.display()))?;
+        write_whole(&output.with_extension("splat"), &gs_core::io::write_splat(&splats))?;
     }
     let report = job.report();
     let report_path = output.with_extension("json");
     let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    std::fs::write(&report_path, json).map_err(|e| format!("impossible d'écrire {} : {e}", report_path.display()))?;
+    write_whole(&report_path, json.as_bytes())?;
     if outcome.completed {
         let _ = std::fs::remove_file(&checkpoint);
     }

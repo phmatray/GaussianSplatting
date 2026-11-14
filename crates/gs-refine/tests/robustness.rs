@@ -470,26 +470,17 @@ fn photographs_can_be_fitted_only_where_the_sensor_measured() {
     assert_eq!(measured.class[h / 2 * w + w / 2], gs_refine::loss::IGNORE);
     assert_eq!(measured.class[3], gs_refine::loss::IGNORE);
 
-    // A job with the option runs, improves, and adds no more Gaussians
-    // than one that paints the holes.
-    let run = |beyond: bool| {
-        let mut config = tiny_config(150);
-        config.train.photo_beyond_sensor = beyond;
-        let mut job = prepare(&written.path, config);
-        job.run(&CancelToken::default(), &mut |_| {}).unwrap();
-        let report = job.report();
-        assert!(report.refined.unwrap().psnr > report.start.unwrap().psnr, "beyond {beyond}");
-        // Coverage of the middle of a training view, where the sensor had nothing.
-        let view = job.trainer.views[5];
-        let cam = view.cam.resized(96, 72);
-        let mut out = Rendered::default();
-        CpuRasterizer::default().forward(job.result().0, &View::from_camera(&cam, [0.0; 3]), &mut out);
-        let inside: f32 = (30..42).flat_map(|y| (40..56).map(move |x| (x, y))).map(|(x, y)| out.alpha[y * 96 + x]).sum::<f32>() / (12.0 * 16.0);
-        (inside, job.result().0.len())
-    };
-    let (painted, measured_only) = (run(true), run(false));
-    eprintln!("coverage of the area without depth: {:.3} when painted, {:.3} when measured only; {} and {} Gaussians", painted.0, measured_only.0, painted.1, measured_only.1);
-    assert!(measured_only.0 <= painted.0 + 0.02, "measured only covers more of the hole: {:.3} against {:.3}", measured_only.0, painted.0);
+    // A job with the option runs and improves on the held-out photographs
+    // (which are scored whole, as always). What the option does to holes
+    // is measured in `examples/refine_lab.rs` (`--depth-hole`): at this
+    // size every surface is seen with depth by some frame.
+    let mut config = tiny_config(150);
+    config.train.photo_beyond_sensor = false;
+    let mut job = prepare(&written.path, config);
+    assert!(job.run(&CancelToken::default(), &mut |_| {}).unwrap().completed);
+    let report = job.report();
+    assert!(report.refined.unwrap().psnr > report.start.unwrap().psnr);
+    assert!(job.result().0.data.iter().flatten().all(|v| v.is_finite()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
