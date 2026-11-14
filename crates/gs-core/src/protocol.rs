@@ -24,6 +24,16 @@ use crate::types::{Aabb, Camera};
 /// Bumped on incompatible changes.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Splat scale a viewer applies to the pipeline's layers in the *sorted*
+/// blending mode of `docs/ARCHITECTURE.md`.
+///
+/// The clouds are sized for the normalised mode, where the splats of a
+/// surface only have to touch: ring splats of 0.45 pixel footprints that the
+/// multi-view fusion no longer stacks eight deep, scan splats of 0.45 cell.
+/// Composited as translucent discs they leave the surface open (the stage
+/// loses 5 dB); 1.4 times larger they close it again.
+pub const SORTED_SPLAT_SCALE: f32 = 1.4;
+
 /// `value` when it is a finite number, `fallback` otherwise, then clamped.
 #[inline]
 fn finite_clamp(value: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
@@ -113,10 +123,12 @@ impl ScanHead {
 #[serde(default)]
 pub struct ScanConfig {
     /// Edge length of a fusion cell in meters (one splat per cell). The
-    /// splat count grows with its inverse square: about 277 000 for the
-    /// whole house at 4 cm, 424 000 at 3.2 cm, 484 000 at 3 cm, 695 000 at
-    /// 2.5 cm, for a gain of roughly 0.1 dB of held-out PSNR per 50 000
-    /// splats.
+    /// cells, not the sensor, limit the fidelity of the scan, and the splat
+    /// count grows with the inverse square of their size: about 280 000 for
+    /// the whole house at 4 cm, 424 000 at 3.2 cm, 756 000 at 2.4 cm (the
+    /// default, 12 MB on the wire) and 1.7 million at 1.6 cm. Held-out views
+    /// at 1280x960 under normalised blending gain 0.9 dB from 3.2 to 2.4 cm
+    /// and 0.7 dB more at 1.6 cm.
     pub voxel_size: f32,
     /// Cruise walking speed along the scan path in meters per second.
     pub speed: f32,
@@ -143,14 +155,20 @@ pub struct ScanConfig {
     pub autostart: bool,
     /// The sensor head that is carried through the house.
     pub head: ScanHead,
-    /// Tangential standard deviation of a scan splat in cells.
+    /// Tangential standard deviation of a scan splat in cells. The default
+    /// of 0.45 is sized for the normalised blending mode of
+    /// `docs/ARCHITECTURE.md`: its visibility discs (1.6 standard
+    /// deviations) then just close the cell grid, and anything larger blurs
+    /// (0.6 costs 1.2 dB there). Sorted "over" compositing needs 0.6 for a
+    /// closed surface, which a viewer in that mode applies as a splat scale
+    /// of 1.35.
     pub kernel: f32,
 }
 
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
-            voxel_size: 0.032,
+            voxel_size: 0.024,
             speed: ScanPath::DEFAULT_SPEED,
             fov_y_deg: 80.0,
             width: 192,
@@ -159,7 +177,7 @@ impl Default for ScanConfig {
             frames_per_second: 6.0,
             autostart: true,
             head: ScanHead::default(),
-            kernel: 0.6,
+            kernel: 0.45,
         }
     }
 }
@@ -266,13 +284,20 @@ impl PipelineConfig {
     pub const MAX_RIG_WIDTH: u32 = 640;
     pub const MAX_RIG_HEIGHT: u32 = 480;
     /// Upper bound on the pixels all ring cameras capture per tick together
-    /// (about sixteen 320x240 cameras). Larger rigs are scaled down.
+    /// (about sixteen 320x240 cameras, or the largest ring of 24 at the
+    /// default 240x180). Larger rigs are scaled down.
     pub const MAX_RIG_PIXELS: u64 = 1_250_000;
 
-    /// The default configuration for a scene: eight 160x120 cameras for the
-    /// stage; a handheld head of five 192x144 sensors with an 80 degree
-    /// vertical field of view and 3.2 cm cells for the house (about 424 000
-    /// splats for the whole scan, a walk of 67 s).
+    /// The image sizes of the ring cameras a user interface should offer:
+    /// the light preset's, the default and the finest that still ticks at
+    /// 30 Hz on four desktop cores (its live layer is 10 MB/s).
+    pub const RIG_RESOLUTIONS: [(u32, u32); 3] = [(160, 120), (240, 180), (320, 240)];
+
+    /// The default configuration for a scene: eight 240x180 cameras for the
+    /// stage, fused across views (about 83 000 static splats and 12 600 live
+    /// ones, 6 MB/s at 30 Hz); a handheld head of five 192x144 sensors with
+    /// an 80 degree vertical field of view and 2.4 cm cells for the house
+    /// (about 756 000 splats for the whole scan, a walk of 67 s).
     pub fn for_scene(scene: SceneKind) -> Self {
         Self {
             scene,
@@ -291,14 +316,16 @@ impl PipelineConfig {
     }
 
     /// A lighter configuration for single-threaded WebAssembly on a laptop or
-    /// a standalone headset: six 120x90 ring cameras at 20 Hz, and a scan
-    /// head of 144x108 sensors taking 5 frames per second into 4 cm cells
-    /// (about 280 000 splats).
+    /// a standalone headset: eight 160x120 ring cameras at 20 Hz (about
+    /// 37 000 static and 6 000 live splats), and a scan head of 144x108
+    /// sensors taking 5 frames per second into 3.2 cm cells (about 430 000
+    /// splats). On one native core a stage tick takes 10 ms and a scan tick
+    /// 11 ms on average, 16 ms at the 95th percentile.
     pub fn light(scene: SceneKind) -> Self {
         Self {
-            rig: RingRig { count: 6, width: 120, height: 90, ..RingRig::default() },
+            rig: RingRig { width: 160, height: 120, ..RingRig::default() },
             target_hz: 20.0,
-            scan: ScanConfig { voxel_size: 0.04, width: 144, height: 108, frames_per_second: 5.0, ..ScanConfig::default() },
+            scan: ScanConfig { voxel_size: 0.032, width: 144, height: 108, frames_per_second: 5.0, ..ScanConfig::default() },
             preview: PreviewConfig { max_width: 64, ..PreviewConfig::default() },
             ..Self::for_scene(scene)
         }
@@ -665,6 +692,62 @@ pub enum ControlMsg {
 mod tests {
     use super::*;
 
+    /// The configurations a build of the last commit before the quality
+    /// round (d1a8e3f) wrote, verbatim: the default stage and the light,
+    /// noisy house.
+    const D1A8E3F_STAGE: &str = r#"{"background_subtraction":true,"noise":{"color_sigma":0.0,"depth_sigma_at_1m":0.0,"dropout":0.0},"paused":false,"preview":{"cameras_per_tick":1,"enabled":false,"max_width":96},"recon":{"background":{"color_threshold":20.0,"depth_margin":0.019999999552965164,"depth_sigma_at_1m":0.001500000013038516,"min_neighbors":2,"noise_sigmas":4.0,"shadow_lift":0.6000000238418579},"edge_shrink":0.5,"edge_threshold":0.029999999329447746,"footprint":0.44999998807907104,"max_anisotropy":4.0,"min_cos":0.20000000298023224,"min_support":1,"opacity":0.8500000238418579,"smooth_passes":2,"thickness":0.10000000149011612},"rig":{"count":8,"elevation":1.2999999523162842,"fov_y_deg":50.0,"height":120,"radius":3.200000047683716,"target":[0.0,1.0,0.0],"tiers":2,"upper_elevation":2.5,"width":160},"scan":{"autostart":false,"fov_y_deg":80.0,"frames_per_second":6.0,"head":"surround","height":144,"max_range":6.0,"speed":0.800000011920929,"voxel_size":0.03200000151991844,"width":192},"scene":"stage","shadows":true,"target_hz":30.0,"time_scale":1.0}"#;
+    const D1A8E3F_HOUSE_LIGHT: &str = r#"{"background_subtraction":true,"noise":{"color_sigma":2.0,"depth_sigma_at_1m":0.001500000013038516,"dropout":0.009999999776482582},"paused":false,"preview":{"cameras_per_tick":1,"enabled":false,"max_width":64},"recon":{"background":{"color_threshold":20.0,"depth_margin":0.019999999552965164,"depth_sigma_at_1m":0.001500000013038516,"min_neighbors":2,"noise_sigmas":4.0,"shadow_lift":0.6000000238418579},"edge_shrink":0.5,"edge_threshold":0.029999999329447746,"footprint":0.44999998807907104,"max_anisotropy":4.0,"min_cos":0.20000000298023224,"min_support":1,"opacity":0.8500000238418579,"smooth_passes":2,"thickness":0.10000000149011612},"rig":{"count":6,"elevation":1.2999999523162842,"fov_y_deg":50.0,"height":90,"radius":3.200000047683716,"target":[0.0,1.0,0.0],"tiers":2,"upper_elevation":2.5,"width":120},"scan":{"autostart":false,"fov_y_deg":80.0,"frames_per_second":5.0,"head":"surround","height":108,"max_range":6.0,"speed":0.800000011920929,"voxel_size":0.03999999910593033,"width":144},"scene":"house","shadows":true,"target_hz":20.0,"time_scale":1.0}"#;
+
+    #[test]
+    fn configurations_of_the_previous_release_parse_verbatim() {
+        let stage: PipelineConfig = serde_json::from_str(D1A8E3F_STAGE).unwrap();
+        // Everything that release wrote is kept, the sizes it ran at included
+        // (they are not this release's defaults any more).
+        assert_eq!((stage.rig.count, stage.rig.width, stage.rig.height), (8, 160, 120));
+        assert_eq!((stage.scan.voxel_size, stage.recon.edge_shrink, stage.recon.footprint), (0.032, 0.5, 0.45));
+        assert!(!stage.preview.enabled && !stage.scan.autostart && stage.noise.is_none());
+        // What it did not know takes this release's defaults.
+        assert_eq!(stage.fusion, MultiViewParams::default());
+        assert_eq!((stage.scan.kernel, stage.recon.background.edge_shrink), (0.45, 0.3));
+        // Nothing in it needs sanitising, and it differs from today's default
+        // in exactly the settings whose defaults moved.
+        assert_eq!(stage.sanitized(), stage);
+        let mut today = PipelineConfig::for_scene(SceneKind::Stage);
+        (today.rig.width, today.rig.height, today.scan.voxel_size) = (160, 120, 0.032);
+        (today.preview.enabled, today.scan.autostart) = (false, false);
+        assert_eq!(stage, today);
+
+        let house: PipelineConfig = serde_json::from_str(D1A8E3F_HOUSE_LIGHT).unwrap();
+        assert_eq!(house.scene, SceneKind::House);
+        assert_eq!((house.rig.count, house.rig.width, house.scan.width, house.scan.voxel_size), (6, 120, 144, 0.04));
+        assert_eq!((house.target_hz, house.noise, house.scan.head), (20.0, NoiseModel::realistic(), ScanHead::Surround));
+        assert_eq!(house.sanitized(), house);
+
+        // The messages that release sent and received.
+        let control = format!(r#"{{"type":"set_config","config":{D1A8E3F_STAGE}}}"#);
+        assert_eq!(serde_json::from_str::<ControlMsg>(&control).unwrap(), ControlMsg::SetConfig { config: stage });
+        let stats = r#"{"tick":7,"scene_time":0.25,"capture_ms":6.1,"reconstruct_ms":1.4,"encode_ms":0.3,"total_ms":7.9,
+            "tick_hz":29.5,"splats_static":68856,"splats_dynamic":9079,"bytes":170000,"pixels":153600,"scan":null}"#;
+        let stats: Stats = serde_json::from_str(stats).unwrap();
+        assert_eq!((stats.tick, stats.splats_static, stats.pixels, stats.fuse_ms), (7, 68856, 153_600, 0.0));
+        assert!(stats.scan.is_none());
+        // And back: that release's reader ignores unknown fields, so what it
+        // reads of today's messages is today's values of the fields it knew.
+        let json = serde_json::to_value(PipelineConfig::default()).unwrap();
+        let old: serde_json::Value = serde_json::from_str(D1A8E3F_STAGE).unwrap();
+        fn keys_are_kept(old: &serde_json::Value, new: &serde_json::Value, path: &str) {
+            if let (Some(old), Some(new)) = (old.as_object(), new.as_object()) {
+                for (key, value) in old {
+                    let found = new.get(key).unwrap_or_else(|| panic!("{path}{key} is gone from the configuration"));
+                    assert_eq!(value.is_object(), found.is_object(), "{path}{key} changed its shape");
+                    assert!(value.is_object() || std::mem::discriminant(value) == std::mem::discriminant(found), "{path}{key} changed its type");
+                    keys_are_kept(value, found, &format!("{path}{key}."));
+                }
+            }
+        }
+        keys_are_kept(&old, &json, "");
+    }
+
     #[test]
     fn default_config_is_already_sane() {
         for kind in [SceneKind::Stage, SceneKind::House] {
@@ -739,9 +822,21 @@ mod tests {
                     "frames_per_second":6.0,"autostart":true},
             "preview":{"enabled":true,"max_width":96,"cameras_per_tick":1}}"#;
         let config: PipelineConfig = serde_json::from_str(config).unwrap();
-        // The head is the new default; everything that was sent is kept.
-        assert_eq!(config.scan, ScanConfig { fov_y_deg: 90.0, ..ScanConfig::default() });
+        // The head is the new default; everything that was sent is kept, and
+        // what came later (the splat kernel of the scan, the multi-view
+        // fusion of the ring) takes its default.
+        assert_eq!(config.scan, ScanConfig { fov_y_deg: 90.0, voxel_size: 0.032, ..ScanConfig::default() });
+        assert_eq!((config.scan.kernel, config.fusion), (0.45, MultiViewParams::default()));
+        assert!(config.fusion.enabled);
         assert_eq!(config.sanitized(), config);
+        // Hostile values of the new fields are tamed like the old ones.
+        let wild = r#"{"scan":{"kernel":1e30},"fusion":{"margin":-5,"tolerance":1e9,"min_normal_dot":7}}"#;
+        let wild: PipelineConfig = serde_json::from_str(wild).unwrap();
+        let tame = wild.sanitized();
+        assert_eq!((tame.scan.kernel, tame.fusion.margin, tame.fusion.tolerance, tame.fusion.min_normal_dot), (1.5, 0.0, 0.5, 1.0));
+        let mut nan = PipelineConfig::default();
+        (nan.scan.kernel, nan.fusion.margin) = (f32::NAN, f32::NAN);
+        assert_eq!(nan.sanitized(), PipelineConfig::default());
         let control = r#"{"type":"set_config","config":{"scene":"house","scan":{"voxel_size":0.04}}}"#;
         let ControlMsg::SetConfig { config } = serde_json::from_str(control).unwrap() else { panic!() };
         assert_eq!((config.scan.head, config.scan.voxel_size), (ScanHead::Surround, 0.04));
@@ -754,6 +849,7 @@ mod tests {
         let stats: Stats = serde_json::from_str(stats).unwrap();
         let scan = stats.scan.unwrap();
         assert_eq!((stats.tick, scan.state, scan.camera.width), (12, ScanState::Scanning, 192));
+        assert_eq!(stats.fuse_ms, 0.0);
         assert!(scan.extra_cameras.is_empty());
         // And the other way: a reader that ignores unknown fields, as every
         // struct here does, loses nothing but the extra sensors.

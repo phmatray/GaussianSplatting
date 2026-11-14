@@ -23,10 +23,11 @@
 //! 3. **Accumulation.** Every splat again, 3 σ quads, `blendFunc(ONE, ONE)`,
 //!    no depth attachment: the fragment shader compares its depth two-sided
 //!    with the visibility texture(s) and adds `(w·colour, w)` to the
-//!    `RGBA16F` target of the surface it lies on. The soft level has two
-//!    such targets and a third (`RG16F` where the GPU renders to it, else
-//!    `RGBA16F`) for the coverage of each surface, which is accumulated
-//!    without the layer weight.
+//!    `RGBA16F` target of the surface it lies on (the soft level has two).
+//!    One more target (`RG16F` where the GPU renders to it, else `RGBA16F`)
+//!    takes the coverage, which is accumulated without the layer weight:
+//!    of each surface at the soft level; at the hard level of the pixels no
+//!    visibility disc reaches, with a flag for the others.
 //! 4. **Resolve.** One triangle into the destination (canvas, XR layer
 //!    framebuffer or snapshot target) with `blendFunc(ONE,
 //!    ONE_MINUS_SRC_ALPHA)`: premultiplied colour over whatever was cleared
@@ -78,9 +79,8 @@ impl Recipe {
             BlendQuality::Soft => (WblendOptions::normalized_soft(), Silhouette::SoftOverNextSurface),
         };
         let Blend::Normalized(n) = preset.blend else { panic!("the preset is not normalised") };
-        let coverage_tau = match (quality, n.coverage) {
-            (BlendQuality::Hard, Coverage::None) => 1.0,
-            (BlendQuality::Soft, Coverage::Linear(tau)) if tau > 0.0 => tau,
+        let coverage_tau = match n.coverage {
+            Coverage::Linear(tau) if tau > 0.0 => tau,
             other => panic!("coverage rule {other:?} is not implemented by the shaders"),
         };
         assert!(
@@ -321,7 +321,7 @@ mod gl {
         soft: bool,
         /// One depth texture and its framebuffer per visibility pass.
         depth: Vec<(WebGlTexture, WebGlFramebuffer)>,
-        /// `[front]`, or `[front, back, cover]` for the soft level.
+        /// `[front, cover]`, or `[front, back, cover]` for the soft level.
         color: Vec<WebGlTexture>,
         accumulate: WebGlFramebuffer,
     }
@@ -392,14 +392,15 @@ mod gl {
             let attach = |index: u32, texture: &WebGlTexture| {
                 gl.framebuffer_texture_2d(GL::FRAMEBUFFER, GL::COLOR_ATTACHMENT0 + index, GL::TEXTURE_2D, Some(texture), 0);
             };
-            self.color.push(texture(gl, GL::RGBA16F, width, height)?);
-            attach(0, &self.color[0]);
-            if !self.soft {
-                return complete("accumulation");
+            let buffers = js_sys::Array::new();
+            for index in 0..if self.soft { 2 } else { 1 } {
+                let sums = texture(gl, GL::RGBA16F, width, height)?;
+                attach(index, &sums);
+                self.color.push(sums);
+                buffers.push(&(GL::COLOR_ATTACHMENT0 + index).into());
             }
-            self.color.push(texture(gl, GL::RGBA16F, width, height)?);
-            attach(1, &self.color[1]);
-            let buffers = js_sys::Array::of3(&GL::COLOR_ATTACHMENT0.into(), &GL::COLOR_ATTACHMENT1.into(), &GL::COLOR_ATTACHMENT2.into());
+            let cover_index = buffers.length();
+            buffers.push(&(GL::COLOR_ATTACHMENT0 + cover_index).into());
             gl.draw_buffers(&buffers);
             // The coverage needs two channels. RG16F is renderable with
             // EXT_color_buffer_float; with only the half-float extension
@@ -407,7 +408,7 @@ mod gl {
             let mut result = Ok(());
             for format in [GL::RG16F, GL::RGBA16F] {
                 let cover = texture(gl, format, width, height)?;
-                attach(2, &cover);
+                attach(cover_index, &cover);
                 result = complete("accumulation");
                 if result.is_ok() {
                     self.color.push(cover);
@@ -553,8 +554,8 @@ mod gl {
             bind(UNIT_FRONT, &targets.color[0]);
             if soft {
                 bind(UNIT_BACK, &targets.color[1]);
-                bind(UNIT_COVER, &targets.color[2]);
             }
+            bind(UNIT_COVER, targets.color.last().expect("the coverage target"));
             gl.use_program(Some(&level.resolve.program));
             gl.uniform2i(level.resolve.origin.as_ref(), x, y);
             gl.uniform1f(level.resolve.inv_tau.as_ref(), 1.0 / recipe.coverage_tau);
@@ -594,7 +595,7 @@ mod tests {
     fn recipes_follow_the_presets() {
         let hard = Recipe::of(BlendQuality::Hard);
         let soft = Recipe::of(BlendQuality::Soft);
-        assert_eq!((hard.visibility_sigma, hard.cutoff_sigma, hard.depth_tolerance), (1.6, 3.0, 0.01));
+        assert_eq!((hard.visibility_sigma, hard.cutoff_sigma, hard.depth_tolerance, hard.coverage_tau), (1.6, 3.0, 0.01, 0.5));
         assert_eq!((soft.visibility_sigma, soft.cutoff_sigma, soft.depth_tolerance, soft.coverage_tau), (2.0, 3.0, 0.01, 0.5));
     }
 

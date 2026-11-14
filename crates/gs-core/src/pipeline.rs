@@ -1059,6 +1059,7 @@ impl Pipeline {
                     || new.shadows != old.shadows
                     || new.noise != old.noise
                     || new.recon != old.recon
+                    || new.fusion != old.fusion
                     || new.background_subtraction != old.background_subtraction;
                 if !rebuild {
                     return vec![self.encode_state()];
@@ -1071,7 +1072,9 @@ impl Pipeline {
             }
             Mode::House(house) => {
                 house.fusion.max_range = new.scan.max_range;
+                // The splat kernel is baked into every fused cell.
                 let restart = new.scan.voxel_size != old.scan.voxel_size
+                    || new.scan.kernel != old.scan.kernel
                     || new.scan.speed != old.scan.speed
                     || new.scan.frames_per_second != old.scan.frames_per_second
                     || new.scan.head != old.scan.head;
@@ -1365,6 +1368,147 @@ mod tests {
         pipeline.handle_control(ControlMsg::SetConfig { config: hostile });
         assert_eq!(pipeline.config().rig.count, RingRig::MAX_COUNT);
         assert_eq!(pipeline.config().target_hz, PipelineConfig::default().target_hz);
+    }
+
+    #[test]
+    fn fusion_and_kernel_changes_take_effect_at_once() {
+        // The ring fusion shapes the static layer too: switching it must
+        // resend layer 0, also while paused, and match a fresh pipeline.
+        let stacked = {
+            let mut config = small_stage();
+            config.fusion.enabled = false;
+            config
+        };
+        let mut pipeline = Pipeline::new(small_stage());
+        pipeline.tick(0.7);
+        let fused = (pipeline.static_splats().len(), pipeline.dynamic_splats().len());
+        pipeline.handle_control(ControlMsg::SetPaused { paused: true });
+        let out = pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"fusion":{"enabled":false}}}"#).unwrap();
+        assert_eq!(kinds(&out), [Kind::State, Kind::Layer, Kind::Layer, Kind::Stats]);
+        assert!(!state_of(&out[0]).config.fusion.enabled);
+        let mut fresh = Pipeline::new(stacked);
+        fresh.tick(0.7);
+        assert_eq!(layer_of(&out[1]).splats.len(), fresh.static_splats().len());
+        assert_eq!(pipeline.static_splats(), fresh.static_splats());
+        assert_eq!(pipeline.dynamic_splats(), fresh.dynamic_splats());
+        assert!(fused.0 < fresh.static_splats().len() && fused.1 < fresh.dynamic_splats().len(), "fusion drops splats");
+        // A margin is a new fusion as well; the same one is not.
+        let out = pipeline
+            .handle_control_json(r#"{"type":"patch_config","patch":{"fusion":{"enabled":true,"margin":0.0}}}"#)
+            .unwrap();
+        assert_eq!(kinds(&out), [Kind::State, Kind::Layer, Kind::Layer, Kind::Stats]);
+        assert!(pipeline.static_splats().len() < fused.0, "no margin keeps a single camera per surface point");
+        let out = pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"fusion":{"margin":0.0}}}"#).unwrap();
+        assert_eq!(kinds(&out), [Kind::State]);
+
+        // The splat kernel of the scan is part of every fused cell: a new
+        // one starts the scan over, as a new cell size does.
+        let mut config = small_house();
+        config.scan.autostart = true;
+        let mut pipeline = Pipeline::new(config);
+        for _ in 0..40 {
+            pipeline.tick(0.1);
+        }
+        assert!(pipeline.scene_time() > 0.0 && !pipeline.static_splats().is_empty());
+        let sigma = |p: &Pipeline| p.static_splats().iter().map(|s| s.scale[0].max(s.scale[1])).fold(0.0, f32::max);
+        let before = sigma(&pipeline);
+        let out = pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"scan":{"kernel":0.9}}}"#).unwrap();
+        assert_eq!(kinds(&out), [Kind::State, Kind::Layer, Kind::Stats]);
+        assert!(layer_of(&out[1]).splats.is_empty() && pipeline.scene_time() == 0.0, "the scan starts over");
+        assert_eq!(pipeline.scan_state(), Some(ScanState::Scanning));
+        let layer = finish_scan(&mut pipeline, Vec::new());
+        assert_eq!(layer.len(), pipeline.static_splats().len());
+        let after = sigma(&pipeline);
+        assert!((after / before - 2.0).abs() < 0.05, "kernel 0.45 -> 0.9: sigma {before} -> {after}");
+    }
+
+    /// Asserts that the frames the stage holds are, bit for bit, what a full
+    /// render of every camera gives at the stage's instant, and that they
+    /// were taken the cheap way (static render plus the moving pixels).
+    fn assert_stage_frames_are_exact(pipeline: &Pipeline, what: &str) {
+        let Mode::Stage(stage) = &pipeline.mode else { panic!("not the stage") };
+        let snap = pipeline.scene.snapshot(stage.time as f32);
+        let exposure = stage.exposures.wrapping_sub(1);
+        assert_eq!((stage.frames.len(), stage.fixed.len()), (stage.cameras.len(), stage.cameras.len()), "{what}");
+        let partial = PartialCapture::new(&snap, stage.fixed[0].scene()).expect("the stage is its static part plus what moves");
+        for (i, cam) in stage.cameras.iter().enumerate() {
+            let seed = exposure.wrapping_mul(0x0001_0001).wrapping_add(i as u32).wrapping_mul(0x9E37_79B1);
+            let opts = capture_options(&pipeline.config, seed);
+            assert!(stage.frames[i] == render_rgbd(&snap, cam, &opts), "{what}: camera {i} at t = {}", stage.time);
+            assert!(stage.fixed[i].serves(cam, &opts), "{what}: camera {i} is rendered in full");
+            let recast = partial.recast_pixels(&stage.fixed[i]).expect("the static render belongs to the scene");
+            assert!(recast < (cam.width * cam.height) as usize, "{what}: camera {i}");
+        }
+    }
+
+    #[test]
+    fn stage_capture_stays_exact_through_everything_a_session_does() {
+        let noisy = NoiseModel::realistic();
+        let rigs = [
+            ("default ring, small", RingRig { width: 56, height: 42, ..RingRig::default() }),
+            ("three cameras, odd size", RingRig { count: 3, width: 97, height: 53, ..RingRig::default() }),
+            ("eleven cameras, one tier", RingRig { count: 11, tiers: 1, width: 40, height: 30, ..RingRig::default() }),
+            // Cameras inside the capture volume: the dancer passes behind
+            // them and closer than the sensor's minimum range.
+            ("inside the stage", RingRig { count: 5, radius: 0.6, elevation: 1.1, width: 64, height: 48, ..RingRig::default() }),
+            // A narrow field of view: limbs and balls leave the frame.
+            ("tele", RingRig { count: 4, fov_y_deg: 14.0, width: 64, height: 48, ..RingRig::default() }),
+            ("wide", RingRig { count: 4, fov_y_deg: 110.0, width: 64, height: 48, ..RingRig::default() }),
+        ];
+        let options = [(true, NoiseModel::NONE, true), (false, noisy, true), (true, noisy, false), (false, NoiseModel::NONE, false)];
+        for (k, (name, rig)) in rigs.into_iter().enumerate() {
+            // Two of the four combinations per rig, all of them over the rigs.
+            for (shadows, noise, background_subtraction) in [options[k % 4], options[(k + 1) % 4]] {
+                let config =
+                    PipelineConfig { rig, shadows, noise, background_subtraction, ..PipelineConfig::for_scene(SceneKind::Stage) };
+                let mut pipeline = Pipeline::new(config);
+                let what = format!("{name}, shadows {shadows}, noise {}, plate {background_subtraction}", !noise.is_none());
+                assert_stage_frames_are_exact(&pipeline, &what);
+                // Uneven steps, across the end of the loop.
+                for dt in [0.033, 1.7, 0.0, 7.9, 0.21] {
+                    pipeline.tick(dt);
+                    assert_stage_frames_are_exact(&pipeline, &what);
+                }
+                pipeline.handle_control(ControlMsg::SetTimeScale { time_scale: 2.5 });
+                pipeline.tick(0.4);
+                assert_stage_frames_are_exact(&pipeline, &what);
+                // Frozen: the same instant, new exposures.
+                pipeline.handle_control(ControlMsg::SetTimeScale { time_scale: 0.0 });
+                pipeline.tick(0.4);
+                pipeline.tick(0.4);
+                assert_stage_frames_are_exact(&pipeline, &what);
+                pipeline.handle_control(ControlMsg::SetPaused { paused: true });
+                pipeline.tick(1.0);
+                assert_stage_frames_are_exact(&pipeline, &what);
+                pipeline.handle_control(ControlMsg::SetPaused { paused: false });
+                pipeline.handle_control(ControlMsg::SetTimeScale { time_scale: -1.0 });
+                pipeline.tick(0.6);
+                assert_stage_frames_are_exact(&pipeline, &what);
+                pipeline.handle_control(ControlMsg::Restart);
+                assert_stage_frames_are_exact(&pipeline, &what);
+                // Changes in mid-session: each one rebuilds the static renders.
+                for patch in [
+                    serde_json::json!({ "shadows": !shadows }),
+                    serde_json::json!({ "noise": { "depth_sigma_at_1m": 0.004, "color_sigma": 3.0, "dropout": 0.02 } }),
+                    serde_json::json!({ "rig": { "count": 6, "width": 60, "height": 44 } }),
+                    serde_json::json!({ "fusion": { "enabled": false }, "time_scale": 1.0 }),
+                    serde_json::json!({ "background_subtraction": !background_subtraction }),
+                ] {
+                    pipeline.handle_control(ControlMsg::PatchConfig { patch: patch.clone() });
+                    assert_stage_frames_are_exact(&pipeline, &format!("{what}, after {patch}"));
+                    pipeline.tick(0.37);
+                    assert_stage_frames_are_exact(&pipeline, &format!("{what}, a tick after {patch}"));
+                }
+            }
+        }
+        // To the house and back: the stage starts afresh.
+        let mut pipeline = Pipeline::new(small_stage());
+        pipeline.tick(2.0);
+        pipeline.handle_control(ControlMsg::SetScene { scene: SceneKind::House });
+        pipeline.tick(0.1);
+        pipeline.handle_control(ControlMsg::SetScene { scene: SceneKind::Stage });
+        pipeline.tick(0.9);
+        assert_stage_frames_are_exact(&pipeline, "back from the house");
     }
 
     #[test]

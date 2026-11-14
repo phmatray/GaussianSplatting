@@ -1,9 +1,13 @@
 //! Novel-view quality of the whole pipeline.
 //!
 //! The pipeline's own messages are decoded like a viewer would, the
-//! resulting cloud is rendered with the reference rasterizer from cameras
-//! that are not part of the rig (or not on the scan path) and compared with
-//! a ray cast of the true scene at the same instant.
+//! resulting cloud is drawn from cameras that are not part of the rig (or
+//! not on the scan path) and compared with a ray cast of the true scene at
+//! the same instant. Every cloud is judged under both blending modes of a
+//! viewer ([`Renderer`]): the normalised one it is produced for, and the
+//! sorted fallback with its splat scale. The views are 640x480: at 320x240
+//! they are coarser than the sensors and tell a fine reconstruction from a
+//! coarse one no longer.
 //!
 //! The thresholds are regression bounds a little below what the default
 //! settings achieve (measured values in the comments; the pipeline is
@@ -16,14 +20,15 @@ use std::sync::OnceLock;
 
 use common::{
     clearance, evaluate, house_look_around_views, house_views, mean, observed_mask, output_dir, run_full_scan, save_png,
-    scan_path_distance, side_by_side, stack, stage_view_above, stage_views, Client, Exposures, Score, BACKGROUND,
+    scan_path_distance, side_by_side, stack, stage_view_above, stage_views, Client, Exposures, Renderer, Score, BACKGROUND,
     HALL_VIEW_CLEARANCE, HOUSE_VIEW_CLEARANCE, HOUSE_VIEW_PATH_DISTANCE,
 };
 use gs_core::capture::{render_reference, NoiseModel};
+use gs_core::experimental::metrics::dilate;
 use gs_core::glam::{Mat4, Quat, Vec3};
 use gs_core::pipeline::{scan_frame, scan_frame_count, scan_sensor, Pipeline};
 use gs_core::protocol::{CameraInfo, ControlMsg, PipelineConfig, ScanHead, ScanState};
-use gs_core::raster::{psnr, rasterize, Image, RasterOptions};
+use gs_core::raster::{psnr, Image};
 use gs_core::rig::ScanPath;
 use gs_core::scene::{house, make_scene, SceneKind, SceneSnapshot};
 use gs_core::{Camera, Splat};
@@ -39,28 +44,78 @@ fn save_sheet(name: &str, scores: &[Score]) {
     }
 }
 
+/// The scores of a set of views under one renderer.
+#[derive(Default)]
+struct Tally {
+    psnr: Vec<f32>,
+    ssim: Vec<f32>,
+    interior: Vec<f32>,
+    texture: Vec<f32>,
+    silhouette: Vec<f32>,
+    coverage: Vec<f32>,
+    psnr_observed: Vec<f32>,
+    coverage_observed: Vec<f32>,
+}
+
+impl Tally {
+    fn push(&mut self, score: &Score) {
+        self.psnr.push(score.psnr);
+        self.ssim.push(score.ssim);
+        self.interior.push(score.interior);
+        self.texture.push(score.texture);
+        self.silhouette.push(score.silhouette);
+        self.coverage.push(score.coverage);
+        self.psnr_observed.push(score.psnr_observed);
+        self.coverage_observed.push(score.coverage_observed);
+    }
+
+    /// Mean and worst PSNR, mean SSIM.
+    fn headline(&self) -> (f32, f32, f32) {
+        (mean(&self.psnr), min(&self.psnr), mean(&self.ssim))
+    }
+
+    fn report(&self, label: &str) {
+        let finite = |values: &[f32]| mean(&values.iter().copied().filter(|v| v.is_finite()).collect::<Vec<_>>());
+        println!(
+            "{label}: PSNR mean {:.2} dB (worst {:.2}), SSIM {:.3}; interior {:.1}, texture {:.1}, silhouette {:.1} dB; \
+             coverage mean {:.2} % (worst {:.2})",
+            mean(&self.psnr),
+            min(&self.psnr),
+            mean(&self.ssim),
+            finite(&self.interior),
+            finite(&self.texture),
+            finite(&self.silhouette),
+            100.0 * mean(&self.coverage),
+            100.0 * min(&self.coverage),
+        );
+    }
+}
+
 /// Runs the stage through `dts` and scores every held-out view after each
-/// tick. Returns the PSNR values and the client.
-fn stage_scores(config: PipelineConfig, dts: &[f32], sheet: &str) -> (Vec<f32>, Client) {
+/// tick under both renderers ([`Renderer::BOTH`] order). Returns the scores
+/// and the client.
+fn stage_scores(config: PipelineConfig, dts: &[f32], label: &str) -> ([Tally; 2], Client) {
     let shadows = config.shadows;
     let mut pipeline = Pipeline::new(config);
     let scene = make_scene(SceneKind::Stage);
     let mut client = Client::default();
     client.apply(&pipeline.snapshot());
     let views = stage_views();
-    let (mut psnrs, mut scores) = (Vec::new(), Vec::new());
+    let mut tallies = [Tally::default(), Tally::default()];
     for &dt in dts {
         client.apply(&pipeline.tick(dt));
         let snap = scene.snapshot(pipeline.scene_time());
-        let cloud = client.cloud();
-        for view in &views {
-            let score = evaluate(&snap, &cloud, &view.cam, shadows, None);
-            psnrs.push(score.psnr);
-            scores.push(score);
+        for (renderer, tally) in Renderer::BOTH.into_iter().zip(&mut tallies) {
+            let scores: Vec<Score> =
+                views.iter().map(|view| evaluate(&snap, &client.layers, &view.cam, shadows, None, renderer)).collect();
+            scores.iter().for_each(|score| tally.push(score));
+            save_sheet(&format!("{}_{}_{:.1}.png", label.replace(' ', "_"), renderer.name(), pipeline.scene_time()), &scores);
         }
     }
-    save_sheet(sheet, &scores);
-    (psnrs, client)
+    for (renderer, tally) in Renderer::BOTH.into_iter().zip(&tallies) {
+        tally.report(&format!("{label}, {}", renderer.name()));
+    }
+    (tallies, client)
 }
 
 #[test]
@@ -99,48 +154,63 @@ fn held_out_views_are_really_held_out() {
 
 #[test]
 fn stage_default_settings() {
-    // Measured: mean 25.14 dB, worst view 22.86 dB (the one from above, which
-    // sees floor that no camera sees).
-    let (psnrs, client) = stage_scores(PipelineConfig::for_scene(SceneKind::Stage), &[1.3, 2.8, 3.6], "stage_default.png");
-    let (mean_psnr, worst) = (mean(&psnrs), min(&psnrs));
+    let (tallies, client) = stage_scores(PipelineConfig::for_scene(SceneKind::Stage), &[1.3, 2.8, 3.6], "stage default");
+    let [normalized, sorted] = &tallies;
     let (fixed, live) = (client.layers[0].len(), client.layers[1].len());
-    println!("stage default: mean {mean_psnr:.2} dB, worst {worst:.2} dB, {fixed} + {live} splats");
-    assert!(mean_psnr >= 24.6, "mean PSNR {mean_psnr:.2} dB");
-    assert!(worst >= 22.3, "worst PSNR {worst:.2} dB");
+    println!("stage default: {fixed} + {live} splats");
+    // Measured, normalised: mean 28.63 dB, worst view 24.46 dB (the one
+    // from above, which sees floor that no camera sees), SSIM 0.941; around
+    // color edges 25.4 dB, around silhouettes 21.0 dB.
+    let (mean_psnr, worst, ssim) = normalized.headline();
+    assert!(mean_psnr >= 28.2 && worst >= 24.0 && ssim >= 0.93, "normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
+    assert!(mean(&normalized.texture) >= 24.9, "texture {:.2} dB", mean(&normalized.texture));
+    assert!(mean(&normalized.silhouette) >= 20.5, "silhouettes {:.2} dB", mean(&normalized.silhouette));
+    // Measured, sorted fallback: mean 26.61 dB, worst 23.78 dB, SSIM 0.904.
+    let (mean_psnr, worst, ssim) = sorted.headline();
+    assert!(mean_psnr >= 26.2 && worst >= 23.3 && ssim >= 0.894, "sorted: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
 
-    // Static plate about 69k splats, live layer about 9k: 16 bytes each.
-    assert!((50_000..90_000).contains(&client.layers[0].len()), "{}", client.layers[0].len());
-    assert!((5_000..14_000).contains(&client.layers[1].len()), "{}", client.layers[1].len());
+    // Static plate about 83k splats, live layer about 12.6k: 16 bytes each.
+    assert!((70_000..95_000).contains(&fixed), "{fixed}");
+    assert!((8_000..17_000).contains(&live), "{live}");
     let stats = client.stats();
     assert!(stats.bytes < 300_000, "{} bytes per tick", stats.bytes);
-    assert_eq!(stats.pixels, 8 * 160 * 120);
+    assert_eq!(stats.pixels, 8 * 240 * 180);
 }
 
 #[test]
 fn stage_with_sensor_noise() {
-    // Measured: mean 24.56 dB, worst 22.63 dB.
     let config = PipelineConfig { noise: NoiseModel::realistic(), ..PipelineConfig::for_scene(SceneKind::Stage) };
-    let (psnrs, client) = stage_scores(config, &[1.3, 3.2], "stage_noise.png");
-    let (mean_psnr, worst) = (mean(&psnrs), min(&psnrs));
-    println!("stage with noise: mean {mean_psnr:.2} dB, worst {worst:.2} dB");
-    assert!(mean_psnr >= 24.0, "mean PSNR {mean_psnr:.2} dB");
-    assert!(worst >= 22.0, "worst PSNR {worst:.2} dB");
+    let (tallies, client) = stage_scores(config, &[1.3, 3.2], "stage with noise");
+    let [normalized, sorted] = &tallies;
+    // Measured, normalised: mean 27.25 dB, worst 23.98 dB, SSIM 0.929.
+    let (mean_psnr, worst, ssim) = normalized.headline();
+    assert!(mean_psnr >= 26.8 && worst >= 23.5 && ssim >= 0.919, "normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
+    // Measured, sorted fallback: mean 25.82 dB, worst 23.50 dB, SSIM 0.894.
+    let (mean_psnr, worst, ssim) = sorted.headline();
+    assert!(mean_psnr >= 25.4 && worst >= 23.0 && ssim >= 0.884, "sorted: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
     // Noise must not leak background into the live layer.
-    assert!(client.layers[1].len() < 14_000, "{} live splats", client.layers[1].len());
+    assert!(client.layers[1].len() < 17_000, "{} live splats", client.layers[1].len());
 }
 
 #[test]
 fn stage_light_preset_and_without_background_subtraction() {
-    // Measured: light preset mean 25.02 dB (worst 22.26); everything live
-    // mean 25.47 dB (worst 23.03).
-    let (psnrs, _) = stage_scores(PipelineConfig::light(SceneKind::Stage), &[2.1], "stage_light.png");
-    println!("stage light: mean {:.2} dB, worst {:.2} dB", mean(&psnrs), min(&psnrs));
-    assert!(mean(&psnrs) >= 24.3 && min(&psnrs) >= 21.7, "{psnrs:?}");
+    // Measured, light preset (eight 160x120 cameras): normalised mean
+    // 27.42 dB (worst 24.08), SSIM 0.921; sorted 25.92 dB (worst 23.68).
+    let (tallies, client) = stage_scores(PipelineConfig::light(SceneKind::Stage), &[2.1], "stage light");
+    let (mean_psnr, worst, ssim) = tallies[0].headline();
+    assert!(mean_psnr >= 27.0 && worst >= 23.6 && ssim >= 0.911, "light, normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
+    let (mean_psnr, worst, _) = tallies[1].headline();
+    assert!(mean_psnr >= 25.5 && worst >= 23.2, "light, sorted: {mean_psnr:.2} dB, worst {worst:.2}");
+    assert_eq!(client.stats().pixels, 8 * 160 * 120);
 
+    // Measured, everything live: normalised mean 29.22 dB (worst 24.60),
+    // SSIM 0.949; sorted 27.05 dB (worst 24.03).
     let config = PipelineConfig { background_subtraction: false, ..PipelineConfig::for_scene(SceneKind::Stage) };
-    let (psnrs, client) = stage_scores(config, &[2.1], "stage_all_live.png");
-    println!("stage all live: mean {:.2} dB, worst {:.2} dB", mean(&psnrs), min(&psnrs));
-    assert!(mean(&psnrs) >= 24.6 && min(&psnrs) >= 22.3, "{psnrs:?}");
+    let (tallies, client) = stage_scores(config, &[2.1], "stage all live");
+    let (mean_psnr, worst, ssim) = tallies[0].headline();
+    assert!(mean_psnr >= 28.8 && worst >= 24.1 && ssim >= 0.94, "all live, normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
+    let (mean_psnr, worst, _) = tallies[1].headline();
+    assert!(mean_psnr >= 26.6 && worst >= 23.5, "all live, sorted: {mean_psnr:.2} dB, worst {worst:.2}");
     assert!(client.layers[0].is_empty());
 }
 
@@ -149,8 +219,23 @@ fn level(image: &Image, i: usize) -> f32 {
     (image.rgb[i * 3] as f32 + image.rgb[i * 3 + 1] as f32 + image.rgb[i * 3 + 2] as f32) / 3.0
 }
 
-fn render(splats: &[Splat], view: &common::View) -> Image {
-    rasterize(splats, &view.cam, &RasterOptions { background: BACKGROUND, ..Default::default() })
+/// The luma change between two pictures that the change of the ground
+/// truth between the same instants does not explain, as an RMS over the
+/// image in 8-bit levels: what remains is flicker.
+fn flicker(pictures: &[Image], truth: Option<&[Image]>) -> f32 {
+    let luma = |image: &Image, i: usize| {
+        0.299 * image.rgb[i * 3] as f32 + 0.587 * image.rgb[i * 3 + 1] as f32 + 0.114 * image.rgb[i * 3 + 2] as f32
+    };
+    let (mut sum, mut count) = (0.0f64, 0u64);
+    for k in 1..pictures.len() {
+        for i in 0..(pictures[k].width * pictures[k].height) as usize {
+            let expected = truth.map_or(0.0, |truth| luma(&truth[k], i) - luma(&truth[k - 1], i));
+            let excess = luma(&pictures[k], i) - luma(&pictures[k - 1], i) - expected;
+            sum += (excess * excess) as f64;
+            count += 1;
+        }
+    }
+    (sum / count.max(1) as f64).sqrt() as f32
 }
 
 /// Pixels of the view from above that show floor in a shadow cast by the
@@ -166,20 +251,14 @@ fn shadow_masks(scene_now: &SceneSnapshot, empty: &SceneSnapshot, view: &common:
     // Static geometry: the same depth with and without the dancer.
     let is_floor = |i: usize| floor.depth[i] > 0.0 && (floor.depth[i] - shaded_frame.depth[i]).abs() < 1e-3;
     let shadow: Vec<bool> = (0..w * h).map(|i| is_floor(i) && level(&lit, i) - level(&shaded, i) > 25.0).collect();
-    let near = |i: usize, radius: i64, mask: &[bool]| {
-        let (x, y) = ((i % w) as i64, (i / w) as i64);
-        (-radius..=radius).any(|dy| {
-            (-radius..=radius).any(|dx| {
-                let (xx, yy) = (x + dx, y + dy);
-                xx >= 0 && yy >= 0 && xx < w as i64 && yy < h as i64 && mask[yy as usize * w + xx as usize]
-            })
-        })
-    };
-    // Lit floor 3 to 8 pixels away from any shadow, and from the dancer.
+    // Lit floor 3 to 8 pixels of a 320-pixel-wide view away from any
+    // shadow, and from the dancer: the same band on the floor whatever the
+    // resolution of the view.
+    let unit = (w / 320).max(1);
     let not_floor: Vec<bool> = (0..w * h).map(|i| !is_floor(i)).collect();
-    let band: Vec<bool> = (0..w * h)
-        .map(|i| is_floor(i) && !near(i, 2, &shadow) && near(i, 8, &shadow) && !near(i, 3, &not_floor))
-        .collect();
+    let (beside, around, occluded) =
+        (dilate(&shadow, w, h, 2 * unit), dilate(&shadow, w, h, 8 * unit), dilate(&not_floor, w, h, 3 * unit));
+    let band: Vec<bool> = (0..w * h).map(|i| is_floor(i) && !beside[i] && around[i] && !occluded[i]).collect();
     (shadow, band)
 }
 
@@ -188,7 +267,9 @@ fn the_dancers_shadow_is_reconstructed_without_a_halo() {
     let scene = make_scene(SceneKind::Stage);
     let empty = scene.snapshot_static();
     let view = stage_view_above();
-    for (label, noise) in [("clean", NoiseModel::NONE), ("noisy", NoiseModel::realistic())] {
+    let cases = [("clean", NoiseModel::NONE), ("noisy", NoiseModel::realistic())];
+    for ((label, noise), renderer) in cases.into_iter().flat_map(|case| Renderer::BOTH.map(|renderer| (case, renderer))) {
+        let label = format!("{label}, {}", renderer.name());
         let mut pipeline = Pipeline::new(PipelineConfig { noise, ..PipelineConfig::for_scene(SceneKind::Stage) });
         let mut client = Client::default();
         client.apply(&pipeline.snapshot());
@@ -196,21 +277,23 @@ fn the_dancers_shadow_is_reconstructed_without_a_halo() {
         let snap = scene.snapshot(pipeline.scene_time());
         let (shadow, band) = shadow_masks(&snap, &empty, &view);
         let shadow_pixels = shadow.iter().filter(|&&m| m).count();
-        assert!(shadow_pixels > 400, "the view shows only {shadow_pixels} shadow pixels");
+        assert!(shadow_pixels > 1600, "the view shows only {shadow_pixels} shadow pixels");
 
         let with_shadow = Image::from_frame(&render_reference(&snap, &view.cam, true, 2, BACKGROUND));
         let without = Image::from_frame(&render_reference(&snap, &view.cam, false, 2, BACKGROUND));
-        let reconstruction = render(&client.cloud(), &view);
-        let static_only = render(&client.layers[0], &view);
+        let (reconstruction, _) = renderer.draw(&client.layers, &view.cam);
+        let (static_only, _) = renderer.draw(&[client.layers[0].clone(), Vec::new()], &view.cam);
         let error = |image: &Image, reference: &Image, mask: &[bool]| {
             let picked: Vec<f32> =
                 (0..mask.len()).filter(|&i| mask[i]).map(|i| (level(image, i) - level(reference, i)).abs()).collect();
             mean(&picked)
         };
-        // Measured (clean / noisy): in the shadow the reconstruction is
-        // 12.3 / 12.5 levels from the shadowed truth and 55 from the lit
-        // one; the plate alone is 41 levels off. In the band around the
-        // shadow: 8.4 / 8.5 levels, against 8.1 / 8.3 for the plate alone.
+        // Measured (normalised, clean / noisy): in the shadow the
+        // reconstruction is 5.9 / 6.4 levels from the shadowed truth and 47
+        // from the lit one; the plate alone is 38 levels off. In the band
+        // around the shadow: 5.1 / 5.5 levels, against 5.0 / 5.3 for the
+        // plate alone. Sorted: 6.8 / 7.4 and 52 levels in the shadow, 10.4
+        // in the band against 10.3 / 10.2.
         let (to_shadow, to_lit) = (error(&reconstruction, &with_shadow, &shadow), error(&reconstruction, &without, &shadow));
         let plate_to_shadow = error(&static_only, &with_shadow, &shadow);
         // Around the shadow the floor is as good as without live layer.
@@ -219,14 +302,34 @@ fn the_dancers_shadow_is_reconstructed_without_a_halo() {
             "shadow ({label}): {shadow_pixels} px, error to shadowed truth {to_shadow:.1}, to lit truth {to_lit:.1}, \
              plate alone {plate_to_shadow:.1}; band around it {halo:.1} (plate alone {plate_halo:.1})"
         );
-        assert!(to_shadow < 16.0, "{label}: the shadow is off by {to_shadow:.1} levels");
+        assert!(to_shadow < 9.0, "{label}: the shadow is off by {to_shadow:.1} levels");
         assert!(to_lit > 3.0 * to_shadow, "{label}: the shadow is not visible ({to_lit:.1} vs {to_shadow:.1})");
         assert!(plate_to_shadow > 3.0 * to_shadow, "{label}: the live layer does not improve on the plate");
-        assert!(halo < plate_halo + 2.0, "{label}: halo around the shadow, {halo:.1} vs {plate_halo:.1} levels");
+        assert!(halo < plate_halo + 1.0, "{label}: halo around the shadow, {halo:.1} vs {plate_halo:.1} levels");
         if let Some(dir) = output_dir() {
-            save_png(&dir.join(format!("shadow_{label}.png")), &stack(&[with_shadow, reconstruction, static_only]));
+            let name = format!("shadow_{}.png", label.replace(", ", "_"));
+            save_png(&dir.join(name), &stack(&[with_shadow, reconstruction, static_only]));
         }
     }
+}
+
+/// Consecutive ticks of the stage, `1/30` s apart from scene time 4.1 s on,
+/// drawn from `view`; with them the ground truth of the same instants.
+fn stage_sequence(config: PipelineConfig, time_scale: f32, ticks: usize, view: &common::View, renderer: Renderer) -> (Vec<Image>, Vec<Image>) {
+    let mut pipeline = Pipeline::new(config);
+    let mut client = Client::default();
+    client.apply(&pipeline.snapshot());
+    client.apply(&pipeline.tick(4.1));
+    client.apply(&pipeline.handle_control(ControlMsg::SetTimeScale { time_scale }));
+    let scene = make_scene(SceneKind::Stage);
+    let (mut pictures, mut truth) = (Vec::new(), Vec::new());
+    for _ in 0..ticks {
+        client.apply(&pipeline.tick(1.0 / 30.0));
+        pictures.push(renderer.draw(&client.layers, &view.cam).0);
+        let snap = scene.snapshot(pipeline.scene_time());
+        truth.push(Image::from_frame(&render_reference(&snap, &view.cam, config.shadows, 1, BACKGROUND)));
+    }
+    (pictures, truth)
 }
 
 #[test]
@@ -234,34 +337,66 @@ fn a_frozen_scene_does_not_flicker_under_sensor_noise() {
     // Time stands still, the sensor noise does not: the picture from above
     // (floor, shadow, dancer) must stay put from tick to tick.
     let config = PipelineConfig { noise: NoiseModel::realistic(), ..PipelineConfig::for_scene(SceneKind::Stage) };
-    let mut pipeline = Pipeline::new(config);
-    let mut client = Client::default();
-    client.apply(&pipeline.snapshot());
-    client.apply(&pipeline.tick(4.1));
-    client.apply(&pipeline.handle_control(ControlMsg::SetTimeScale { time_scale: 0.0 }));
     let scene = make_scene(SceneKind::Stage);
-    let snap = scene.snapshot(pipeline.scene_time());
-    let empty = scene.snapshot_static();
     let view = stage_view_above();
-    let (shadow, _) = shadow_masks(&snap, &empty, &view);
+    let (shadow, _) = shadow_masks(&scene.snapshot(4.1), &scene.snapshot_static(), &view);
+    for renderer in Renderer::BOTH {
+        let (frames, _) = stage_sequence(config, 0.0, 4, &view, renderer);
+        let mut worst_psnr = f32::INFINITY;
+        let mut worst_shadow = 0.0f32;
+        for pair in frames.windows(2) {
+            worst_psnr = worst_psnr.min(psnr(&pair[0], &pair[1]));
+            let changes: Vec<f32> =
+                (0..shadow.len()).filter(|&i| shadow[i]).map(|i| (level(&pair[0], i) - level(&pair[1], i)).abs()).collect();
+            worst_shadow = worst_shadow.max(mean(&changes));
+        }
+        // The same sensors without the multi-view fusion: choosing one
+        // camera per surface point must not add flicker of its own.
+        let mut stacked = config;
+        stacked.fusion.enabled = false;
+        let (stacked_frames, _) = stage_sequence(stacked, 0.0, 4, &view, renderer);
+        let (fused_rms, stacked_rms) = (flicker(&frames, None), flicker(&stacked_frames, None));
+        println!(
+            "flicker, {}: {worst_psnr:.1} dB between consecutive ticks, {worst_shadow:.2} levels in the shadow; \
+             {fused_rms:.2} levels rms, {stacked_rms:.2} without fusion",
+            renderer.name()
+        );
+        // Measured, normalised: 36.1 dB between consecutive ticks, 1.2
+        // levels in the shadow, 3.45 levels rms against 2.99 without fusion.
+        // Sorted: 36.4 dB, 1.8 levels, 3.26 against 3.00. The fused cloud
+        // averages fewer observations per pixel, which is where its 9 to
+        // 15 % come from (a hysteresis on the choice of camera changes
+        // nothing; see `gs_core::multiview`).
+        assert!(worst_psnr > 34.0, "{}: consecutive ticks differ: {worst_psnr:.1} dB", renderer.name());
+        assert!(worst_shadow < 4.0, "{}: the shadow flickers by {worst_shadow:.2} levels", renderer.name());
+        assert!(fused_rms < 1.25 * stacked_rms, "{}: {fused_rms:.2} levels against {stacked_rms:.2} stacked", renderer.name());
+    }
+}
 
-    let mut frames = Vec::new();
-    for _ in 0..4 {
-        client.apply(&pipeline.tick(1.0 / 30.0));
-        frames.push(render(&client.cloud(), &view));
+#[test]
+fn a_moving_scene_changes_like_the_ground_truth() {
+    // The dance goes on: from one tick to the next the picture may change
+    // where the truth changes, and by as much. What changes beyond that is
+    // flicker (splats of another camera taking over, silhouettes jumping by
+    // a sensor pixel). Judged from a held-out view at eye height, with and
+    // without sensor noise, against the same sensors without fusion.
+    let view = &stage_views()[0];
+    for (label, noise) in [("clean", NoiseModel::NONE), ("noisy", NoiseModel::realistic())] {
+        let config = PipelineConfig { noise, ..PipelineConfig::for_scene(SceneKind::Stage) };
+        let (frames, truth) = stage_sequence(config, 1.0, 5, view, Renderer::Normalized);
+        let mut stacked = config;
+        stacked.fusion.enabled = false;
+        let (stacked_frames, _) = stage_sequence(stacked, 1.0, 5, view, Renderer::Normalized);
+        let truth_rms = flicker(&truth, None);
+        let (fused_rms, stacked_rms) = (flicker(&frames, Some(&truth)), flicker(&stacked_frames, Some(&truth)));
+        println!("moving scene, {label}: the truth changes by {truth_rms:.2} levels rms; unexplained change {fused_rms:.2}, {stacked_rms:.2} without fusion");
+        // Measured: the truth changes by 10.7 levels rms; unexplained
+        // change 7.17 levels (clean) and 8.07 (noisy), against 7.50 and 8.31
+        // without fusion.
+        assert!(truth_rms > 5.0, "the dance stands still: {truth_rms:.2}");
+        assert!(fused_rms < 9.0, "{label}: {fused_rms:.2} levels of flicker");
+        assert!(fused_rms < 1.02 * stacked_rms, "{label}: {fused_rms:.2} levels against {stacked_rms:.2} stacked");
     }
-    let mut worst_psnr = f32::INFINITY;
-    let mut worst_shadow = 0.0f32;
-    for pair in frames.windows(2) {
-        worst_psnr = worst_psnr.min(psnr(&pair[0], &pair[1]));
-        let changes: Vec<f32> =
-            (0..shadow.len()).filter(|&i| shadow[i]).map(|i| (level(&pair[0], i) - level(&pair[1], i)).abs()).collect();
-        worst_shadow = worst_shadow.max(mean(&changes));
-    }
-    // Measured: 37.8 dB between consecutive ticks, 1.7 levels in the shadow.
-    println!("flicker: {worst_psnr:.1} dB between consecutive ticks, {worst_shadow:.2} levels in the shadow");
-    assert!(worst_psnr > 35.0, "consecutive ticks differ: {worst_psnr:.1} dB");
-    assert!(worst_shadow < 5.0, "the shadow flickers by {worst_shadow:.2} levels");
 }
 
 /// Angle of the rotation that takes one orientation to the other, in
@@ -399,9 +534,16 @@ fn the_reported_scan_camera_moves_steadily_tick_after_tick() {
 /// The finished default home scan, shared by the house tests.
 struct Scan {
     config: PipelineConfig,
-    cloud: Vec<Splat>,
+    /// The map in layer 0; layer 1 stays empty in the house.
+    layers: [Vec<Splat>; 2],
     ticks: usize,
     appended_bytes: usize,
+}
+
+impl Scan {
+    fn cloud(&self) -> &[Splat] {
+        &self.layers[0]
+    }
 }
 
 fn full_scan() -> &'static Scan {
@@ -418,7 +560,8 @@ fn full_scan() -> &'static Scan {
         let state = client.state.as_ref().unwrap();
         assert_eq!(state.scene, "house");
         assert_eq!(state.ceiling_height, Some(house::CEILING_HEIGHT));
-        Scan { config: *pipeline.config(), cloud: client.cloud(), ticks, appended_bytes: client.bytes }
+        let bytes = client.bytes;
+        Scan { config: *pipeline.config(), layers: client.layers, ticks, appended_bytes: bytes }
     })
 }
 
@@ -427,66 +570,60 @@ fn house_full_scan() {
     let scan = full_scan();
     let snap = make_scene(SceneKind::House).snapshot(0.0);
     let exposures = Exposures::of_scan(&snap, &scan.config);
-    let (mut psnrs, mut coverages, mut psnrs_observed, mut coverages_observed, mut scores) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for view in house_views() {
+    let (mut normalized, mut sorted) = (Tally::default(), Tally::default());
+    let mut scores = Vec::new();
+    for (i, view) in house_views().iter().enumerate() {
         let mask = observed_mask(&snap, &exposures, &view.cam);
-        let score = evaluate(&snap, &scan.cloud, &view.cam, scan.config.shadows, Some(&mask));
-        psnrs.push(score.psnr);
-        coverages.push(score.coverage);
-        psnrs_observed.push(score.psnr_observed);
-        coverages_observed.push(score.coverage_observed);
+        let score = evaluate(&snap, &scan.layers, &view.cam, scan.config.shadows, Some(&mask), Renderer::Normalized);
+        normalized.push(&score);
         scores.push(score);
+        // The fallback on one direction per spot.
+        if i % 3 == 0 {
+            sorted.push(&evaluate(&snap, &scan.layers, &view.cam, scan.config.shadows, Some(&mask), Renderer::Sorted));
+        }
     }
     for (i, chunk) in scores.chunks(6).enumerate() {
         save_sheet(&format!("house_{i}.png"), chunk);
     }
+    println!("house: {} splats in {} ticks, {:.1} MB", scan.cloud().len(), scan.ticks, scan.appended_bytes as f32 / 1e6);
+    normalized.report("house, normalised");
+    sorted.report("house, sorted (every third view)");
     println!(
-        "house: {} splats in {} ticks, {:.1} MB; PSNR mean {:.2} dB (worst {:.2}), coverage mean {:.2} % (worst {:.2}); \
-         where the scan has looked: PSNR mean {:.2} dB (worst {:.2}), coverage mean {:.2} % (worst {:.2})",
-        scan.cloud.len(),
-        scan.ticks,
-        scan.appended_bytes as f32 / 1e6,
-        mean(&psnrs),
-        min(&psnrs),
-        100.0 * mean(&coverages),
-        100.0 * min(&coverages),
-        mean(&psnrs_observed),
-        min(&psnrs_observed),
-        100.0 * mean(&coverages_observed),
-        100.0 * min(&coverages_observed),
+        "house, where the scan has looked: PSNR mean {:.2} dB (worst {:.2}), coverage mean {:.2} % (worst {:.2})",
+        mean(&normalized.psnr_observed),
+        min(&normalized.psnr_observed),
+        100.0 * mean(&normalized.coverage_observed),
+        100.0 * min(&normalized.coverage_observed),
     );
-    // Measured: 423 672 splats; PSNR mean 21.79 dB (worst 18.95); coverage
-    // mean 99.86 % (worst 97.95 %). On the pixels whose surface point some
-    // scan frame has seen: PSNR mean 21.98 dB (worst 19.00), coverage mean
-    // 99.98 % (worst 99.79 %). What keeps the PSNR below 22 dB is the cell
-    // size: 3.2 cm cells are 2 to 3 pixels wide in these views, which blurs
-    // every color edge of the patterned rugs, tiles and pictures. The 0.4 %
-    // of the pixels that the scan never saw (floor behind furniture, the
-    // niche beside the wardrobe) cost another 0.2 dB.
-    //
-    // The look-around sweep of a single camera that the five-sensor head
-    // replaces scored 21.46 dB (worst 19.16) and 99.69 % (worst 97.68 %)
-    // with 416 522 splats, while turning seven times as fast.
-    assert!(scan.cloud.len() <= 440_000, "{} splats", scan.cloud.len());
-    assert!(scan.cloud.len() >= 380_000, "{} splats", scan.cloud.len());
-    assert!(mean(&psnrs) >= 21.4, "mean PSNR {:.2} dB", mean(&psnrs));
+    // Measured: 756 234 splats of 2.4 cm cells. Normalised: PSNR mean
+    // 23.65 dB (worst 20.50), SSIM 0.851; coverage mean 99.80 % (worst
+    // 97.63 %). On the pixels whose surface point some scan frame has seen:
+    // PSNR mean 23.97 dB, coverage mean 99.96 % (worst 99.57 %). Sorted, on
+    // every third view: 22.76 dB (worst 21.29), SSIM 0.827. What limits the
+    // PSNR is still the cell size: a cell is 3 to 4 pixels wide in these
+    // views. The 0.4 % of the pixels that the scan never saw (floor behind
+    // furniture, the niche beside the wardrobe) cost 0.3 dB.
+    assert!((700_000..=800_000).contains(&scan.cloud().len()), "{} splats", scan.cloud().len());
+    let (mean_psnr, worst, ssim) = normalized.headline();
     // The worst view (the kitchen seen from the dining room, past a lamp
     // shade the scan sees edge-on) is touchy: turning the head by 2 degrees
     // here and there moves it by 0.4 dB while the mean stays put, so its
     // bound keeps that much distance.
-    assert!(min(&psnrs) >= 18.6, "worst PSNR {:.2} dB", min(&psnrs));
-    assert!(mean(&coverages) >= 0.996, "mean coverage {:.4}", mean(&coverages));
-    assert!(min(&coverages) >= 0.973, "worst coverage {:.4}", min(&coverages));
-    assert!(mean(&psnrs_observed) >= 21.6, "mean observed PSNR {:.2} dB", mean(&psnrs_observed));
-    assert!(mean(&coverages_observed) >= 0.998, "mean observed coverage {:.4}", mean(&coverages_observed));
-    assert!(min(&coverages_observed) >= 0.993, "worst observed coverage {:.4}", min(&coverages_observed));
+    assert!(mean_psnr >= 23.25 && worst >= 20.0 && ssim >= 0.84, "normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
+    assert!(mean(&normalized.coverage) >= 0.996, "mean coverage {:.4}", mean(&normalized.coverage));
+    assert!(min(&normalized.coverage) >= 0.97, "worst coverage {:.4}", min(&normalized.coverage));
+    assert!(mean(&normalized.psnr_observed) >= 23.55, "mean observed PSNR {:.2} dB", mean(&normalized.psnr_observed));
+    assert!(mean(&normalized.coverage_observed) >= 0.998, "mean observed coverage {:.4}", mean(&normalized.coverage_observed));
+    assert!(min(&normalized.coverage_observed) >= 0.993, "worst observed coverage {:.4}", min(&normalized.coverage_observed));
+    let (mean_psnr, worst, ssim) = sorted.headline();
+    assert!(mean_psnr >= 22.3 && worst >= 20.8 && ssim >= 0.815, "sorted: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
+    assert!(mean(&sorted.coverage) >= 0.995, "sorted: mean coverage {:.4}", mean(&sorted.coverage));
 }
 
 #[test]
 fn house_light_preset_scan() {
     // What the WebAssembly worker runs on a laptop or a headset: sensors of
-    // 144x108 taking 5 frames per second into 4 cm cells, so each of the
+    // 144x108 taking 5 frames per second into 3.2 cm cells, so each of the
     // four side, up and down sensors fires only every 1.6 s.
     let mut config = PipelineConfig::light(SceneKind::House);
     config.scan.autostart = false;
@@ -494,30 +631,21 @@ fn house_light_preset_scan() {
     let mut pipeline = Pipeline::new(config);
     let mut client = Client::default();
     let ticks = run_full_scan(&mut pipeline, &mut client);
-    let cloud = client.cloud();
     let snap = make_scene(SceneKind::House).snapshot(0.0);
-    let (mut psnrs, mut coverages) = (Vec::new(), Vec::new());
-    // Every other standard view (one direction per spot) and the views at
+    let mut tally = Tally::default();
+    // One direction per spot of the standard views and the views at
     // ceilings, corners and floors.
-    for view in house_views().into_iter().step_by(2).chain(house_look_around_views()) {
-        let score = evaluate(&snap, &cloud, &view.cam, config.shadows, None);
-        psnrs.push(score.psnr);
-        coverages.push(score.coverage);
+    for view in house_views().into_iter().step_by(3).chain(house_look_around_views()) {
+        tally.push(&evaluate(&snap, &client.layers, &view.cam, config.shadows, None, Renderer::Normalized));
     }
-    println!(
-        "house light: {} splats in {ticks} ticks; PSNR mean {:.2} dB (worst {:.2}), \
-         coverage mean {:.2} % (worst {:.2})",
-        cloud.len(),
-        mean(&psnrs),
-        min(&psnrs),
-        100.0 * mean(&coverages),
-        100.0 * min(&coverages),
-    );
-    // Measured: 280 304 splats; PSNR mean 22.71 dB (worst 19.60), coverage
-    // mean 99.86 % (worst 97.90 %).
-    assert!((250_000..=300_000).contains(&cloud.len()), "{} splats", cloud.len());
-    assert!(mean(&psnrs) >= 22.3 && min(&psnrs) >= 19.1, "{psnrs:?}");
-    assert!(mean(&coverages) >= 0.996 && min(&coverages) >= 0.973, "{coverages:?}");
+    println!("house light: {} splats in {ticks} ticks", client.layers[0].len());
+    tally.report("house light, normalised");
+    // Measured: 432 408 splats; PSNR mean 25.20 dB (worst 21.24), SSIM
+    // 0.863; coverage mean 99.84 % (worst 97.76 %).
+    assert!((400_000..=460_000).contains(&client.layers[0].len()), "{} splats", client.layers[0].len());
+    let (mean_psnr, worst, ssim) = tally.headline();
+    assert!(mean_psnr >= 24.8 && worst >= 20.7 && ssim >= 0.85, "{mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
+    assert!(mean(&tally.coverage) >= 0.996 && min(&tally.coverage) >= 0.972, "{:?}", tally.coverage);
 }
 
 #[test]
@@ -526,22 +654,22 @@ fn house_ceilings_corners_and_floors_are_scanned() {
     // beams, no missing patch of ceiling over the shower.
     let scan = full_scan();
     let snap = make_scene(SceneKind::House).snapshot(0.0);
-    let (mut psnrs, mut scores) = (Vec::new(), Vec::new());
+    let (mut tally, mut scores) = (Tally::default(), Vec::new());
     for view in house_look_around_views() {
         assert!(clearance(&snap, view.cam.position()) > 0.3, "{} is not in free space", view.name);
-        let score = evaluate(&snap, &scan.cloud, &view.cam, scan.config.shadows, None);
+        let score = evaluate(&snap, &scan.layers, &view.cam, scan.config.shadows, None, Renderer::Normalized);
         println!("look around, {:16} {:.2} dB, coverage {:.2} %", view.name, score.psnr, 100.0 * score.coverage);
         assert!(score.coverage >= 0.995, "{}: coverage {:.4}", view.name, score.coverage);
-        psnrs.push(score.psnr);
+        tally.push(&score);
         scores.push(score);
     }
     save_sheet("house_look_around.png", &scores);
-    println!("look around: mean {:.2} dB, worst {:.2} dB", mean(&psnrs), min(&psnrs));
-    // Measured: every view fully covered; mean 25.73 dB, worst 20.94 dB (the
+    tally.report("look around, normalised");
+    // Measured: every view fully covered; mean 28.51 dB, worst 23.15 dB (the
     // kitchen ceiling with its beams and lamp cords). A single sensor that
-    // only looks ahead leaves holes over 5 to 8 % of three of these views,
-    // which then score 14.6 to 16 dB.
-    assert!(mean(&psnrs) >= 25.2 && min(&psnrs) >= 20.4, "{psnrs:?}");
+    // only looks ahead leaves holes over 5 to 8 % of three of these views.
+    let (mean_psnr, worst, _) = tally.headline();
+    assert!(mean_psnr >= 28.0 && worst >= 22.6, "{:?}", tally.psnr);
 }
 
 #[test]
@@ -551,9 +679,9 @@ fn house_surfaces_are_single_layered_and_walls_do_not_bleed() {
 
     // Floor and ceiling: one layer of splats each, facing into the room.
     let facing = |s: &Splat| s.rotation() * Vec3::Z;
-    let floor: Vec<&Splat> = scan.cloud.iter().filter(|s| s.pos[1].abs() < 0.02 && facing(s).y > 0.9).collect();
+    let floor: Vec<&Splat> = scan.cloud().iter().filter(|s| s.pos[1].abs() < 0.02 && facing(s).y > 0.9).collect();
     let ceiling: Vec<&Splat> =
-        scan.cloud.iter().filter(|s| (s.pos[1] - house::CEILING_HEIGHT).abs() < 0.02 && facing(s).y < -0.9).collect();
+        scan.cloud().iter().filter(|s| (s.pos[1] - house::CEILING_HEIGHT).abs() < 0.02 && facing(s).y < -0.9).collect();
     let cell = voxel * voxel;
     let area = (2.0 * house::HALF_X) * (2.0 * house::HALF_Z);
     // Furniture and rugs hide part of the floor; nothing hides the ceiling
@@ -564,7 +692,7 @@ fn house_surfaces_are_single_layered_and_walls_do_not_bleed() {
     assert!((0.55..=1.02).contains(&floor_cells), "floor: {floor_cells}");
     assert!((0.75..=1.02).contains(&ceiling_cells), "ceiling: {ceiling_cells}");
     // Nothing hovers in the open: every splat lies within the house shell.
-    for s in &scan.cloud {
+    for s in scan.cloud() {
         assert!(
             s.pos[0].abs() < house::HALF_X + 0.3 && s.pos[2].abs() < house::HALF_Z + 0.3 && (-0.3..=2.8).contains(&s.pos[1]),
             "a splat at {:?}",
@@ -581,11 +709,11 @@ fn house_surfaces_are_single_layered_and_walls_do_not_bleed() {
         ("bathroom side", Vec3::new(1.6, 1.5, 2.2), Vec3::new(0.4, 1.3, 2.4)),
     ] {
         let cam = gs_core::Camera::look_at(eye, target, Vec3::Y, 50f32.to_radians(), 160, 120);
-        let score = evaluate(&snap, &scan.cloud, &cam, scan.config.shadows, None);
+        let score = evaluate(&snap, &scan.layers, &cam, scan.config.shadows, None, Renderer::Normalized);
         println!("wall, {name}: {:.2} dB, coverage {:.3}", score.psnr, score.coverage);
         assert!(score.coverage > 0.99, "{name}: holes in the wall ({:.3})", score.coverage);
-        // Measured: 27.2 dB from the hall, 21.8 dB from the bathroom (tiles).
-        assert!(score.psnr > 20.8, "{name}: {:.2} dB, the far face bleeds through", score.psnr);
+        // Measured: 29.5 dB from the hall, 24.7 dB from the bathroom (tiles).
+        assert!(score.psnr > 23.8, "{name}: {:.2} dB, the far face bleeds through", score.psnr);
         save_sheet(&format!("wall_{}.png", name.replace(' ', "_")), &[score]);
     }
 }

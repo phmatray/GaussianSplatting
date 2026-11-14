@@ -454,7 +454,9 @@ pub fn frame_to_pixel_splats(
             if class == MASK_CHANGED {
                 p += s.n * (params.background.shadow_lift * s.z / cam.fx);
             }
-            let shrink = |a: bool, b: bool| if a || b { k * params.edge_shrink } else { k };
+            let edge_shrink =
+                if hooks.mask.is_some() && class == MASK_FOREGROUND { params.background.edge_shrink } else { params.edge_shrink };
+            let shrink = |a: bool, b: bool| if a || b { k * edge_shrink } else { k };
             let (ku, kv) = (shrink(s.open[0], s.open[1]), shrink(s.open[2], s.open[3]));
             let rgb = &frame.rgb[i * 3..i * 3 + 3];
             let normal_world = rotation * s.n;

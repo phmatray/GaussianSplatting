@@ -24,6 +24,10 @@
 //!   part of it spent sorting.
 //! * `popping(steps, degrees)`: renders `steps` views of an orbit that turns
 //!   `degrees` per step and returns how much consecutive pictures differ.
+//! * `flicker(ticks)` (with `animate=1`): ticks the pipeline `ticks` times
+//!   under a fixed camera and returns how much consecutive pictures differ.
+//!   With the scene frozen (`patch={"time_scale":0,...}`) and sensor noise
+//!   on, that is the flicker of the renderer on a noisy live layer.
 //! * `fragments()`: fragments per pixel of the current view and mode,
 //!   counted by the CPU reference.
 
@@ -63,6 +67,51 @@ fn numbers_of(arg: &JsValue) -> Vec<f32> {
 /// Largest per-channel difference of every pixel of two pictures.
 fn pixel_differences<'a>(a: &'a Image, b: &'a Image) -> impl Iterator<Item = u8> + 'a {
     a.rgb.chunks_exact(3).zip(b.rgb.chunks_exact(3)).map(|(p, q)| p.iter().zip(q).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0))
+}
+
+/// How much consecutive pictures of a sequence differ.
+#[derive(Default)]
+struct Changes {
+    previous: Option<Image>,
+    pairs: u32,
+    /// Sum over the pairs of the mean absolute difference per channel.
+    mean_abs: f64,
+    /// Sum of the fractions of pixels that jump by more than 8 / 32 levels.
+    jumps8: f64,
+    jumps32: f64,
+    /// Largest fraction above 8 levels of a single pair.
+    worst8: f64,
+}
+
+impl Changes {
+    fn push(&mut self, image: Image) {
+        if let Some(before) = &self.previous {
+            let pixels = (image.rgb.len() / 3).max(1) as f64;
+            let total: u64 = image.rgb.iter().zip(&before.rgb).map(|(a, b)| a.abs_diff(*b) as u64).sum();
+            let over = |level: u8| pixel_differences(&image, before).filter(|d| *d > level).count() as f64 / pixels;
+            let over8 = over(8);
+            self.mean_abs += total as f64 / image.rgb.len().max(1) as f64;
+            self.jumps8 += over8;
+            self.jumps32 += over(32);
+            self.worst8 = self.worst8.max(over8);
+            self.pairs += 1;
+        }
+        self.previous = Some(image);
+    }
+
+    /// `{ blend, pairs, meanAbsDiff, jumpFraction8, jumpFraction32,
+    /// worstJumpFraction8 }`, the fractions averaged over the pairs.
+    fn report(&self, blend: &str) -> js_sys::Object {
+        let n = self.pairs.max(1) as f64;
+        let out = js_sys::Object::new();
+        dom::set(&out, "blend", blend);
+        dom::set(&out, "pairs", self.pairs);
+        dom::set(&out, "meanAbsDiff", self.mean_abs / n);
+        dom::set(&out, "jumpFraction8", self.jumps8 / n);
+        dom::set(&out, "jumpFraction32", self.jumps32 / n);
+        dom::set(&out, "worstJumpFraction8", self.worst8);
+        out
+    }
 }
 
 impl Page {
@@ -194,38 +243,30 @@ impl Page {
         out.into()
     }
 
-    /// `popping(steps, degrees)`: see the module documentation. Returns, over
-    /// all consecutive pairs: the mean absolute difference per channel, the
-    /// fraction of pixels that jump by more than 8 and by more than 32 levels,
-    /// and the largest such fraction of a single step.
+    /// `popping(steps, degrees)`: see the module documentation.
     fn popping(&self, steps: u32, degrees: f32) -> JsValue {
-        let steps = steps.clamp(2, 400);
-        let mut previous: Option<Image> = None;
-        let (mut sum, mut jumps8, mut jumps32, mut worst8, mut pairs) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0u32);
-        for i in 0..steps {
+        let mut changes = Changes::default();
+        for i in 0..steps.clamp(2, 400) {
             let cam = self.orbited((degrees * i as f32).to_radians());
-            let Ok(image) = self.viewer.snapshot(&cam) else { continue };
-            if let Some(before) = &previous {
-                let pixels = (image.rgb.len() / 3).max(1) as f64;
-                let total: u64 = image.rgb.iter().zip(&before.rgb).map(|(a, b)| a.abs_diff(*b) as u64).sum();
-                let over8 = pixel_differences(&image, before).filter(|d| *d > 8).count() as f64 / pixels;
-                let over32 = pixel_differences(&image, before).filter(|d| *d > 32).count() as f64 / pixels;
-                sum += total as f64 / image.rgb.len().max(1) as f64;
-                jumps8 += over8;
-                jumps32 += over32;
-                worst8 = worst8.max(over8);
-                pairs += 1;
+            if let Ok(image) = self.viewer.snapshot(&cam) {
+                changes.push(image);
             }
-            previous = Some(image);
         }
-        let n = pairs.max(1) as f64;
-        let out = js_sys::Object::new();
-        dom::set(&out, "blend", self.viewer.blend_status().active.as_str());
-        dom::set(&out, "pairs", pairs);
-        dom::set(&out, "meanAbsDiff", sum / n);
-        dom::set(&out, "jumpFraction8", jumps8 / n);
-        dom::set(&out, "jumpFraction32", jumps32 / n);
-        dom::set(&out, "worstJumpFraction8", worst8);
+        changes.report(self.viewer.blend_status().active.as_str()).into()
+    }
+
+    /// `flicker(ticks)`: see the module documentation.
+    fn flicker(&self, ticks: u32) -> JsValue {
+        let cam = self.camera();
+        let mut changes = Changes::default();
+        for _ in 0..ticks.clamp(2, 400) {
+            self.tick_now(1.0 / 30.0);
+            if let Ok(image) = self.viewer.snapshot(&cam) {
+                changes.push(image);
+            }
+        }
+        let out = changes.report(self.viewer.blend_status().active.as_str());
+        dom::set(&out, "dynamicSplats", self.viewer.layer_len(LAYER_DYNAMIC) as u32);
         out.into()
     }
 
@@ -259,11 +300,14 @@ impl Page {
         out.into()
     }
 
-    /// One tick of the animated stage.
+    /// One tick of the animated stage, unless paused.
     fn tick(&self, dt: f32) {
-        if self.paused.get() {
-            return;
+        if !self.paused.get() {
+            self.tick_now(dt);
         }
+    }
+
+    fn tick_now(&self, dt: f32) {
         let mut guard = self.pipeline.borrow_mut();
         let Some(pipeline) = guard.as_mut() else { return };
         for message in scenes::tick_layers(pipeline, dt) {
@@ -293,6 +337,10 @@ fn export(page: &Rc<Page>) {
     let popping = Closure::<dyn FnMut(u32, f32) -> JsValue>::new(move |steps: u32, degrees: f32| p.popping(steps, degrees));
     dom::set(&api, "popping", popping.as_ref().clone());
     popping.forget();
+    let p = page.clone();
+    let flicker = Closure::<dyn FnMut(u32) -> JsValue>::new(move |ticks: u32| p.flicker(ticks));
+    dom::set(&api, "flicker", flicker.as_ref().clone());
+    flicker.forget();
     let p = page.clone();
     let fragments = Closure::<dyn FnMut() -> JsValue>::new(move || p.fragments());
     dom::set(&api, "fragments", fragments.as_ref().clone());

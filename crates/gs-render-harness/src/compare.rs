@@ -454,7 +454,13 @@ fn stage_views() -> Vec<SurfelView> {
         SurfelView { name: "stage_both_faces", cam: orbit, params: RenderParams { cull_backfaces: false, ..params }, only: normalized },
         SurfelView { name: "stage_equal_weights", cam: orbit, params: RenderParams { layer_weights: [1.0, 1.0], ..params }, only: normalized },
         SurfelView { name: "stage_static_only", cam: orbit, params: RenderParams { show_dynamic: false, ..params }, only: normalized },
-        SurfelView { name: "stage_max_radius", cam: orbit, params: RenderParams { max_radius_px: 1.0e6, ..params }, only: &["soft"] },
+        // The default fill-rate clamp must not touch a splat of this view.
+        SurfelView {
+            name: "stage_max_radius",
+            cam: orbit,
+            params: RenderParams { max_radius_px: RenderParams::default().max_radius_px, ..params },
+            only: &["soft"],
+        },
     ]
 }
 

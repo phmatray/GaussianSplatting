@@ -1,5 +1,6 @@
 // The dynamic layer: wire messages through Viewer::apply_message change the
-// picture over time while the static layer stays put.
+// picture over time while the static layer stays put; the blending mode
+// follows the content and the parameters.
 //   node e2e/render/live.cjs        (BUILD=1 to rebuild the harness first)
 const fs = require('fs');
 const path = require('path');
@@ -22,8 +23,12 @@ async function run({ browser, url }) {
   const s1 = await state(page);
   let img = await imageStats(page, f1, f0);
   check('live: the picture changes over time', img.diffChangedFrac > 0.003 && hasContent(img.left) && hasContent(img.right), `${(img.diffChangedFrac * 100).toFixed(2)} % of the pixels changed, mean abs diff ${img.diffMeanAbs.toFixed(2)}`);
-  check('live: ticks keep coming and each one redraws', s1.ticks > s0.ticks + 5 && s1.framesRendered > s0.framesRendered + 5 && s1.sorts > s0.sorts + 5,
-    `ticks +${s1.ticks - s0.ticks}, rendered +${s1.framesRendered - s0.framesRendered}, sorts +${s1.sorts - s0.sorts}`);
+  check('live: ticks keep coming and each one redraws', s1.ticks > s0.ticks + 5 && s1.framesRendered > s0.framesRendered + 5,
+    `ticks +${s1.ticks - s0.ticks}, rendered +${s1.framesRendered - s0.framesRendered}`);
+  // Wire layers are surfels: the default mode is normalised, which has no draw order.
+  check('live: wire layers are drawn normalised (soft) by default, in targets of the canvas size', s1.blend === 'normalized-soft' && s1.blendReason === 'surfel-content' && !s1.blendFallback && s1.offscreen[0] === s1.canvasWidth && s1.offscreen[1] === s1.canvasHeight,
+    `${s1.blend} (${s1.blendReason}), off-screen targets ${s1.offscreen.join('x')}, canvas ${s1.canvasWidth}x${s1.canvasHeight}`);
+  check('live: the normalised mode never sorts on the CPU', s1.sorts === 0, `${s1.sorts} sorts after ${s1.framesRendered} frames`);
   check('live: only the dynamic layer changes', s1.staticSplats === s0.staticSplats && s1.dynamicSplats !== s0.dynamicSplats, `static ${s1.staticSplats}, dynamic ${s0.dynamicSplats} -> ${s1.dynamicSplats}`);
   check('live: all visible splats are drawn', s1.splatsDrawn === s1.splatsTotal || Math.abs(s1.splatsDrawn - s1.splatsTotal) < 2000, `drawn ${s1.splatsDrawn} of ${s1.splatsTotal}`);
   console.log(`      tick ${s1.tickMs.toFixed(1)} ms (capture + encode + apply), apply_message ${s1.applyMs.toFixed(2)} ms, sort ${s1.sortMs.toFixed(2)} ms, viewer CPU ${s1.frameMs.toFixed(2)} ms/frame`);
@@ -36,6 +41,39 @@ async function run({ browser, url }) {
   const p1 = await shot(page, 'live-3-paused-later.png');
   img = await imageStats(page, p1, p0);
   check('live: paused animation gives a stable picture', img.diffMeanAbs === 0, `mean abs diff ${img.diffMeanAbs}`);
+
+  // ---- blending modes on the same (paused) cloud
+  await cmd(page, 'quality', 'hard');
+  await page.waitForTimeout(300);
+  const hard = await state(page);
+  const fHard = await shot(page, 'live-3b-normalized-hard.png');
+  img = await imageStats(page, fHard, p1);
+  check('live: quality selects hard silhouettes: the same picture but for the rims', hard.blend === 'normalized-hard' && hard.blendReason === 'surfel-content' && hard.sorts === 0 && img.diffMeanAbs > 0 && img.diffChangedFrac < 0.08,
+    `${hard.blend}, ${(img.diffChangedFrac * 100).toFixed(2)} % of the pixels differ from soft`);
+  await cmd(page, 'blend', 'sorted');
+  await page.waitForTimeout(300);
+  const sorted = await state(page);
+  const fSorted = await shot(page, 'live-3c-sorted.png');
+  img = await imageStats(page, fSorted, p1);
+  check('live: the sorted mode can be forced: it sorts, and gives up the off-screen targets', sorted.blend === 'sorted' && sorted.blendReason === 'requested' && !sorted.blendFallback && sorted.sorts > 0 && sorted.offscreen[0] === 0 && hasContent(img.left) && hasContent(img.right) && img.diffChangedFrac > 0.01,
+    `${sorted.blend} (${sorted.blendReason}), ${sorted.sorts} sorts, off-screen ${sorted.offscreen.join('x')}, ${(img.diffChangedFrac * 100).toFixed(1)} % of the pixels differ from normalised`);
+  await cmd(page, 'blend', 'auto');
+  await cmd(page, 'quality', 'soft');
+  await cmd(page, 'staticContent', 'imported');
+  await page.waitForTimeout(300);
+  const imported = await state(page);
+  await cmd(page, 'blend', 'normalized');
+  await page.waitForTimeout(300);
+  const forced = await state(page);
+  await cmd(page, 'blend', 'auto');
+  await cmd(page, 'staticContent', 'surfels');
+  await page.waitForTimeout(300);
+  const back = await state(page);
+  const fBack = await shot(page, 'live-3d-normalized-again.png');
+  img = await imageStats(page, fBack, p1);
+  check('live: auto follows the content: an imported layer is drawn sorted, surfels normalised', imported.blend === 'sorted' && imported.blendReason === 'imported-content' && forced.blend === 'normalized-soft' && forced.blendReason === 'requested' && back.blend === 'normalized-soft' && back.blendReason === 'surfel-content',
+    `imported: ${imported.blend} (${imported.blendReason}); forced: ${forced.blend} (${forced.blendReason}); surfels again: ${back.blend} (${back.blendReason})`);
+  check('live: switching modes back and forth reproduces the picture exactly', img.diffMeanAbs === 0, `mean abs diff ${img.diffMeanAbs}`);
 
   // ---- layer visibility
   const all = await state(page);

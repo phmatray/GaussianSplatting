@@ -5,8 +5,9 @@
 //! The reconstruction is always judged the way a viewer would see it: the
 //! pipeline's own [`Outgoing`] messages are decoded with [`codec::decode`],
 //! the two layers are maintained exactly as a client does, and the resulting
-//! cloud is rendered with the reference rasterizer from cameras that are
-//! *not* part of the rig or on the scan path.
+//! cloud is drawn by the CPU references of the viewer's two blending modes
+//! ([`Renderer`]) from cameras that are *not* part of the rig or on the scan
+//! path.
 
 #![allow(dead_code)]
 
@@ -15,10 +16,12 @@ use std::path::Path;
 
 use gs_core::capture::{render_reference, render_rgbd, CaptureOptions};
 use gs_core::codec::{self, Body, LayerMode, PreviewMsg};
+use gs_core::experimental::metrics::{self, classify, MaskParams, INTERIOR, SILHOUETTE, TEXTURE, UNOBSERVED};
+use gs_core::experimental::wblend::{self, Layer, WblendOptions, LIVE_LAYER_WEIGHT};
 use gs_core::glam::Vec3;
 use gs_core::pipeline::{scan_frame, scan_frame_count, scan_sensor, Outgoing, Pipeline, ScanFrame};
-use gs_core::protocol::{ControlMsg, PipelineConfig, ScanState, SessionState, Stats};
-use gs_core::raster::{psnr, rasterize, Image, RasterOptions};
+use gs_core::protocol::{ControlMsg, PipelineConfig, ScanState, SessionState, Stats, SORTED_SPLAT_SCALE};
+use gs_core::raster::Image;
 use gs_core::rig::ScanPath;
 use gs_core::scene::{house, SceneSnapshot};
 use gs_core::{Camera, RgbdFrame, Splat};
@@ -120,9 +123,11 @@ pub struct View {
     pub cam: Camera,
 }
 
-/// Image size of the held-out views.
-pub const VIEW_WIDTH: u32 = 320;
-pub const VIEW_HEIGHT: u32 = 240;
+/// Image size of the held-out views. Large enough that a splat of the
+/// default clouds covers a few pixels: at 320x240 the views are coarser
+/// than the sensors, and a finer reconstruction scores no better.
+pub const VIEW_WIDTH: u32 = 640;
+pub const VIEW_HEIGHT: u32 = 480;
 
 fn view(name: impl Into<String>, eye: Vec3, target: Vec3, fov_deg: f32) -> View {
     View { name: name.into(), cam: Camera::look_at(eye, target, Vec3::Y, fov_deg.to_radians(), VIEW_WIDTH, VIEW_HEIGHT) }
@@ -214,6 +219,45 @@ pub fn top_view() -> View {
     }
 }
 
+/// The two blending modes of a viewer (`docs/ARCHITECTURE.md`), drawn by
+/// their CPU references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renderer {
+    /// Normalised blending with soft silhouettes, the mode the clouds are
+    /// produced for and a viewer's default: splat scale 1, the live layer
+    /// weighted [`LIVE_LAYER_WEIGHT`] to 1.
+    Normalized,
+    /// Sorted "over" compositing, the fallback: splat scale
+    /// [`SORTED_SPLAT_SCALE`].
+    Sorted,
+}
+
+impl Renderer {
+    pub const BOTH: [Self; 2] = [Self::Normalized, Self::Sorted];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Normalized => "normalised",
+            Self::Sorted => "sorted",
+        }
+    }
+
+    fn options(self) -> WblendOptions {
+        match self {
+            Self::Normalized => WblendOptions::normalized_soft(),
+            Self::Sorted => WblendOptions { kernel_scale: SORTED_SPLAT_SCALE, ..WblendOptions::sorted() },
+        }
+    }
+
+    /// Draws the static and the live layer; returns the picture over
+    /// [`BACKGROUND`] and the coverage of every pixel.
+    pub fn draw(self, layers: &[Vec<Splat>; 2], cam: &Camera) -> (Image, Vec<f32>) {
+        let layers = [Layer { splats: &layers[0], weight: 1.0 }, Layer { splats: &layers[1], weight: LIVE_LAYER_WEIGHT }];
+        let rendered = wblend::render(&layers, cam, &self.options());
+        (rendered.over(BACKGROUND), rendered.alpha)
+    }
+}
+
 /// Result of comparing one held-out view.
 pub struct Score {
     /// PSNR of the splat render against the ray-cast reference, in dB, over
@@ -222,67 +266,54 @@ pub struct Score {
     /// PSNR over the pixels of the `observed` mask only (equal to `psnr`
     /// without a mask).
     pub psnr_observed: f32,
+    /// Mean SSIM of the luma.
+    pub ssim: f32,
+    /// PSNR on flat surfaces, around color edges and around depth edges
+    /// (bands of 4 pixels at 640x480), in dB.
+    pub interior: f32,
+    pub texture: f32,
+    pub silhouette: f32,
     /// Fraction of the pixels where the reference shows scene and the splats
-    /// accumulate at least half opacity.
+    /// cover at least half of the pixel.
     pub coverage: f32,
     /// The same, among the pixels of the `observed` mask.
     pub coverage_observed: f32,
-    /// Fraction of the scene pixels that are in the `observed` mask.
+    /// Fraction of the pixels that are in the `observed` mask.
     pub observed_fraction: f32,
     pub reference: Image,
     pub reconstruction: Image,
 }
 
-/// Renders `splats` and the true scene from `cam` and compares them.
-///
-/// The splats are rasterized over black and over white: the difference gives
-/// the accumulated opacity of every pixel, from which both the coverage and
-/// the image over [`BACKGROUND`] follow.
+/// Draws the two layers of a cloud with `renderer` and the true scene from
+/// `cam`, and compares them.
 ///
 /// `observed`, when given, marks the pixels whose surface point the sensors
 /// have seen at all (see [`observed_mask`]); the `*_observed` scores are
 /// restricted to them, which separates the quality of the reconstruction
 /// from the reach of the cameras.
-pub fn evaluate(snap: &SceneSnapshot, splats: &[Splat], cam: &Camera, shadows: bool, observed: Option<&[bool]>) -> Score {
-    let reference_frame = render_reference(snap, cam, shadows, 2, BACKGROUND);
-    let reference = Image::from_frame(&reference_frame);
-    let black = rasterize(splats, cam, &RasterOptions { background: [0, 0, 0], ..Default::default() });
-    let white = rasterize(splats, cam, &RasterOptions { background: [255, 255, 255], ..Default::default() });
-
-    let pixels = (cam.width * cam.height) as usize;
-    let mut reconstruction = Image::new(cam.width, cam.height, BACKGROUND);
-    let (mut scene, mut covered) = (0usize, 0usize);
-    let (mut seen, mut seen_covered, mut seen_error) = (0usize, 0usize, 0.0f64);
-    for i in 0..pixels {
-        // Per channel: white − black = 255·(1 − alpha).
-        let transparency: f32 =
-            (0..3).map(|c| white.rgb[i * 3 + c] as f32 - black.rgb[i * 3 + c] as f32).sum::<f32>() / (3.0 * 255.0);
-        let mut error = 0.0f64;
-        for (c, &background) in BACKGROUND.iter().enumerate() {
-            let v = (black.rgb[i * 3 + c] as f32 + transparency * background as f32).round().clamp(0.0, 255.0);
-            reconstruction.rgb[i * 3 + c] = v as u8;
-            error += (v as f64 - reference.rgb[i * 3 + c] as f64).powi(2);
-        }
-        let is_scene = reference_frame.depth[i] > 0.0;
-        if is_scene {
-            scene += 1;
-            covered += usize::from(transparency < 0.5);
-        }
-        if observed.is_none_or(|m| m[i]) {
-            seen += 1;
-            seen_error += error;
-            seen_covered += usize::from(transparency < 0.5 || !is_scene);
-        }
-    }
-    let ratio = |a: usize, b: usize| if b > 0 { a as f32 / b as f32 } else { 1.0 };
-    let mse = seen_error / (3 * seen.max(1)) as f64;
+pub fn evaluate(
+    snap: &SceneSnapshot,
+    layers: &[Vec<Splat>; 2],
+    cam: &Camera,
+    shadows: bool,
+    observed: Option<&[bool]>,
+    renderer: Renderer,
+) -> Score {
+    let reference = render_reference(snap, cam, shadows, 2, BACKGROUND);
+    let (reconstruction, alpha) = renderer.draw(layers, cam);
+    let regions = classify(&reference, observed, &MaskParams::default().scaled_to(cam.width));
+    let score = metrics::score(&reference, &reconstruction, &alpha, &regions);
     Score {
-        psnr: psnr(&reference, &reconstruction),
-        psnr_observed: if mse > 0.0 { (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32 } else { f32::INFINITY },
-        coverage: ratio(covered, scene),
-        coverage_observed: ratio(seen_covered, seen),
-        observed_fraction: ratio(seen, pixels),
-        reference,
+        psnr: score.psnr,
+        psnr_observed: score.psnr_observed,
+        ssim: score.ssim,
+        interior: score.psnr_region(INTERIOR),
+        texture: score.psnr_region(TEXTURE),
+        silhouette: score.psnr_region(SILHOUETTE),
+        coverage: score.coverage,
+        coverage_observed: score.coverage_observed,
+        observed_fraction: 1.0 - score.pixels[UNOBSERVED] as f32 / score.pixels.iter().sum::<u64>().max(1) as f32,
+        reference: Image::from_frame(&reference),
         reconstruction,
     }
 }

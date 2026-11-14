@@ -180,6 +180,97 @@ pub fn house_viewpoints() -> Vec<Viewpoint> {
     points
 }
 
+/// A small deterministic generator (SplitMix64) for the random viewpoints:
+/// the same seed gives the same views on every machine.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `lo..hi`.
+    pub fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * ((self.next() >> 40) as f32 / (1u64 << 24) as f32)
+    }
+}
+
+/// Random visitor views of the stage at instant `t`: `visitors` eyes
+/// anywhere between 1.6 m and 4.6 m from the axis and between knee height
+/// and well above the rig, looking somewhere at the dancer ([`Kind::Held`]),
+/// and `close` eyes 0.55 m to 1 m from the dancer's chest, all around it
+/// ([`Kind::Close`]). None of them was used to tune anything.
+pub fn stage_random_viewpoints(snap: &SceneSnapshot, t: f32, visitors: usize, close: usize, seed: u64) -> Vec<Viewpoint> {
+    let mut rng = Rng::new(seed ^ (t.to_bits() as u64) << 20);
+    let mut points = Vec::new();
+    for k in 0..visitors {
+        let (angle, radius) = (rng.range(0.0, std::f32::consts::TAU), rng.range(1.6, 4.6));
+        let eye = Vec3::new(radius * angle.sin(), rng.range(0.4, 2.8), radius * angle.cos());
+        let target = Vec3::new(rng.range(-0.3, 0.3), rng.range(0.5, 1.4), rng.range(-0.3, 0.3));
+        points.push(viewpoint(&format!("visitor{k}"), Kind::Held, eye, target, rng.range(40.0, 65.0)));
+    }
+    let joints = StageScene::new().dancer_joints(t);
+    let mut k = 0;
+    while k < close {
+        let (angle, elevation) = (rng.range(0.0, std::f32::consts::TAU), rng.range(-0.15, 0.7));
+        let direction = Vec3::new(elevation.cos() * angle.sin(), elevation.sin(), elevation.cos() * angle.cos());
+        let eye = joints.chest + direction * rng.range(0.55, 1.0);
+        let target = joints.chest.lerp(joints.neck, rng.range(-0.5, 1.0));
+        // Not inside an arm or a juggled ball.
+        if common::clearance(snap, eye) < 0.15 {
+            continue;
+        }
+        points.push(viewpoint(&format!("near{k}"), Kind::Close, eye, target, 50.0));
+        k += 1;
+    }
+    points
+}
+
+/// Random visitor views of the house: `visitors` eyes anywhere in free space
+/// (0.45 m from every surface) between sitting and standing height, looking
+/// in any direction ([`Kind::Held`]), and `close` eyes that look straight at
+/// a surface 0.45 m to 1.2 m away ([`Kind::Close`]).
+pub fn house_random_viewpoints(snap: &SceneSnapshot, visitors: usize, close: usize, seed: u64) -> Vec<Viewpoint> {
+    use gs_core::scene::house::{HALF_X, HALF_Z};
+    let mut rng = Rng::new(seed);
+    let direction = |rng: &mut Rng, lowest: f32, highest: f32| {
+        let (yaw, pitch) = (rng.range(0.0, std::f32::consts::TAU), rng.range(lowest, highest).to_radians());
+        Vec3::new(pitch.cos() * yaw.sin(), pitch.sin(), pitch.cos() * yaw.cos())
+    };
+    let eye_with = |rng: &mut Rng, clearance: f32| loop {
+        let eye = Vec3::new(rng.range(-HALF_X, HALF_X), rng.range(1.0, 1.8), rng.range(-HALF_Z, HALF_Z));
+        if common::clearance(snap, eye) >= clearance {
+            return eye;
+        }
+    };
+    let mut points = Vec::new();
+    for k in 0..visitors {
+        let eye = eye_with(&mut rng, 0.45);
+        let toward = direction(&mut rng, -35.0, 25.0);
+        points.push(viewpoint(&format!("visitor{k}"), Kind::Held, eye, eye + toward, 70.0));
+    }
+    let mut k = 0;
+    while k < close {
+        let eye = eye_with(&mut rng, 0.3);
+        let toward = direction(&mut rng, -40.0, 20.0);
+        let Some(hit) = snap.raycast(eye, toward, 1.2) else { continue };
+        if hit.t < 0.45 {
+            continue;
+        }
+        points.push(viewpoint(&format!("near{k}"), Kind::Close, eye, hit.pos, 60.0));
+        k += 1;
+    }
+    points
+}
+
 /// One render of one view.
 pub struct ViewResult {
     pub score: Score,

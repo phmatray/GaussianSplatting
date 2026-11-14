@@ -24,7 +24,12 @@ async function run({ browser, url }) {
   console.log('\n=== nav: desktop navigation ===');
   const { ctx, page, logs } = await newPage(browser, { width: 960, height: 600, hasTouch: true });
   // Few, coarse cameras: headless Chromium rasterizes in software.
-  await page.goto(`${url}/?test=live&static_cams=4&capture_scale=0.5`);
+  // Sorted blending: the fly and damping checks below time the camera
+  // against the wall clock, and the viewer caps a frame's time step at 0.1 s.
+  // The software rasterizer of a headless browser stays above 10 frames per
+  // second in the sorted mode only. Navigation does not depend on the mode;
+  // modes.cjs repeats resize and context loss in the normalised one.
+  await page.goto(`${url}/?test=live&static_cams=4&capture_scale=0.5&blend=sorted`);
   await waitLive(page);
   // Freeze the dancer: from here on only navigation changes the picture.
   await cmd(page, 'pause', true);

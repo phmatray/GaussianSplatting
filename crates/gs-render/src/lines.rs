@@ -9,10 +9,11 @@ use crate::glutil::{link_program, uniform};
 use crate::shaders::{line_fs, DEPTH_OCTAVES, LINE_VS};
 
 /// A line is hidden where it lies more than this fraction of its depth
-/// behind the visible surface. Three times the tolerance of the splats
-/// themselves, so that a grid lying *on* a reconstructed floor (whose
-/// surfels sit a few millimeters above or below it) stays in one piece.
-const OCCLUSION_TOLERANCE: f32 = 0.03;
+/// behind the visible surface. Twice the tolerance of the splats
+/// themselves, so that a grid lying *on* a reconstructed floor stays in one
+/// piece: seen from a height `h`, surfels `d` above the grid are `d / h` of
+/// the depth in front of it (a centimeter of noise, seen from 0.5 m up).
+const OCCLUSION_TOLERANCE: f32 = 0.02;
 
 /// Texture unit of the surface depth while lines are drawn.
 const SURFACE_UNIT: u32 = 1;

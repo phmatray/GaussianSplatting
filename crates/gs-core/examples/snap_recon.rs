@@ -1,9 +1,11 @@
 //! Novel-view check of the whole pipeline, with pictures.
 //!
-//! Runs the [`Pipeline`], decodes its messages like a viewer, renders the
-//! reconstructed cloud from held-out cameras with the CPU rasterizer and
-//! compares it with the ray-cast scene (PSNR, coverage). Writes
-//! `reference | reconstruction | 4x difference` sheets as PNG.
+//! Runs the [`Pipeline`], decodes its messages like a viewer, draws the
+//! reconstructed cloud from held-out cameras with the CPU reference of a
+//! viewer's blending mode (normalised by default, `--sorted` for the
+//! fallback) and compares it with the ray-cast scene (PSNR by region, SSIM,
+//! coverage). Writes `reference | reconstruction | 4x difference` sheets as
+//! PNG.
 //!
 //! ```text
 //! cargo run -p gs-core --release --features par --example snap_recon -- <out dir> [options]
@@ -13,7 +15,8 @@
 //!   --noise                      realistic sensor noise
 //!   --light                      start from PipelineConfig::light
 //!   --no-png                     numbers only
-//!   --half-res                   held-out views of the stage at 160x120 instead of 320x240
+//!   --sorted                     draw with sorted "over" compositing and its splat scale
+//!   --half-res                   held-out views of the stage at 320x240 instead of 640x480
 //!   --previews-from <seconds>    where on the walk the preview strip starts (default 24)
 //! ```
 //!
@@ -30,7 +33,7 @@ use std::time::Instant;
 
 use common::{
     evaluate, house_views, mean, observed_mask, run_full_scan, save_png, side_by_side, stack, stage_views, top_view, Client,
-    Exposures,
+    Exposures, Renderer,
 };
 use gs_core::capture::NoiseModel;
 use gs_core::codec::{self, Body};
@@ -48,6 +51,7 @@ struct Options {
     noise: bool,
     light: bool,
     png: bool,
+    renderer: Renderer,
     /// Divides the resolution of the held-out views.
     view_divisor: u32,
     /// Walking time at which the preview strip starts, seconds.
@@ -62,6 +66,7 @@ fn parse_args() -> Options {
         noise: false,
         light: false,
         png: true,
+        renderer: Renderer::Normalized,
         view_divisor: 1,
         previews_from: 24.0,
     };
@@ -82,6 +87,7 @@ fn parse_args() -> Options {
             "--noise" => options.noise = true,
             "--light" => options.light = true,
             "--no-png" => options.png = false,
+            "--sorted" => options.renderer = Renderer::Sorted,
             "--half-res" => options.view_divisor = 2,
             "--previews-from" => {
                 options.previews_from =
@@ -127,12 +133,20 @@ fn stage(options: &Options) {
         client.apply(&pipeline.tick(dt));
         let time = pipeline.scene_time();
         let snap = scene.snapshot(time);
-        let cloud = client.cloud();
         dynamic.push(client.layers[1].len() as f32);
         let mut sheets = Vec::new();
         for view in &views {
-            let score = evaluate(&snap, &cloud, &view.cam, pipeline.config().shadows, None);
-            println!("  t={time:4.1} {:8} psnr {:5.2} dB  coverage {:5.1} %", view.name, score.psnr, 100.0 * score.coverage);
+            let score = evaluate(&snap, &client.layers, &view.cam, pipeline.config().shadows, None, options.renderer);
+            println!(
+                "  t={time:4.1} {:8} psnr {:5.2} dB (interior {:4.1}, texture {:4.1}, silhouette {:4.1})  ssim {:.3}  coverage {:5.1} %",
+                view.name,
+                score.psnr,
+                score.interior,
+                score.texture,
+                score.silhouette,
+                score.ssim,
+                100.0 * score.coverage
+            );
             all.push(score.psnr);
             sheets.push(side_by_side(&score));
         }
@@ -142,7 +156,8 @@ fn stage(options: &Options) {
     }
     let stats = *client.stats();
     println!(
-        "RESULT stage psnr_mean={:.2} psnr_min={:.2} static={} dynamic={:.0} tick_bytes={}",
+        "RESULT stage renderer={} psnr_mean={:.2} psnr_min={:.2} static={} dynamic={:.0} tick_bytes={}",
+        options.renderer.name(),
         mean(&all),
         all.iter().copied().fold(f32::INFINITY, f32::min),
         client.layers[0].len(),
@@ -159,7 +174,7 @@ fn house(options: &Options) {
     let start = Instant::now();
     let ticks = run_full_scan(&mut pipeline, &mut client);
     let scan_s = start.elapsed().as_secs_f64();
-    let cloud = client.cloud();
+    let cloud = &client.layers[0];
     println!("house: {} splats after {ticks} ticks, {scan_s:.1} s, {} bytes on the wire", cloud.len(), client.bytes);
 
     let exposures = Exposures::of_scan(&snap, pipeline.config());
@@ -167,7 +182,7 @@ fn house(options: &Options) {
     let (mut psnrs_observed, mut coverages_observed, mut observed) = (Vec::new(), Vec::new(), Vec::new());
     for view in house_views() {
         let mask = observed_mask(&snap, &exposures, &view.cam);
-        let score = evaluate(&snap, &cloud, &view.cam, pipeline.config().shadows, Some(&mask));
+        let score = evaluate(&snap, &client.layers, &view.cam, pipeline.config().shadows, Some(&mask), options.renderer);
         println!(
             "  {:12} psnr {:5.2} dB  coverage {:5.1} %   where observed ({:5.1} %): psnr {:5.2} dB  coverage {:5.1} %",
             view.name,
@@ -196,7 +211,7 @@ fn house(options: &Options) {
         let open = HouseScene::with_options(HouseOptions { ceiling: false }).snapshot(0.0);
         let clipped: Vec<_> = cloud.iter().copied().filter(|s| s.pos[1] < ceiling - 0.15).collect();
         let top = top_view();
-        let mut score = evaluate(&open, &clipped, &top.cam, pipeline.config().shadows, None);
+        let mut score = evaluate(&open, &[clipped, Vec::new()], &top.cam, pipeline.config().shadows, None, options.renderer);
         for p in &state.scan.as_ref().expect("the house reports its scan path").path {
             let Some((x, y, _)) = top.cam.project(Vec3::from_array(*p)) else { continue };
             let image = &mut score.reconstruction;
@@ -213,8 +228,9 @@ fn house(options: &Options) {
     }
     let min = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min);
     println!(
-        "RESULT house psnr_mean={:.2} psnr_min={:.2} coverage_mean={:.2} coverage_min={:.2} observed={:.1} \
+        "RESULT house renderer={} psnr_mean={:.2} psnr_min={:.2} coverage_mean={:.2} coverage_min={:.2} observed={:.1} \
          psnr_obs_mean={:.2} psnr_obs_min={:.2} coverage_obs_mean={:.2} coverage_obs_min={:.2} splats={} scan_s={:.1}",
+        options.renderer.name(),
         mean(&psnrs),
         min(&psnrs),
         100.0 * mean(&coverages),

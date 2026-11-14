@@ -46,6 +46,22 @@
 //! (a viewer's splat scale of about 1.45): eight overlapping clouds no longer
 //! hide the gaps between the splats of one camera.
 //!
+//! # What was tried and dropped
+//!
+//! Measured on the default stage with realistic sensor noise, eight 240x180
+//! cameras, normalised blending (`examples/quality_report.rs`):
+//!
+//! * *Hysteresis* (a quality bonus for the pixels kept on the previous
+//!   tick): no effect on the flicker of a still subject, at any strength.
+//!   The seams between cameras do not wander enough to show.
+//! * *Keeping the dominated splats with a reduced blending weight*
+//!   (`(q / q_best)^p` in the opacity byte): +0.2 dB without noise, nothing
+//!   with noise, for 60 % more splats on the wire.
+//!
+//! What a fused cloud of a still, noisy subject does flicker more than the
+//! stacked one (4 to 11 % in RMS) comes from averaging fewer observations
+//! per pixel; with the subject moving it flickers 4 to 7 % less.
+//!
 //! # Cost
 //!
 //! One projection per splat and per camera that can see its surface, cut
@@ -81,14 +97,19 @@ pub struct MultiViewParams {
     /// The normals of two observations of the same surface point make at
     /// least this cosine.
     pub min_normal_dot: f32,
-    /// A pixel on the rim of its camera's splats (a 4-neighbour produced no
-    /// splat) never replaces another camera's splat.
-    pub edge_guard: bool,
+    /// ... and the replaced one lies on the tangent plane of the better one
+    /// within this fraction of the depth.
+    pub plane_tolerance: f32,
+    /// Width in pixels of the rim of a camera's splats that never replaces
+    /// another camera's splat: a pixel is on the rim when one of its
+    /// 4-neighbours produced no splat, and so on inward. `0` disables the
+    /// guard.
+    pub edge_guard: u32,
 }
 
 impl Default for MultiViewParams {
     fn default() -> Self {
-        Self { enabled: true, margin: 0.25, tolerance: 0.03, min_normal_dot: 0.3, edge_guard: true }
+        Self { enabled: true, margin: 0.25, tolerance: 0.03, min_normal_dot: 0.3, plane_tolerance: 0.006, edge_guard: 2 }
     }
 }
 
@@ -103,7 +124,8 @@ impl MultiViewParams {
             margin: clamp(self.margin, d.margin, 0.0, 10.0),
             tolerance: clamp(self.tolerance, d.tolerance, 1.0e-4, 0.5),
             min_normal_dot: clamp(self.min_normal_dot, d.min_normal_dot, -1.0, 1.0),
-            edge_guard: self.edge_guard,
+            plane_tolerance: clamp(self.plane_tolerance, d.plane_tolerance, 1.0e-4, 0.5),
+            edge_guard: self.edge_guard.min(16),
         }
     }
 }
@@ -139,6 +161,7 @@ const NONE: u32 = u32::MAX;
 /// What the fusion needs to know about a splat that may dominate another.
 #[derive(Clone, Copy)]
 struct Cover {
+    position: Vec3A,
     normal: Vec3A,
     depth: f32,
     quality: f32,
@@ -174,24 +197,29 @@ impl Table {
                 *slot = k as u32;
             }
         }
-        let slot = if params.edge_guard {
-            let has = |x: usize, y: usize| emitted[y * w + x] != NONE;
+        // Peel the rim off `edge_guard` times: what is left may dominate.
+        let mut slot = emitted;
+        for _ in 0..params.edge_guard {
+            let has = |x: usize, y: usize| slot[y * w + x] != NONE;
             let mut inner = vec![NONE; w * h];
             for y in 1..h.saturating_sub(1) {
                 for x in 1..w.saturating_sub(1) {
                     if has(x - 1, y) && has(x + 1, y) && has(x, y - 1) && has(x, y + 1) {
-                        inner[y * w + x] = emitted[y * w + x];
+                        inner[y * w + x] = slot[y * w + x];
                     }
                 }
             }
-            inner
-        } else {
-            emitted
-        };
+            slot = inner;
+        }
         let covers = view
             .splats
             .iter()
-            .map(|s| Cover { normal: Vec3A::from(s.normal), depth: s.depth, quality: quality(cam, s) })
+            .map(|s| Cover {
+                position: Vec3A::from(s.splat.pos),
+                normal: Vec3A::from(s.normal),
+                depth: s.depth,
+                quality: quality(cam, s),
+            })
             .collect();
         let inverse = cam.world_from_cam.inverse();
         Self {
@@ -263,7 +291,11 @@ fn dominators(tables: &[Table], own: usize, view: &View, params: &MultiViewParam
                 continue;
             }
             let other = &table.covers[index as usize];
-            if other.quality > needed && (other.depth - z).abs() <= tolerance * z && other.normal.dot(normal) >= params.min_normal_dot {
+            if other.quality > needed
+                && (other.depth - z).abs() <= tolerance * z
+                && other.normal.dot(normal) >= params.min_normal_dot
+                && other.normal.dot(p - other.position).abs() <= params.plane_tolerance * z
+            {
                 out.list.push(table.first + index);
             }
         }
@@ -454,7 +486,8 @@ mod tests {
         (per_view, stats)
     }
 
-    const GREEDY: MultiViewParams = MultiViewParams { enabled: true, margin: 0.0, tolerance: 0.03, min_normal_dot: 0.3, edge_guard: true };
+    const GREEDY: MultiViewParams =
+        MultiViewParams { enabled: true, margin: 0.0, tolerance: 0.03, min_normal_dot: 0.3, plane_tolerance: 0.006, edge_guard: 2 };
 
     #[test]
     fn the_frontal_camera_wins_and_nothing_else_changes() {
@@ -490,9 +523,86 @@ mod tests {
         let frames: Vec<RgbdFrame> = cams.iter().map(|c| shoot(c, |_| false, ball)).collect();
         let splats = candidates(&cams, &frames);
         assert!(splats[0].len() >= 4, "{}", splats[0].len());
-        let params = MultiViewParams { edge_guard: false, ..GREEDY };
+        let params = MultiViewParams { edge_guard: 0, ..GREEDY };
         let (_, stats) = fused(&cams, &splats, &params);
         assert_eq!(stats.kept, stats.input);
+    }
+
+    #[test]
+    fn a_splat_only_gives_way_to_one_on_its_own_surface() {
+        use crate::capture::{render_rgbd, CaptureOptions};
+        use crate::scene::{Lighting, Material, Primitive, SceneSnapshot};
+        // A hand held 7 cm in front of the chest, seen from the front and
+        // from 40 degrees to the side. The side camera sees a strip of the
+        // chest that the hand hides from the front camera; along the rays
+        // of the front camera that strip lies 7 cm behind the hand, inside
+        // any depth tolerance that survives sensor noise at 3 m, and both
+        // surfaces face the same way. Only the distance to the tangent
+        // plane tells them apart.
+        let gray = Material::solid(Vec3::splat(0.7));
+        let chest = Primitive::cuboid(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.3, 0.3, 0.02), gray);
+        let hand = Primitive::cuboid(Vec3::new(0.0, 1.0, 0.08), Vec3::new(0.06, 0.06, 0.01), gray);
+        let snap = SceneSnapshot::new(vec![chest, hand], Lighting::default());
+        let fine = |eye: Vec3| Camera::look_at(eye, Vec3::new(0.0, 1.0, 0.0), Vec3::Y, 0.8, 320, 240);
+        let cams = [fine(Vec3::new(0.0, 1.0, 3.2)), fine(Vec3::new(2.2, 1.0, 2.6))];
+        let frames: Vec<RgbdFrame> = cams.iter().map(|c| render_rgbd(&snap, c, &CaptureOptions::default())).collect();
+        let splats = candidates(&cams, &frames);
+        assert!(splats.iter().all(|list| list.len() > 1000), "{:?}", splats.iter().map(Vec::len).collect::<Vec<_>>());
+        // Dropped splats without a kept splat of another camera on their own
+        // surface (within 2 cm of its plane, 2.5 cm away, normals agreeing).
+        let orphans = |params: &MultiViewParams| {
+            let (per_view, stats) = fused(&cams, &splats, params);
+            let mut orphans = 0;
+            for (i, list) in splats.iter().enumerate() {
+                for s in list.iter().filter(|s| !per_view[i].contains(&s.splat)) {
+                    let p = s.splat.position();
+                    let covered = per_view.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, kept)| kept).any(|k| {
+                        let normal = k.rotation() * Vec3::Z;
+                        let offset = p - k.position();
+                        normal.dot(offset).abs() < 0.02 && offset.length() < 0.025 && normal.dot(s.normal) > 0.3
+                    });
+                    orphans += usize::from(!covered);
+                }
+            }
+            (orphans, stats.input - stats.kept)
+        };
+        let params = MultiViewParams { edge_guard: 1, ..GREEDY };
+        let (loose, loose_dropped) = orphans(&MultiViewParams { plane_tolerance: 0.5, ..params });
+        let (tight, tight_dropped) = orphans(&params);
+        println!("orphans: {loose} of {loose_dropped} dropped without the plane test, {tight} of {tight_dropped} with it");
+        // Measured: 6 of 1826 without the plane test, 0 of 1810 with it.
+        assert!(loose >= 5, "the depth test alone tells the surfaces apart: {loose} of {loose_dropped}");
+        assert_eq!(tight, 0, "{tight} of {tight_dropped} dropped splats gave way to another surface");
+        assert!(tight_dropped > 500, "nothing left to fuse: {tight_dropped}");
+    }
+
+    #[test]
+    fn the_rim_of_a_camera_never_replaces_anything() {
+        // One camera straight above a floor patch, one at a grazing angle:
+        // the wider the guarded rim of the frontal view, the more of the
+        // grazing view stays, and what is dropped lies inside the frontal
+        // view's patch by the width of the guard.
+        let cams = [camera(Vec3::new(0.0, 3.0, 0.01)), camera(Vec3::new(0.0, 0.9, 3.0))];
+        let frames: Vec<RgbdFrame> = cams.iter().map(|c| shoot(c, |p| p.length() < 0.8, None)).collect();
+        let splats = candidates(&cams, &frames);
+        // Footprint of a pixel of the frontal camera on the floor.
+        let pixel = 3.0 / cams[0].fx;
+        let mut kept_before = 0;
+        for guard in 0..=4u32 {
+            let (per_view, _) = fused(&cams, &splats, &MultiViewParams { edge_guard: guard, ..GREEDY });
+            assert_eq!(per_view[0].len(), splats[0].len(), "guard {guard}");
+            assert!(per_view[1].len() > kept_before || guard == 0, "guard {guard}: {} kept", per_view[1].len());
+            kept_before = per_view[1].len();
+            for s in splats[1].iter().filter(|s| !per_view[1].contains(&s.splat)) {
+                let radius = s.splat.position().length();
+                // The rim is peeled in 4-neighbour steps, so along a diagonal
+                // a step is 0.7 pixels; the center of a dropped splat lies
+                // anywhere in the pixel that replaces it.
+                let inset = (guard as f32 * std::f32::consts::FRAC_1_SQRT_2 - 0.75) * pixel;
+                assert!(radius < 0.8 - inset, "guard {guard}: dropped {radius} m from the center");
+            }
+        }
+        assert!(kept_before < splats[1].len(), "a guard of 4 pixels keeps everything of a patch 38 pixels wide");
     }
 
     #[test]
@@ -527,7 +637,7 @@ mod tests {
         let ball = Some((Vec3::new(0.2, 0.4, 0.1), 0.4));
         let frames: Vec<RgbdFrame> = cams.iter().map(|c| shoot(c, |p| p.length() < 1.2, ball)).collect();
         let splats = candidates(&cams, &frames);
-        for params in [GREEDY, MultiViewParams::default(), MultiViewParams { edge_guard: false, ..GREEDY }] {
+        for params in [GREEDY, MultiViewParams::default(), MultiViewParams { edge_guard: 0, ..GREEDY }] {
             let all = views(&cams, &splats);
             let tables: Vec<Table> = {
                 let mut first = 0;
@@ -587,9 +697,16 @@ mod tests {
         assert_eq!(fuse(&[], &GREEDY, &mut out), FusionStats::default());
         assert!(out.is_empty());
         // Hostile parameters are tamed.
-        let wild = MultiViewParams { enabled: true, margin: f32::NAN, tolerance: -3.0, min_normal_dot: f32::INFINITY, edge_guard: false };
+        let wild = MultiViewParams {
+            enabled: true,
+            margin: f32::NAN,
+            tolerance: -3.0,
+            min_normal_dot: f32::INFINITY,
+            plane_tolerance: f32::NEG_INFINITY,
+            edge_guard: u32::MAX,
+        };
         let tame = wild.sanitized();
-        assert_eq!((tame.margin, tame.tolerance, tame.min_normal_dot), (0.25, 1.0e-4, 0.3));
+        assert_eq!((tame.margin, tame.tolerance, tame.min_normal_dot, tame.plane_tolerance), (0.25, 1.0e-4, 0.3, 0.006));
         assert_eq!(tame.sanitized(), tame);
         assert_eq!(serde_json::from_str::<MultiViewParams>("{}").unwrap(), MultiViewParams::default());
     }

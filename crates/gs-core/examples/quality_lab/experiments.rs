@@ -50,13 +50,22 @@ pub struct StageRecipe {
     pub cameras: Option<Vec<usize>>,
 }
 
+/// The reconstruction parameters the lab calls "today": the product's
+/// before the quality round, when the rim splats of the foreground were
+/// narrowed like all others.
+pub fn lab_recon() -> ReconstructParams {
+    let mut recon = ReconstructParams::default();
+    recon.background.edge_shrink = recon.edge_shrink;
+    recon
+}
+
 impl Default for StageRecipe {
     fn default() -> Self {
         Self {
             scale: 1,
             size: None,
             sensor: Sensor::Native,
-            recon: ReconstructParams::default(),
+            recon: lab_recon(),
             exact_normals: false,
             fusion: None,
             cameras: None,

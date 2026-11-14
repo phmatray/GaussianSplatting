@@ -12,15 +12,22 @@
 //!       [--set '<JSON patch of the configuration>']
 //! cargo run -p gs-core --release --features par --example quality_report -- score  <dir> <label> [--only <text>]
 //!       [--res 1280x960] [--variants sorted:1,soft:1,hard:1] [--every <n>] [--no-temporal]
+//!       [--random <visitors>,<close>,<seed>]
 //! cargo run -p gs-core --release --features par --example quality_report -- sheets <dir> <before> <after>
-//!       [--before sorted:1] [--after sorted:1,soft:1]
+//!       [--before sorted:1] [--after fallback:1.4,soft:1] [--after-house fallback:1.4,soft:0.8]
 //! ```
 //!
 //! A variant is `<mode>:<splat scale>`: `sorted` is back-to-front "over"
-//! compositing, `soft` and `hard` are the two quality levels of the
+//! compositing with the plain dilation of the viewer before the quality
+//! round, `fallback` is today's sorted mode (the same with the energy
+//! conserving low-pass), `soft` and `hard` are the two quality levels of the
 //! normalised mode (see "Blending modes" in `docs/ARCHITECTURE.md`); the
 //! splat scale multiplies every standard deviation, as a viewer's splat
 //! scale setting does.
+//!
+//! `--random` judges from seeded random visitor views and close-ups instead
+//! of the fixed held-out ones: a gain that only shows on the views a change
+//! was tuned on is not a gain.
 //!
 //! The temporal metric compares consecutive ticks drawn from one fixed
 //! held-out view with the change of the ground truth between the same two
@@ -46,8 +53,8 @@ use gs_core::rig::ScanPath;
 use gs_core::scene::{make_scene, SceneKind, SceneSnapshot};
 use gs_core::Splat;
 use harness::{
-    crop_row, evaluate, evaluate_set, house_viewpoints, panel_row, stage_viewpoints, table_header, table_row, EvalView, Kind, Lab,
-    Viewpoint,
+    crop_row, evaluate, evaluate_set, house_random_viewpoints, house_viewpoints, panel_row, stage_random_viewpoints, stage_viewpoints,
+    table_header, table_row, EvalView, Kind, Lab, Viewpoint,
 };
 
 /// The two instants of the dance the stage is judged at (as in the lab).
@@ -230,12 +237,14 @@ impl Variant {
         let scale: f32 = scale.parse().unwrap_or_else(|_| panic!("bad splat scale in {text:?}"));
         let base = match mode {
             "sorted" => WblendOptions::default(),
+            "fallback" => WblendOptions::sorted(),
             "soft" => WblendOptions::normalized_soft(),
             "hard" => WblendOptions::normalized_hard(),
-            other => panic!("unknown renderer {other:?} (sorted, soft, hard)"),
+            other => panic!("unknown renderer {other:?} (sorted, fallback, soft, hard)"),
         };
         let name = match mode {
-            "sorted" => format!("sorted x{scale}"),
+            "sorted" => format!("sorted (old filter) x{scale}"),
+            "fallback" => format!("sorted x{scale}"),
             other => format!("normalised {other} x{scale}"),
         };
         Self { name, opts: WblendOptions { kernel_scale: scale, ..base } }
@@ -312,6 +321,24 @@ struct ScoreArgs {
     /// Use every n-th held-out house view.
     every: usize,
     temporal: bool,
+    /// Judge from random visitor views instead of the fixed held-out ones.
+    random: Option<RandomViews>,
+}
+
+/// `--random <visitors>,<close>,<seed>`: viewpoints nothing was tuned on.
+#[derive(Clone, Copy)]
+struct RandomViews {
+    visitors: usize,
+    close: usize,
+    seed: u64,
+}
+
+impl RandomViews {
+    fn parse(text: &str) -> Self {
+        let mut parts = text.split(',').map(|p| p.parse::<u64>().expect("--random wants <visitors>,<close>,<seed>"));
+        let mut next = || parts.next().expect("--random wants <visitors>,<close>,<seed>");
+        Self { visitors: next() as usize, close: next() as usize, seed: next() }
+    }
 }
 
 fn luma(image: &Image, i: usize) -> f32 {
@@ -380,8 +407,12 @@ fn score_stage(lab: &Lab, row: &str, dir: &Path, args: &ScoreArgs, temporal: &mu
     let (mut views, mut instant) = (Vec::new(), Vec::new());
     for (k, &t) in times.iter().enumerate() {
         let snap = scene.snapshot(t);
-        for point in stage_viewpoints(t) {
-            views.push(eval_view(lab, &format!("stage_t{t}"), None, &point, args.resolution, &snap));
+        let (points, key) = match args.random {
+            Some(r) => (stage_random_viewpoints(&snap, t, r.visitors, r.close, r.seed), format!("stage_t{t}_s{}", r.seed)),
+            None => (stage_viewpoints(t), format!("stage_t{t}")),
+        };
+        for point in points {
+            views.push(eval_view(lab, &key, None, &point, args.resolution, &snap));
             instant.push(k);
         }
     }
@@ -405,9 +436,23 @@ fn score_stage(lab: &Lab, row: &str, dir: &Path, args: &ScoreArgs, temporal: &mu
 }
 
 /// The evaluation views of a stored house scan.
-fn house_views(lab: &Lab, observed_key: &str, config: &PipelineConfig, resolution: (u32, u32), every: usize) -> Vec<EvalView> {
+fn house_views(
+    lab: &Lab,
+    observed_key: &str,
+    config: &PipelineConfig,
+    resolution: (u32, u32),
+    every: usize,
+    random: Option<RandomViews>,
+) -> Vec<EvalView> {
     let snap = make_scene(SceneKind::House).snapshot(0.0);
     let exposures = scan_exposures(&snap, config);
+    if let Some(r) = random {
+        let key = format!("{observed_key}_s{}", r.seed);
+        return house_random_viewpoints(&snap, r.visitors, r.close, r.seed)
+            .iter()
+            .map(|point| eval_view(lab, &format!("house_s{}", r.seed), Some((&key, &exposures)), point, resolution, &snap))
+            .collect();
+    }
     let mut held = 0;
     house_viewpoints()
         .iter()
@@ -426,7 +471,7 @@ fn score_house(lab: &Lab, row: &str, observed_key: &str, dir: &Path, args: &Scor
     let meta = read_meta(dir);
     let config = config_of(&meta);
     let splats = read_splats(&dir.join("static.splats"));
-    let views = house_views(lab, observed_key, &config, args.resolution, args.every);
+    let views = house_views(lab, observed_key, &config, args.resolution, args.every, args.random);
     let count = harness::thousands(splats.len());
     let wire = harness::bytes(splats.len() * WIRE);
     for variant in &args.variants {
@@ -483,10 +528,18 @@ fn caption(label: &str, variant: &Variant, score: &gs_core::experimental::metric
     format!("{label}, {}  {:.2} dB  SSIM {:.3}", variant.name, score.psnr, score.ssim)
 }
 
-fn sheets(lab: &Lab, before: &str, after: &str, before_variants: &[Variant], after_variants: &[Variant], only: Option<&str>) {
+fn sheets(
+    lab: &Lab,
+    before: &str,
+    after: &str,
+    before_variants: &[Variant],
+    after_stage: &[Variant],
+    after_house: &[Variant],
+    only: Option<&str>,
+) {
     const FULL: (u32, u32) = (1280, 960);
     std::fs::create_dir_all(lab.out.join("sheets/preview")).expect("cannot create the sheet directory");
-    let sides = [(before, "before", before_variants), (after, "after", after_variants)];
+    let sides = [(before, "before", before_variants), (after, "after", after_stage)];
 
     if only.is_none_or(|o| "stage".contains(o)) {
         let scene = make_scene(SceneKind::Stage);
@@ -517,6 +570,7 @@ fn sheets(lab: &Lab, before: &str, after: &str, before_variants: &[Variant], aft
         }
     }
 
+    let sides = [(before, "before", before_variants), (after, "after", after_house)];
     if only.is_none_or(|o| "house".contains(o)) {
         let snap = make_scene(SceneKind::House).snapshot(0.0);
         let scenario = "house_default_clean";
@@ -583,14 +637,16 @@ fn main() {
                 variants: Variant::list(option(rest, "--variants").unwrap_or("sorted:1,soft:1,hard:1")),
                 every: option(rest, "--every").map_or(1, |n| n.parse().expect("bad --every")),
                 temporal: !rest.iter().any(|a| a == "--no-temporal"),
+                random: option(rest, "--random").map(RandomViews::parse),
             };
             score(&lab, label, only, &score_args);
         }
         "sheets" => {
             let after = rest.first().expect("sheets wants a before and an after label");
             let before_variants = Variant::list(option(rest, "--before").unwrap_or("sorted:1"));
-            let after_variants = Variant::list(option(rest, "--after").unwrap_or("sorted:1,soft:1"));
-            sheets(&lab, label, after, &before_variants, &after_variants, only);
+            let after_stage = Variant::list(option(rest, "--after").unwrap_or("fallback:1.4,soft:1"));
+            let after_house = Variant::list(option(rest, "--after-house").unwrap_or("fallback:1.4,soft:0.8"));
+            sheets(&lab, label, after, &before_variants, &after_stage, &after_house, only);
         }
         other => eprintln!("unknown command {other:?}\n{usage}"),
     }

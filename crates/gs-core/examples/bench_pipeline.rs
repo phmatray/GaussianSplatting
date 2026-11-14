@@ -5,8 +5,9 @@
 //! cargo run -p gs-core --release --features par --example bench_pipeline   # rayon
 //! ```
 //!
-//! Prints one `RESULT` line per scenario; an argument keeps the scenarios
-//! whose label contains it. The stage numbers are taken over two loops of
+//! Prints one `RESULT` line per scenario; a first argument keeps the
+//! scenarios whose label contains it, a second one is a JSON object merged
+//! into their configuration (`bench_pipeline "house light" '{"scan":{"voxel_size":0.032}}'`). The stage numbers are taken over two loops of
 //! the dance at the configured tick rate; the house is scanned twice, once in
 //! real-time steps (per-tick cost, sensor frames per tick, previews) and once
 //! with `ScanFinish` (time to fuse the whole path).
@@ -213,6 +214,17 @@ fn main() {
 
     let filter = std::env::args().nth(1);
     let wanted = |label: &str| filter.as_deref().is_none_or(|f| label.contains(f));
+    let patch: Option<serde_json::Value> =
+        std::env::args().nth(2).map(|text| serde_json::from_str(&text).expect("the second argument is a JSON object"));
+    // The patch goes through the pipeline's own `PatchConfig`.
+    let patched = |config: PipelineConfig| match &patch {
+        Some(patch) => {
+            let mut pipeline = Pipeline::new(PipelineConfig { paused: true, ..config });
+            pipeline.handle_control(ControlMsg::PatchConfig { patch: patch.clone() });
+            PipelineConfig { paused: config.paused, ..*pipeline.config() }
+        }
+        None => config,
+    };
     let default = PipelineConfig::for_scene(SceneKind::Stage);
     let mut stages = vec![
         ("stage default".to_string(), default),
@@ -234,7 +246,7 @@ fn main() {
     }
     for (label, config) in stages {
         if wanted(&label) {
-            stage(&label, config);
+            stage(&label, patched(config));
         }
     }
     let house_default = PipelineConfig::for_scene(SceneKind::House);
@@ -248,7 +260,7 @@ fn main() {
     ];
     for (label, config) in houses {
         if wanted(label) {
-            house(label, config);
+            house(label, patched(config));
         }
     }
 }

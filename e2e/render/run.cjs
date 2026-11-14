@@ -5,7 +5,9 @@
 // Environment:
 //   SKIP_BUILD=1       use the existing crates/gs-render-harness/dist
 //   GS_RENDER_OUT=dir  where screenshots and reports go (default: out/render-e2e)
-//   ONLY=compare,xr    run a subset (compare, nav, live, xr, robust, perf)
+//   ONLY=compare,xr    run a subset (compare, modes, nav, live, xr, robust, perf),
+//                      or `measure`: pictures and timings of the blending
+//                      modes (see measure.cjs), not part of the default run
 //   PERF_N=200000,1000000   splat counts of the perf check
 //   GS_NPM_TOOLS / IWER_BUNDLE   where to find the IWER emulator if it is not
 //                      installed with `npm install` in e2e/render
@@ -14,7 +16,9 @@ const fs = require('fs');
 const path = require('path');
 const lib = require('./lib.cjs');
 
-const SUITES = ['compare', 'nav', 'live', 'xr', 'robust', 'perf'];
+const SUITES = ['compare', 'modes', 'nav', 'live', 'xr', 'robust', 'perf'];
+// On request only (ONLY=measure): pictures and timings, not checks.
+const OPTIONAL = ['measure'];
 
 (async () => {
   const only = process.env.ONLY ? process.env.ONLY.split(',') : SUITES;
@@ -23,7 +27,7 @@ const SUITES = ['compare', 'nav', 'live', 'xr', 'robust', 'perf'];
   const { srv, url } = await lib.serve();
   const browser = await chromium.launch();
   console.log(`chromium ${browser.version()}, serving ${url}, output in ${lib.OUT}`);
-  for (const name of SUITES.filter((s) => only.includes(s))) {
+  for (const name of [...SUITES, ...OPTIONAL].filter((s) => only.includes(s))) {
     const before = lib.results.length;
     const start = Date.now();
     try {

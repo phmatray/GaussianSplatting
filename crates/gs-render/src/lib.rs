@@ -26,6 +26,9 @@
 //! viewer.set_nav_mode(NavMode::Fly);
 //! viewer.set_view(eye, target);
 //! viewer.set_params(RenderParams { splat_scale: 0.8, ..viewer.params() });
+//! // Cheaper silhouettes, e.g. on a headset:
+//! viewer.set_params(RenderParams { quality: gs_render::BlendQuality::Hard, ..viewer.params() });
+//! let status = viewer.blend_status(); // what is drawn, and why
 //! viewer.set_scene_hints(SceneHints { ceiling_height: Some(2.5), ..Default::default() });
 //!
 //! // VR: `enter_xr` must be called synchronously from the click handler.
@@ -45,30 +48,54 @@
 //!   core WebGL2, no extension, bit-exact floats). Replacing the dynamic
 //!   layer costs O(its size), appending costs O(chunk) amortized (textures
 //!   grow geometrically); the other layer is never touched.
-//! * **Drawing**: one quad per splat in sorted order. The order lives in an
-//!   `R32UI` texture and the quads are plain indexed triangles whose vertex
+//! * **Blending modes** ([`BlendMode`], `docs/ARCHITECTURE.md`). *Sorted*:
+//!   back-to-front premultiplied alpha, for imported 3DGS files. *Normalised*:
+//!   the order-independent weighted mean of the splats of the visible
+//!   surface, for the sensor surfels of the capture pipeline; no CPU sort,
+//!   crisper texture, nothing behind a surface shows through. The default,
+//!   [`BlendMode::Auto`], picks by content ([`LayerContent`]): wire messages
+//!   are surfels, [`Viewer::set_layer`] is an imported file. The normalised
+//!   mode has two quality levels ([`BlendQuality`]: hard or soft
+//!   silhouettes) and needs `EXT_color_buffer_half_float` or
+//!   `EXT_color_buffer_float`; without them, or when its render targets
+//!   cannot be allocated, the viewer draws sorted and
+//!   [`Viewer::blend_status`] says why.
+//! * **Drawing**: one quad per splat, plain indexed triangles whose vertex
 //!   shader derives quad and corner from `gl_VertexID` — the same work as an
 //!   instanced draw on a GPU, but 25× faster on the software rasterizer of
 //!   headless browsers (which runs instances one draw call at a time), and
-//!   that is where every automated check of this project runs.
-//! * **Shading** follows the numbered recipe of `gs_core::splat` step by
-//!   step, so the image matches `gs_core::raster::rasterize` (the harness
-//!   crate asserts ≥ 35 dB PSNR): EWA projection with the 0.3 px² low-pass,
-//!   3σ quads from the eigen-decomposition, `α = o·exp(−4.5·|q|²)`,
-//!   premultiplied back-to-front blending on sRGB values. Focal lengths come
-//!   from the projection matrix and the viewport, so asymmetric WebXR
-//!   frusta work unchanged.
-//! * **Sorting**: `gs_core::sort::DepthSorter` on the main thread, at most
-//!   once per frame and shared by both eyes. The order only depends on the
-//!   view *direction*, so it is kept while the direction stays within a
-//!   fraction of a degree and the data is unchanged; a sort slower than 4 ms
-//!   is repeated at most every other frame. Depths far outside the bulk of
-//!   the scene are compressed logarithmically before they are quantized, so
-//!   that stray far-away splats (floaters of an imported file) do not cost
-//!   the scene its depth resolution.
+//!   that is where every automated check of this project runs. In the
+//!   sorted mode the order lives in an `R32UI` texture. The normalised mode
+//!   draws every layer in storage order three or four times (one or two
+//!   depth-only visibility passes, the accumulation into half-float
+//!   targets) and resolves with one triangle into the canvas or the XR
+//!   framebuffer; its off-screen targets have the size of the view.
+//! * **Shading** follows the reference implementations of `gs_core` step by
+//!   step: `gs_core::splat` (EWA projection, 3σ quads from the
+//!   eigen-decomposition, `α = o·exp(−4.5·|q|²)`, premultiplied
+//!   back-to-front blending on sRGB values) for the sorted mode, and
+//!   `gs_core::experimental::wblend` with its presets `normalized_hard` and
+//!   `normalized_soft` for the normalised one. The harness crate compares
+//!   the pictures with the CPU rasterizers (≥ 35 dB PSNR sorted, ≥ 45 dB
+//!   normalised). Both modes share the 0.3 px² screen-space low-pass, which
+//!   for surfels conserves the energy of a splat (far and miniature views
+//!   stay sharp) and for imported files is the plain dilation they were
+//!   trained with. Focal lengths come from the projection matrix and the
+//!   viewport, so asymmetric WebXR frusta work unchanged.
+//! * **Sorting** (sorted mode only): `gs_core::sort::DepthSorter` on the
+//!   main thread, at most once per frame and shared by both eyes. The order
+//!   only depends on the view *direction*, so it is kept while the
+//!   direction stays within a fraction of a degree and the data is
+//!   unchanged; a sort slower than 4 ms is repeated at most every other
+//!   frame. Depths far outside the bulk of the scene are compressed
+//!   logarithmically before they are quantized, so that stray far-away
+//!   splats (floaters of an imported file) do not cost the scene its depth
+//!   resolution.
 //! * **Gizmos** ([`Viewer::set_gizmos`]): floor grid, world axes, camera
-//!   frusta, the scan path and the handheld camera, as anti-aliased lines
-//!   drawn on top. In VR the two controllers are added automatically.
+//!   frusta, the scan path and the handheld camera, as anti-aliased lines.
+//!   Over sorted splats they are drawn on top; the normalised mode knows
+//!   the visible surface and hides the lines behind it. In VR the two
+//!   controllers are added automatically (never hidden).
 //! * **Desktop navigation** ([`NavMode`]): orbit (drag rotates, wheel or
 //!   pinch zooms, right/middle/shift-drag pans, optional idle auto-rotation)
 //!   and fly (WASD or arrows, Q/E down/up, drag looks, shift is faster, the

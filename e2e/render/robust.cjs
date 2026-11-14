@@ -233,7 +233,8 @@ async function degenerateState(page) {
 async function layout(browser, url) {
   console.log('\n=== robust: device pixel ratio 3, auto-rotate, unsized canvas ===');
   const { ctx, page, logs } = await newPage(browser, { width: 300, height: 200, deviceScaleFactor: 3 });
-  await page.goto(`${url}/?test=live&static_cams=3&capture_scale=0.35&autorotate=1`);
+  // Sorted blending for the frame rate: the rotation is timed (see nav.cjs).
+  await page.goto(`${url}/?test=live&static_cams=3&capture_scale=0.35&autorotate=1&blend=sorted`);
   await waitLive(page);
   let s = await state(page);
   check('robust: the device pixel ratio is capped at 2', s.canvasWidth === 600 && s.canvasHeight === 400, `${s.canvasWidth}x${s.canvasHeight} for 300x200 CSS pixels at DPR 3`);
@@ -297,14 +298,22 @@ async function eyePsnr(page, file, eye) {
   );
 }
 
-async function stereoAgainstReference(page, label, file) {
+// Both eyes of the running session against the CPU reference of the
+// blending mode `blend` (which the viewer must report): 35 dB in the sorted
+// mode, 45 dB in the normalised one, as in compare.cjs. The normalised mode
+// renders each eye in off-screen targets of the eye's size.
+async function stereoAgainstReference(page, label, file, blend = 'normalized-soft') {
   // A still picture: no ticks, no gizmos, hands behind the head, no HUD.
   const f = await shot(page, file);
   const eyes = [await eyePsnr(page, f, 0), await eyePsnr(page, f, 1)];
-  const xr = (await state(page)).xr;
-  const p = xr.views.map((v) => v.projection);
-  check(`robust: ${label}: both eyes match the CPU reference (PSNR >= 35 dB)`, eyes.every((e) => e && e.psnr >= 35 && e.brightFrac > 0.02),
-    eyes.map((e, i) => (e ? `eye ${i}: ${e.psnr.toFixed(2)} dB, ${e.width}x${e.height}, principal point offset (${p[i][8].toFixed(2)}, ${p[i][9].toFixed(2)})` : 'no reference')).join('; '));
+  const s = await state(page);
+  const p = s.xr.views.map((v) => v.projection);
+  const min = blend === 'sorted' ? 35 : 45;
+  const size = s.xr.views[0].viewport.slice(2);
+  const targets = blend === 'sorted' ? [0, 0] : size;
+  check(`robust: ${label} [${blend}]: both eyes match the CPU reference (PSNR >= ${min} dB)`,
+    s.blend === blend && s.offscreen[0] === targets[0] && s.offscreen[1] === targets[1] && eyes.every((e) => e && e.psnr >= min && e.brightFrac > 0.02),
+    `${s.blend}, off-screen targets ${s.offscreen.join('x')}; ` + eyes.map((e, i) => (e ? `eye ${i}: ${e.psnr.toFixed(2)} dB, ${e.width}x${e.height}, principal point offset (${p[i][8].toFixed(2)}, ${p[i][9].toFixed(2)})` : 'no reference')).join('; '));
   return eyes;
 }
 
@@ -362,10 +371,22 @@ async function xrStress(browser, url) {
   const p = s.xr.views.map((v) => v.projection);
   check('robust: the session delivers off-axis projections that differ per eye', Math.abs(p[0][8] - 0.21) < 1e-6 && Math.abs(p[1][8] + 0.17) < 1e-6 && Math.abs(p[0][9] - 0.08) < 1e-6, `P[2][0] = ${p[0][8].toFixed(3)} / ${p[1][8].toFixed(3)}`);
   await stereoAgainstReference(page, 'life-size stereo, off-axis frusta', 'robust-5-xr-off-axis.png');
+  check('robust: a normalised VR session never sorts', s.sorts === 0, `${s.sorts} sorts`);
   await cmd(page, 'miniature', true);
   await frames(4);
   await stereoAgainstReference(page, 'miniature (world scale 15) stereo, off-axis frusta', 'robust-6-xr-off-axis-miniature.png');
+  // The other two renderings, switched inside the session.
+  await cmd(page, 'quality', 'hard');
+  await frames(4);
+  await stereoAgainstReference(page, 'miniature stereo', 'robust-6b-xr-miniature-hard.png', 'normalized-hard');
   await cmd(page, 'miniature', false);
+  await frames(4);
+  await stereoAgainstReference(page, 'life-size stereo', 'robust-5b-xr-hard.png', 'normalized-hard');
+  await cmd(page, 'blend', 'sorted');
+  await frames(4);
+  await stereoAgainstReference(page, 'life-size stereo', 'robust-5c-xr-sorted.png', 'sorted');
+  await cmd(page, 'blend', 'auto');
+  await cmd(page, 'quality', 'soft');
 
   // ---- hostile and valid messages while the session runs
   await frames(2);
@@ -433,6 +454,8 @@ async function xrStress(browser, url) {
   check('robust: the desktop view is back after all sessions', canvas.w === 1280 && canvas.h === 640 && hasContent(img.left) && hasContent(img.right), JSON.stringify(canvas));
 
   // ---- fly mode: the space bar moves up, but not when it activates a button
+  // (timed against the wall clock: sorted blending for the frame rate, see nav.cjs)
+  await cmd(page, 'blend', 'sorted');
   await cmd(page, 'nav', 'fly');
   await cmd(page, 'pause', true);
   let eye0 = (await settle(page)).eye;
@@ -445,11 +468,14 @@ async function xrStress(browser, url) {
   const stayed = Math.abs(s.eye[1] - eye0[1]) < 1e-6;
   await page.evaluate(() => document.activeElement.blur());
   await page.keyboard.down('Space');
-  await page.waitForTimeout(400);
+  // Held until the camera has risen: how long that takes depends on the
+  // frame rate (the viewer caps a frame's time step), not on the key.
+  await page.waitForFunction((y) => window.__harness.state().eye[1] > y + 0.15, eye0[1], { timeout: 15000 }).catch(() => {});
   await page.keyboard.up('Space');
   s = await settle(page);
   check('robust: Space on a focused button presses the button; elsewhere it flies up', stayed && s.eye[1] > eye0[1] + 0.1, `eye y ${eye0[1].toFixed(3)} -> ${s.eye[1].toFixed(3)}, unchanged by the button press: ${stayed}`);
   await cmd(page, 'nav', 'orbit');
+  await cmd(page, 'blend', 'auto');
   await cmd(page, 'pause', false);
 
   // ---- destroyed while a session is starting

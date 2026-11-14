@@ -46,8 +46,9 @@ pub enum BlendMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlendQuality {
     /// Hard silhouettes: the visible surface is opaque inside visibility
-    /// discs of 1.6 standard deviations and ends there. One visibility pass
-    /// and one half-float target; about half the fill-rate of
+    /// discs of 1.6 standard deviations; an object in front of another
+    /// surface ends there, with a stair-stepped rim. One visibility pass
+    /// and two render targets: about two thirds of the work of
     /// [`BlendQuality::Soft`].
     Hard,
     /// Soft silhouettes over the next surface: a second visibility pass
@@ -253,8 +254,10 @@ impl Default for RenderParams {
 }
 
 impl RenderParams {
-    /// Default of [`RenderParams::sorted_surfel_scale`].
-    pub const SORTED_SURFEL_SCALE: f32 = 1.0;
+    /// Default of [`RenderParams::sorted_surfel_scale`]:
+    /// `gs_core::protocol::SORTED_SPLAT_SCALE`, the factor the capture
+    /// pipeline's own quality tests judge its clouds with in sorted mode.
+    pub const SORTED_SURFEL_SCALE: f32 = gs_core::protocol::SORTED_SPLAT_SCALE;
 
     /// Copy with every field forced into its valid range (NaN and nonsense
     /// become the default), so that the renderer never has to re-check.

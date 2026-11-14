@@ -28,7 +28,7 @@
 //! of them in a hierarchy of their own. Most pixels never get that far: the
 //! primary test only runs inside the screen boxes of the moving primitives,
 //! and the shadow test of a directional light only where the point lies in
-//! the light's view of those boxes ([`ShadowMask`]). On the stage about 6 %
+//! the light's view of those boxes (`ShadowMask`). On the stage about 6 %
 //! of the pixels of a ring camera change from the empty stage; one
 //! screen-space bounding box around them would still hold 42 % of the
 //! image, which is why the tests are per pixel and per primitive.
@@ -378,7 +378,7 @@ impl StaticRender {
 
     /// True when a capture through `cam` with `opts` can build on this
     /// render: same camera, same shadows, same range limits.
-    fn serves(&self, cam: &Camera, opts: &CaptureOptions) -> bool {
+    pub(crate) fn serves(&self, cam: &Camera, opts: &CaptureOptions) -> bool {
         // Bit patterns, so that a NaN limit matches itself.
         let same = |a: f32, b: f32| a.to_bits() == b.to_bits();
         self.cam == *cam && self.shadows == opts.shadows && same(self.min_range, opts.min_range) && same(self.max_range, opts.max_range)
@@ -1209,7 +1209,7 @@ mod tests {
             Primitive::cuboid(Vec3::new(-1.5, 0.3, -3.0), Vec3::splat(0.3), Material::solid(Vec3::X)),
             Primitive::cuboid(Vec3::new(-1.5, 0.3, -3.0), Vec3::splat(0.3), Material::solid(Vec3::Y)),
         ];
-        let moving = vec![
+        let moving = [
             // Rests exactly on the floor and slides across it.
             Primitive::cuboid(Vec3::new(t.sin(), 0.2, -3.0), Vec3::splat(0.2), Material::solid(Vec3::Z)).with_dynamic(true),
             // A slab flush with the floor surface (coplanar with it).

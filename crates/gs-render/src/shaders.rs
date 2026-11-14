@@ -14,12 +14,12 @@
 //!
 //! | Program | Vertex | Fragment | Output |
 //! |---|---|---|---|
-//! | sorted | `SORTED` | [`SORTED_FS`] | premultiplied colour, blended "over" |
-//! | visibility | plain | [`VISIBILITY_FS`] | depth only |
-//! | second visibility | plain | [`VISIBILITY_FS`] + `SECOND` | depth only |
-//! | accumulation, hard | plain | [`ACCUMULATE_FS`] | `(Σ w·c, Σ w)` |
-//! | accumulation, soft | plain | [`ACCUMULATE_FS`] + `SOFT` | the same for two surfaces, and their coverage |
-//! | resolve | [`RESOLVE_VS`] | [`RESOLVE_FS`] (+ `SOFT`) | premultiplied colour, blended "over" |
+//! | sorted | [`sorted_vs`] | [`SORTED_FS`] | premultiplied colour, blended "over" |
+//! | visibility | [`surfel_vs`] | [`visibility_fs`] | depth only |
+//! | second visibility | [`surfel_vs`] | [`visibility_fs`] + `SECOND` | depth only |
+//! | accumulation, hard | [`surfel_vs`] | [`accumulate_fs`] | `(Σ w·c, Σ w)` and the coverage |
+//! | accumulation, soft | [`surfel_vs`] | [`accumulate_fs`] + `SOFT` | the same for two surfaces, and their coverage |
+//! | resolve | [`RESOLVE_VS`] | [`resolve_fs`] (+ `SOFT`) | premultiplied colour, blended "over" |
 //! | lines | [`LINE_VS`] | [`line_fs`] (+ `OCCLUDED`) | premultiplied colour, blended "over" |
 //!
 //! # Fragments of the normalised mode
@@ -368,9 +368,11 @@ void main() {
 /// targets, no depth attachment (the two-sided test samples the visibility
 /// depth instead). The weight of a fragment is
 /// `layer weight · opacity · gain · kernel`, with the kernel tapered so that
-/// it reaches zero at the cutoff. With `SOFT` a fragment goes to the target
-/// of the surface it lies on, and the coverage of each surface, which must
-/// not see the layer weight, is accumulated apart.
+/// it reaches zero at the cutoff. The coverage, which must not see the layer
+/// weight, is accumulated apart: `o_cover.r` for the first surface; `.g` is
+/// the second surface with `SOFT`, and without it a flag "inside a
+/// visibility disc". With `SOFT` a fragment goes to the target of the
+/// surface it lies on.
 const ACCUMULATE_FS_BODY: &str = r#"
 in vec4 v_color;
 
@@ -382,6 +384,8 @@ layout(location = 0) out vec4 o_front;
 uniform sampler2D u_second;   // depth of the surface behind it
 layout(location = 1) out vec4 o_back;
 layout(location = 2) out vec4 o_cover;
+#else
+layout(location = 1) out vec4 o_cover;
 #endif
 
 void main() {
@@ -407,9 +411,12 @@ void main() {
     discard;
   }
 #else
-  // Hard silhouettes: nothing shows outside the visibility discs.
-  if (first >= 1.0 || !on_surface(e, first)) discard;
+  // Hard silhouettes. Where no visibility disc reaches, every fragment
+  // counts and the resolve turns the accumulated coverage into the opacity
+  // of the pixel; inside a disc only its surface counts, and it is opaque.
+  if (!on_surface(e, first)) discard;
   o_front = sum;
+  o_cover = vec4(cover, first < 1.0 ? 1.0 : 0.0, 0.0, 0.0);
 #endif
 }
 "#;
@@ -439,29 +446,29 @@ void main() {
 /// coverage of the pixel and blended "over" whatever the framebuffer holds
 /// (`blendFunc(ONE, ONE_MINUS_SRC_ALPHA)`).
 ///
-/// Hard: the accumulation pass only kept fragments inside visibility discs,
-/// so a pixel with any weight is opaque. Soft: the first surface gets the
-/// coverage its accumulated weight earns, `min(1, W / 0.5)`, over the second
-/// surface, which is opaque where its own discs reach.
+/// Hard: a pixel inside a visibility disc is opaque; elsewhere it gets the
+/// coverage its accumulated weight earns, `min(1, W / τ)`. Soft: the first
+/// surface gets that coverage everywhere, over the second surface, which is
+/// opaque where its own discs reach.
 const RESOLVE_FS_BODY: &str = r#"
 precision highp float;
 precision highp sampler2D;
 
 uniform sampler2D u_front;
+uniform sampler2D u_cover;
 uniform ivec2 u_origin;       // lower-left corner of the viewport in the framebuffer
+uniform float u_inv_tau;      // 1 / weight at which a surface is opaque
 #ifdef SOFT
 uniform sampler2D u_back;
-uniform sampler2D u_cover;
 uniform sampler2D u_second;   // depth of the second surface
-uniform float u_inv_tau;      // 1 / weight at which a surface is opaque
 #endif
 out vec4 o_color;
 
 void main() {
   ivec2 at = ivec2(gl_FragCoord.xy) - u_origin;
   vec4 front = texelFetch(u_front, at, 0);
-#ifdef SOFT
   vec2 cover = texelFetch(u_cover, at, 0).rg;
+#ifdef SOFT
   float alpha = front.a > 0.0 ? min(cover.x * u_inv_tau, 1.0) : 0.0;
   vec3 rgb = front.a > 0.0 ? front.rgb * (alpha / front.a) : vec3(0.0);
   vec4 back = texelFetch(u_back, at, 0);
@@ -475,7 +482,8 @@ void main() {
   o_color = vec4(rgb, alpha);
 #else
   if (front.a <= 0.0) discard;
-  o_color = vec4(front.rgb / front.a, 1.0);
+  float alpha = cover.y > 0.0 ? 1.0 : min(cover.x * u_inv_tau, 1.0);
+  o_color = vec4(front.rgb * (alpha / front.a), alpha);
 #endif
 }
 "#;

@@ -19,8 +19,8 @@
 //! `1` and [`LIVE_LAYER_WEIGHT`]. [`WblendOptions::sorted`] is the "Sorted"
 //! mode. The section "What a WebGL2 port needs" below is the lab's original
 //! sketch; `gs-render` documents what the port actually does (a logarithmic
-//! depth encoding, an 8-bit target for the coverage, no depth attachment in
-//! the accumulation pass).
+//! depth encoding, a two-channel target for the coverage at both levels, no
+//! depth attachment in the accumulation pass).
 //!
 //! # Normalised blending ([`Blend::Normalized`])
 //!
@@ -296,21 +296,26 @@ impl WblendOptions {
     }
 
     /// The "Normalised" blending mode of `docs/ARCHITECTURE.md` with hard
-    /// silhouettes: the cheaper of the two quality levels and exactly what
-    /// the WebGL2 viewer renders at `Quality::Hard` (one visibility pass, one
-    /// `RGBA16F` accumulation target).
+    /// silhouettes: the cheaper of the two quality levels, the configuration
+    /// of the lab's "C1 hard" rows and exactly what the WebGL2 viewer renders
+    /// at `Quality::Hard` (one visibility pass, an `RGBA16F` accumulation
+    /// target and a two-channel one for the coverage).
     ///
-    /// Opaque inside visibility discs of 1.6 standard deviations and empty
-    /// outside every disc, depth of a fragment on the plane of its splat,
-    /// two-sided 1 % depth test, tapered 3σ kernel, EWA footprint with the
-    /// normalised low-pass filter ([`crate::splat::LOW_PASS_PX2`]) and no
-    /// screen-space floor.
+    /// Opaque inside visibility discs of 1.6 standard deviations. Where no
+    /// disc reaches (the rim of an object against the empty background, a
+    /// pinhole between the discs of a sparsely sampled surface) the pixel
+    /// gets the coverage `min(1, W / 0.5)` of the weight accumulated without
+    /// the layer weights; an object in front of another surface ends at its
+    /// discs. Depth of a fragment on the plane of its splat, two-sided 1 %
+    /// depth test, tapered 3σ kernel, EWA footprint with the normalised
+    /// low-pass filter ([`crate::splat::LOW_PASS_PX2`]) and no screen-space
+    /// floor.
     pub fn normalized_hard() -> Self {
         let params = Normalized {
             vis_cutoff: 1.6,
             depth_tol: 0.01,
             depth_tol_sigma: 0.0,
-            coverage: Coverage::None,
+            coverage: Coverage::Linear(0.5),
             taper: true,
             silhouette: Silhouette::Hard,
             near_fringe: false,
@@ -328,15 +333,14 @@ impl WblendOptions {
     /// renders at `Quality::Soft` (two visibility passes, three accumulation
     /// targets).
     ///
-    /// Visibility discs of 2 standard deviations, coverage `min(1, W / 0.5)`
-    /// of the weight accumulated without the layer weights, first surface
-    /// over second surface over the background; everything else as in
-    /// [`Self::normalized_hard`].
+    /// Visibility discs of 2 standard deviations; the coverage
+    /// `min(1, W / 0.5)` applies to the first surface everywhere, also
+    /// inside its discs: first surface over second surface over the
+    /// background. Everything else as in [`Self::normalized_hard`].
     pub fn normalized_soft() -> Self {
         let hard = Self::normalized_hard();
         let Blend::Normalized(params) = hard.blend else { unreachable!("normalized_hard is normalised") };
-        let params =
-            Normalized { vis_cutoff: 2.0, coverage: Coverage::Linear(0.5), silhouette: Silhouette::SoftOverNextSurface, ..params };
+        let params = Normalized { vis_cutoff: 2.0, silhouette: Silhouette::SoftOverNextSurface, ..params };
         Self { blend: Blend::Normalized(params), ..hard }
     }
 }
@@ -990,14 +994,17 @@ mod tests {
         let sorted = WblendOptions { point_sigma_px: 1.0, ..WblendOptions::sorted() };
         let expected = raster::rasterize(&[a, b], &cam, &RasterOptions { point_mode: true, point_sigma_px: 1.0, ..Default::default() });
         assert!(max_difference(&rasterize(&[a, b], &cam, &sorted), &expected) <= 1);
-        // Normalised: opaque dots of the visibility radius (1.6 px), the
-        // nearer one in front, each at the depth of its center.
+        // Normalised: opaque dots of the visibility radius (1.6 px) with a
+        // faint fringe that ends at the cutoff (3 px), the nearer one in
+        // front, each at the depth of its center.
         let hard = WblendOptions { point_sigma_px: 1.0, ..WblendOptions::normalized_hard() };
         let image = rasterize(&[a, b], &cam, &hard);
         for cx in [50u32, 150] {
             assert_eq!(image.pixel(cx, 80), [255; 3]);
             assert_eq!(image.pixel(cx + 1, 80), [255; 3]);
-            assert_eq!(image.pixel(cx + 2, 80), [0; 3]);
+            // (e⁻² − e⁻⁴·⁵) / (1 − e⁻⁴·⁵) of the weight, over τ = 0.5.
+            assert!((image.pixel(cx + 2, 80)[0] as f32 - 64.2).abs() < 1.5, "{:?}", image.pixel(cx + 2, 80));
+            assert_eq!(image.pixel(cx + 3, 80), [0; 3]);
         }
         let behind = disc(cam.unproject(50.5, 80.5, 1.2), Vec3::Z, 0.3, [255, 0, 0, 255]);
         assert_eq!(rasterize(&[behind, a], &cam, &hard).pixel(50, 80), [255; 3]);
@@ -1007,13 +1014,15 @@ mod tests {
     fn presets_are_the_documented_configurations() {
         let hard = WblendOptions::normalized_hard();
         let Blend::Normalized(h) = hard.blend else { panic!("not normalised") };
-        assert_eq!((h.vis_cutoff, h.silhouette, h.coverage, h.near_fringe), (1.6, Silhouette::Hard, Coverage::None, false));
+        assert_eq!((h.vis_cutoff, h.silhouette, h.coverage, h.near_fringe), (1.6, Silhouette::Hard, Coverage::Linear(0.5), false));
         assert_eq!((hard.depth, hard.footprint, hard.screen_floor_px), (DepthModel::Plane, Footprint::Ewa, 0.0));
         assert_eq!(hard.low_pass, LowPass::Normalized(crate::splat::LOW_PASS_PX2));
         let soft = WblendOptions::normalized_soft();
         let Blend::Normalized(s) = soft.blend else { panic!("not normalised") };
         assert_eq!((s.vis_cutoff, s.silhouette, s.coverage), (2.0, Silhouette::SoftOverNextSurface, Coverage::Linear(0.5)));
         assert_eq!(WblendOptions { blend: hard.blend, ..soft }, hard);
+        // The two levels differ in the silhouette rule and the disc radius only.
+        assert_eq!(Normalized { vis_cutoff: h.vis_cutoff, silhouette: h.silhouette, ..s }, h);
         assert_eq!(WblendOptions::sorted().blend, Blend::Over);
         assert_eq!(LIVE_LAYER_WEIGHT, 16.0);
     }

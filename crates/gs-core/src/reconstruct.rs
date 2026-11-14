@@ -83,11 +83,13 @@ fn finite_clamp(value: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
 #[serde(default)]
 pub struct ReconstructParams {
     /// Footprint factor `k`: the tangential standard deviation is `k` pixel
-    /// footprints. A single camera needs about 0.6 for a closed surface;
-    /// where the views of several cameras overlap, as on the stage, their
-    /// splats interleave and a smaller value gives a sharper picture (the
-    /// default was chosen by held-out PSNR with 3 to 12 ring cameras).
-    /// Larger values blur and fatten silhouettes.
+    /// footprints. The default suits the normalised blending mode of
+    /// `docs/ARCHITECTURE.md`, where the splats of a surface only have to
+    /// touch. Sorted "over" compositing of one camera's splats, which is
+    /// what the multi-view fusion leaves of most surfaces, needs about 0.65
+    /// for a closed surface: a viewer in that mode scales the splats by
+    /// [`crate::protocol::SORTED_SPLAT_SCALE`]. Larger values blur and
+    /// fatten silhouettes.
     pub footprint: f32,
     /// Standard deviation along the normal, as a fraction of the shorter
     /// tangential one.
@@ -202,6 +204,13 @@ pub struct BackgroundParams {
     /// Mask clean-up: a marked pixel survives only when at least this many of
     /// its 8 neighbours are marked too. `0` disables the clean-up.
     pub min_neighbors: u32,
+    /// [`ReconstructParams::edge_shrink`] of the foreground pixels. The
+    /// outline of the subject is seen against the stage from all around, and
+    /// every renderer draws it too fat rather than too thin; narrower rim
+    /// splats than on the plate (whose "silhouettes" are mostly the borders
+    /// of what a camera sees of the floor) take a part of that away:
+    /// +0.2 dB around silhouettes in held-out views, +0.2 dB in a close-up.
+    pub edge_shrink: f32,
 }
 
 impl Default for BackgroundParams {
@@ -213,6 +222,7 @@ impl Default for BackgroundParams {
             color_threshold: 20.0,
             shadow_lift: 0.6,
             min_neighbors: 2,
+            edge_shrink: 0.3,
         }
     }
 }
@@ -228,6 +238,7 @@ impl BackgroundParams {
             color_threshold: finite_clamp(self.color_threshold, d.color_threshold, 1.0, 255.0),
             shadow_lift: finite_clamp(self.shadow_lift, d.shadow_lift, 0.0, 4.0),
             min_neighbors: self.min_neighbors.min(8),
+            edge_shrink: finite_clamp(self.edge_shrink, d.edge_shrink, 0.1, 1.0),
         }
     }
 }
@@ -626,7 +637,11 @@ fn row_to_splats(
         if class == MASK_CHANGED {
             p += s.n * (params.background.shadow_lift * s.z / cam.fx);
         }
-        let shrink = |a: bool, b: bool| if a || b { k * params.edge_shrink } else { k };
+        // The outline of what stands in front of the plate is a real object
+        // outline, seen against the background from every side.
+        let edge_shrink =
+            if mask.is_some() && class == MASK_FOREGROUND { params.background.edge_shrink } else { params.edge_shrink };
+        let shrink = |a: bool, b: bool| if a || b { k * edge_shrink } else { k };
         let (ku, kv) = (shrink(s.open[0], s.open[1]), shrink(s.open[2], s.open[3]));
         let rgb = &frame.rgb[i * 3..i * 3 + 3];
         let normal = rotation * s.n;
@@ -1069,7 +1084,10 @@ pub struct VoxelFusion {
     /// ray are not used.
     pub min_cos: f32,
     /// Tangential standard deviation of a splat in voxels. `0.6` is the
-    /// smallest value that closes the gaps between neighbouring cells.
+    /// smallest value that closes the gaps between neighbouring cells under
+    /// sorted "over" compositing; the pipeline uses 0.45
+    /// ([`crate::protocol::ScanConfig::kernel`]), sized for normalised
+    /// blending.
     pub radius_factor: f32,
     /// Opacity of the splats, `0..=1`. The map is a single layer of splats,
     /// so anything below 1 lets what is behind a surface shine through

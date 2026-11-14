@@ -126,6 +126,8 @@ async function run({ browser, url }) {
   check('xr: local-floor reference space', xr.referenceSpace === 'local-floor');
   const vps = xr.views.map((v) => v.viewport);
   check('xr: two views with side-by-side viewports', xr.views.length === 2 && vps[0][0] === 0 && vps[1][0] === vps[0][2] && vps[0][2] > 0 && vps[1][2] === vps[0][2], JSON.stringify(vps));
+  check('xr: each eye is drawn normalised, in off-screen targets of the eye size, without a sort', s.blend === 'normalized-soft' && s.offscreen[0] === vps[0][2] && s.offscreen[1] === vps[0][3] && s.sorts === 0,
+    `${s.blend} (${s.blendReason}), off-screen targets ${s.offscreen.join('x')}, eye ${vps[0][2]}x${vps[0][3]}, ${s.sorts} sorts`);
   check('xr: the rig starts at the desktop camera, on the floor, facing the same way', Math.abs(xr.rig[0] - desktop.eye[0]) < 1e-4 && xr.rig[1] === 0 && Math.abs(xr.rig[2] - desktop.eye[2]) < 1e-4 && Math.abs(xr.rig[3] - desktopYaw) < 1e-4 && xr.scale === 1 && !xr.miniature,
     `rig ${f3(xr.rig)} desktop eye ${f3(desktop.eye)} yaw ${desktopYaw.toFixed(3)}`);
   let dev = await device(page);
@@ -312,6 +314,7 @@ async function run({ browser, url }) {
   s = await state(page);
   check('xr: desktop view restored (full-size mono picture, same camera as before)', canvas.w === 1280 && canvas.h === 640 && canvas.parent === 'BODY' && hasContent(img.left) && img.lrMeanAbsDiff > 12 && dist(s.eye, desktop.eye) < 1e-4,
     JSON.stringify({ canvas, lrMeanAbsDiff: +img.lrMeanAbsDiff.toFixed(2) }));
+  check('xr: the off-screen targets follow the view back to the canvas size', s.blend === 'normalized-soft' && s.offscreen[0] === 1280 && s.offscreen[1] === 640, `${s.blend}, ${s.offscreen.join('x')}`);
 
   // ---- second session, ended from the runtime side (system menu / headset off)
   await enterVr(page);
