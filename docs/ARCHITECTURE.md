@@ -25,8 +25,10 @@ feed-forward depth network) would deliver.
    the same instant, the frames are turned into Gaussians, and the viewer
    replaces the dynamic layer. The empty stage is captured once (background
    plate) and sent as a static layer; per tick only foreground pixels are sent.
-2. **Home scan** (`SceneKind::House`). One handheld camera is walked along a
-   path through a furnished house. Each RGB-D frame is fused into a voxel hash
+2. **Home scan** (`SceneKind::House`). A handheld head of five rigidly mounted
+   RGB-D sensors (ahead, 120 degrees to either side, tilted 60 degrees up and
+   down) is carried along a path through a furnished house. Each RGB-D frame
+   is fused into a voxel hash
    and only newly observed surface is appended, so the house builds up
    progressively. Afterwards you walk through it (fly controls or VR).
 
@@ -37,9 +39,9 @@ feed-forward depth network) would deliver.
 | `crates/gs-core` | native + wasm | Math, scenes, sensors, reconstruction, wire codec, sorting, CPU reference rasterizer, PLY/.splat I/O, `Pipeline` |
 | `crates/gs-server` | native | Pipeline thread + axum HTTP/HTTPS + WebSocket broadcast. Library and headless `gs-server` binary |
 | `crates/gs-render` | wasm | WebGL2 Gaussian splat renderer, camera controls, gizmos, WebXR session |
-| `crates/gs-worker` | wasm (Web Worker) | Runs `Pipeline` in the browser when no native server is available |
+| `crates/gs-worker` | wasm (Web Worker) | Runs `Pipeline` in the browser when no native server is available; in server mode it relays the WebSocket to the page |
 | `crates/gs-app` | wasm | Leptos CSR user interface, built with Trunk |
-| `src-tauri` | native | Tauri 2 desktop shell. Starts `gs-server`, exposes info commands |
+| `src-tauri` | native | Tauri 2 desktop shell. Starts `gs-server`, exposes info commands. Workspace member outside `default-members` (needs WebKitGTK; root `cargo build` / `cargo test` skip it) |
 | `e2e` | node | Playwright end-to-end checks (desktop render, WS mode, emulated VR) |
 
 ## Conventions (binding for every crate)
@@ -65,14 +67,14 @@ feed-forward depth network) would deliver.
 | `scene` | Analytic primitives (sphere/ellipsoid, box, cylinder, capsule, cone) under affine transforms, procedural materials, ray casting with an acceleration structure, diffuse shading with shadows. `Scene` trait: `snapshot(t)` and `snapshot_static()` |
 | `scene::stage` | Round stage, articulated dancer (forward kinematics, procedural dance loop), juggled balls |
 | `scene::house` | Furnished single-storey interior with several rooms |
-| `rig` | Ring rig generation, handheld scan path (spline through the rooms) |
+| `rig` | Ring rig generation, handheld scan path (spline through the rooms, walking speed limited so the heading turns slowly) |
 | `capture` | `render_rgbd(snapshot, camera, opts) -> RgbdFrame`, sensor noise model |
 | `reconstruct` | Depth map → oriented surfel Gaussians, background subtraction, voxel-hash fusion |
 | `splat` | Covariance math, EWA projection helpers |
 | `sort` | Back-to-front counting/radix sort of splat indices |
 | `raster` | CPU reference splat rasterizer (tests, golden images, PSNR) |
 | `codec` | Binary wire messages (quantized 16-byte splats, previews) |
-| `protocol` | serde types: `PipelineConfig`, `SessionState`, `ControlMsg`, `Stats` |
+| `protocol` | serde types: `PipelineConfig`, `SessionState`, `ControlMsg`, `Stats`, `ScanHead` |
 | `pipeline` | `Pipeline`: owns scene, rig, fusion state; `tick(dt) -> Vec<Outgoing>` (one encoded message each, with `reliable` and a latest-wins `slot`), `snapshot()` for late joiners, `handle_control` |
 | `io` | Import/export of INRIA 3DGS `.ply` and antimatter15 `.splat` |
 
@@ -93,8 +95,13 @@ Scan mode: positions are hashed into voxels; the first good observation of a
 voxel produces a round disc splat (radius `0.6 ×` the voxel size) and closer
 views refine it in place. New cells are streamed as `Append` chunks; because
 refinement rewrites earlier splats, layer 0 gets one full `Replace` when the
-scan ends or is paused. The handheld camera pose comes from
-`pipeline::scan_camera` (walk along `ScanPath` plus a look-around sweep).
+scan ends or is paused. The pose of every sensor comes from
+`pipeline::scan_sensor` (`scan_camera` is sensor 0): the head (`scan.head`,
+default `surround`, five 192x144 sensors with an 80 degree vertical field of
+view) rides along `ScanPath` and faces the walking direction averaged over one
+second, with a sway of 10 degrees. The sensors fire one at a time at 6 frames
+per second in the order 0,1,0,2,0,3,0,4. The walk takes about 67 s; the head
+turns at 20 degrees per second on average and 37 at most.
 
 ### Wire format
 
@@ -105,7 +112,9 @@ One self-describing little-endian binary message per WebSocket frame or
 - `Layer`: `layer_id`, mode `Replace | Append`, AABB, then `count × 16 bytes`
   (`pos` as 3×u16 in the AABB, 3×u8 log-scale, RGBA, 3-byte quaternion).
 - `Preview`: one camera's downsampled RGB + depth for the feed thumbnails.
-- `Stats`: JSON timings and counts.
+  In the house the camera id is the sensor id (0 = forward).
+- `Stats`: JSON timings and counts. In the house `scan.camera` is the forward
+  sensor and `scan.extra_cameras` lists the others.
 
 Layer 0 is static (background plate, or the accumulated scan), layer 1 is the
 live dynamic layer. Clients send JSON `ControlMsg` text frames back
@@ -128,6 +137,14 @@ and `Preview` are *latest wins* per slot: a slow client skips stale ones.
 open the URL (or scan the QR code shown in the desktop app) and press
 "Entrer en VR". The frontend probes `GET /api/info`; if it answers, it uses the
 WebSocket, otherwise it starts the local worker.
+
+In server mode the page does not open the WebSocket itself: the worker opens
+it in *relay* mode, coalesces messages by the delivery contract (a layer 0
+`Replace` drops earlier layer 0 messages; layer 1, `Stats` and each `Preview`
+are latest wins) and hands acknowledged batches to the page, at most two
+outstanding. A page that renders slowly therefore skips ahead instead of
+falling seconds behind. If the worker cannot load, the page falls back to a
+socket on the main thread.
 
 ## Server interface (binding for `gs-server`, `src-tauri`, `gs-app`)
 
@@ -175,7 +192,12 @@ clients. The pipeline does not tick while no client is connected.
 Hardening: the WebSocket and `POST` routes check the `Origin` header (same
 host, or the Tauri origins `tauri://localhost` / `http://tauri.localhost`);
 CORS on the loopback listener allows only those Tauri origins; control text
-frames are capped at `pipeline::MAX_CONTROL_JSON`.
+frames are capped at `pipeline::MAX_CONTROL_JSON`. A connection that sends no
+complete request within 15 s is closed (`POST /api/lan` answers 408). While
+LAN is on, `lan.urls` and `lan.fingerprint` follow the machine's addresses
+(checked every 5 s; the certificate is renewed if it does not name the new
+address). The LAN listener has no authentication: anyone on the network can
+watch and send control messages, which is why it is off by default.
 
 The Tauri shell starts the server in-process and exposes one command,
 `server_info`, returning the same info JSON. The frontend resolves its
@@ -194,6 +216,45 @@ source in this order: Tauri command (then uses `http_url` as base), else
 - WebXR `immersive-vr`, `local-floor`: one sort per frame, one draw per eye.
   Left stick moves, right stick snap-turns, a button toggles a 1:1 /
   miniature ("dollhouse") world scale.
+
+## Blending modes (binding for `gs-core` and `gs-render`)
+
+Sensor surfels describe opaque surfaces, so stacking them as translucent
+discs in sort order blurs textures and lets the splats behind a surface leak
+through it. Measurements (`gs_core::experimental`, `examples/quality_lab.rs`)
+led to two modes that every renderer of this project implements, the CPU
+reference and the WebGL2 viewer alike:
+
+- **Sorted**: back-to-front premultiplied alpha, as in the 3DGS reference
+  implementations. Used for imported `.ply` / `.splat` scenes, which are
+  translucent by nature, and as the fallback when the GPU cannot render to a
+  half-float target.
+- **Normalised** (default for the live and scan layers): order independent,
+  no CPU sort.
+  1. *Visibility*: every splat is drawn as an opaque disc (visibility radius
+     in standard deviations) into a depth buffer; the fragment depth is taken
+     on the splat's plane, not at its center.
+  2. *Accumulation*: every fragment within a two-sided depth tolerance of the
+     visible surface adds `w·colour` and `w`, with
+     `w = layer weight · opacity · exp(−m/2)`.
+  3. *Resolve*: `colour = Σ w·colour / Σ w`. Coverage is accumulated without
+     the layer weights. Silhouettes are either hard (opaque inside the
+     visibility discs) or soft (a second visibility pass finds the next
+     surface; first surface over second surface over background).
+
+  In this mode the opacity byte of a wire splat is a blending weight. The
+  live layer (layer 1) carries a higher layer weight than the static plate so
+  that the shadows it captures win over the plate underneath.
+
+Both modes use the same normalised screen-space low-pass filter (a small
+dilation of the projected covariance with the amplitude scaled so that the
+splat keeps its energy), which keeps distant and miniature views from
+turning to mush.
+
+`gs_core::experimental::wblend` is the CPU reference for the normalised mode
+and for the filter; the viewer is compared against it pixel by pixel in
+`e2e/render`. The splat cloud is produced for the normalised mode; a viewer
+in sorted mode compensates with its splat scale.
 
 ## Verification
 
