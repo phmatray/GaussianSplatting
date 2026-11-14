@@ -148,6 +148,12 @@ const LOOK_AHEAD: f32 = 0.9;
 const STATION: f32 = 0.02;
 /// The walker slows down so that the path never turns faster than this (rad/s).
 const MAX_TURN_RATE: f32 = 0.75;
+/// The walker also slows down so that [`ScanPath::heading_at`], the direction
+/// a handheld camera faces, never swings faster than this (rad/s, about 32
+/// degrees per second). The heading aims at a point ahead on the path, so it
+/// starts to swing before the walker reaches a bend and can turn faster than
+/// the path under his feet.
+const MAX_HEADING_RATE: f32 = 0.56;
 /// Slowest walking speed in tight turns, as a fraction of the cruise speed.
 const MIN_SPEED_FRACTION: f32 = 0.3;
 
@@ -248,7 +254,8 @@ impl ScanPath {
     }
 
     /// Computes when the walker reaches each station: cruise speed, reduced
-    /// where the path curves so the turn rate stays below `MAX_TURN_RATE`.
+    /// where the path curves so the turn rate stays below `MAX_TURN_RATE`
+    /// and the heading swings no faster than `MAX_HEADING_RATE`.
     fn build_schedule(&mut self) {
         let length = self.length();
         if length < 1e-6 {
@@ -262,7 +269,11 @@ impl ScanPath {
         let pts: Vec<Vec3> = (0..=count)
             .map(|k| self.position_at_distance(k as f32 * self.station))
             .collect();
-        // Curvature from chords spanning ~10 cm either side of each station.
+        let headings: Vec<Vec3> = (0..=count)
+            .map(|k| self.heading_at_distance(k as f32 * self.station))
+            .collect();
+        // Curvature, and swing of the heading per meter walked, from chords
+        // spanning ~10 cm either side of each station.
         let span = ((0.1 / self.station).round() as usize).clamp(1, count);
         let mut v: Vec<f32> = (0..=count)
             .map(|k| {
@@ -270,8 +281,11 @@ impl ScanPath {
                     return self.speed;
                 }
                 let (a, b) = (pts[k] - pts[k - span], pts[k + span] - pts[k]);
-                let curvature = a.angle_between(b) / (0.5 * (a.length() + b.length())).max(1e-6);
-                (MAX_TURN_RATE / curvature.max(1e-6)).clamp(MIN_SPEED_FRACTION * self.speed, self.speed)
+                let walked = (a.length() + b.length()).max(1e-6);
+                let curvature = a.angle_between(b) / (0.5 * walked);
+                let swing = headings[k - span].angle_between(headings[k + span]) / walked;
+                let limit = (MAX_TURN_RATE / curvature.max(1e-6)).min(MAX_HEADING_RATE / swing.max(1e-6));
+                limit.clamp(MIN_SPEED_FRACTION * self.speed, self.speed)
             })
             .collect();
         // Ease in and out of the slow sections. Eroding first (running
@@ -380,9 +394,14 @@ impl ScanPath {
     /// Unit walking direction (horizontal) at time `t`, smoothed by aiming at
     /// a point a little ahead on the path.
     pub fn heading_at(&self, t: f32) -> Vec3 {
+        self.heading_at_distance(self.distance_at(t))
+    }
+
+    /// [`ScanPath::heading_at`] after walking `distance` meters.
+    fn heading_at_distance(&self, distance: f32) -> Vec3 {
         let length = self.length();
         let ahead = LOOK_AHEAD.min(0.5 * length);
-        let s = self.distance_at(t).min(length - ahead);
+        let s = distance.min(length - ahead);
         let d = self.position_at_distance(s + ahead) - self.position_at_distance(s);
         Vec3::new(d.x, 0.0, d.z).normalize_or(Vec3::NEG_Z)
     }
