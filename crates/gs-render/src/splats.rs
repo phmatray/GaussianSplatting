@@ -163,6 +163,8 @@ pub(crate) struct SplatScene {
     /// The render targets of the normalised mode could not be allocated for
     /// a view: the mode is suspended until [`SplatScene::retry_normalized`].
     targets_failed: bool,
+    /// That has happened on this context before (it is announced once).
+    targets_failed_before: bool,
     /// Splats submitted by the most recent draw.
     drawn: u32,
     /// Duration of the last sort, milliseconds.
@@ -373,6 +375,7 @@ impl SplatScene {
             },
             normalized: create_normalized(gl),
             targets_failed: false,
+            targets_failed_before: false,
             drawn: 0,
             sort_ms: 0.0,
             sort_count: 0,
@@ -392,6 +395,7 @@ impl SplatScene {
         // The old programs and targets died with the old context.
         self.normalized = create_normalized(&self.gl);
         self.targets_failed = false;
+        self.targets_failed_before = false;
         self.detached = false;
         self.sorted.version = 0;
         self.sorted.instances = 0;
@@ -468,11 +472,12 @@ impl SplatScene {
 
     /// Suspends the normalised mode (a render target could not be
     /// allocated): [`Self::blend_status`] reports the fallback until
-    /// [`Self::retry_normalized`]. Returns whether it was available before,
-    /// that is, whether this is news.
+    /// [`Self::retry_normalized`]. Returns whether this is the first time
+    /// on this context, that is, whether it is news.
     pub fn suspend_normalized(&mut self) -> bool {
         self.release_normalized_targets();
-        self.normalized.is_ok() && !std::mem::replace(&mut self.targets_failed, true)
+        self.targets_failed = true;
+        !std::mem::replace(&mut self.targets_failed_before, true)
     }
 
     /// Lets the next frame try the normalised mode again after
