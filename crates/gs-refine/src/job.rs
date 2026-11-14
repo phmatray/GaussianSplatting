@@ -317,8 +317,32 @@ pub struct RefineJob {
     curve: Vec<CurvePoint>,
     evals: Vec<EvalPoint>,
     fusion_score: Option<EvalScore>,
+    /// The best state among the scheduled evaluations: score, iteration.
     best: Option<(f32, u32, Gaussians)>,
+    /// The score of the state a run stopped in, when that is not a
+    /// scheduled evaluation. It competes for the result of this job, and
+    /// is dropped when the job goes on, so that a stop leaves no trace.
+    interim: Option<EvalPoint>,
+    warm_up: WarmUp,
+    /// Width of the pictures of the last step (0 before the first).
+    last_width: u32,
     completed: bool,
+}
+
+/// How far the passes before the first step have come, and the pose
+/// registration of the current level: enough to go on after a stop exactly
+/// where it fell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct WarmUp {
+    /// Views whose exposure was measured against the starting cloud.
+    exposure_views: usize,
+    /// The mean exposure was moved into the cloud.
+    settled: bool,
+    /// Iteration of the last pose registration and how many views it has
+    /// done.
+    registration: Option<(u32, usize)>,
+    /// The fusion and the starting cloud were scored: the steps can begin.
+    done: bool,
 }
 
 fn build_pool(threads: usize) -> Result<rayon::ThreadPool, RefineError> {
@@ -327,6 +351,17 @@ fn build_pool(threads: usize) -> Result<rayon::ThreadPool, RefineError> {
         .thread_name(|i| format!("gs-refine-{i}"))
         .build()
         .map_err(|e| RefineError::Io(std::io::Error::other(e.to_string())))
+}
+
+/// The cache of decoded training views of a job.
+fn view_cache(config: &RefineConfig, capture: &Capture) -> ViewCache {
+    let mut cache = ViewCache::new(config.cache_mb.max(16) << 20);
+    if !config.train.photo_beyond_sensor {
+        let params = crate::init::ingest_params(capture.mode, &config.init);
+        let mode = params.mode(capture.mode);
+        cache.measured = Some((mode.near, mode.far));
+    }
+    cache
 }
 
 /// PSNR in dB of a mean squared error on `0..=1` values.
@@ -435,7 +470,7 @@ impl RefineJob {
         };
         let trainer = Trainer::new(config.train.clone(), model, views, region, CpuRasterizer::default());
         Ok(Self {
-            cache: ViewCache::new(config.cache_mb.max(16) << 20),
+            cache: view_cache(&config, &capture),
             config,
             capture,
             info,
@@ -452,6 +487,9 @@ impl RefineJob {
             evals: Vec::new(),
             fusion_score: None,
             best: None,
+            interim: None,
+            warm_up: WarmUp::default(),
+            last_width: 0,
             completed: false,
         })
     }
@@ -478,11 +516,14 @@ impl RefineJob {
     }
 
     /// The Gaussians that are the result: the best state on the held-out
-    /// views if one was recorded, the current state otherwise.
+    /// views among the evaluations of the run and, for a stopped job, the
+    /// state it stopped in; the current state when nothing was scored.
     pub fn result(&self) -> (&Gaussians, u32) {
-        match &self.best {
-            Some((_, iteration, model)) => (model, *iteration),
-            None => (&self.trainer.model, self.trainer.iteration),
+        let current = (&self.trainer.model, self.trainer.iteration);
+        match (&self.best, &self.interim) {
+            (Some((best, ..)), Some(interim)) if interim.iteration == current.1 && interim.score.psnr > *best => current,
+            (Some((_, iteration, model)), _) => (model, *iteration),
+            (None, _) => current,
         }
     }
 
@@ -502,14 +543,19 @@ impl RefineJob {
 
     /// Scores `draw(view, width, height) -> colour floats` on the held-out
     /// views.
-    fn evaluate_with(&self, mut draw: impl FnMut(&ViewInfo, u32, u32) -> Vec<f32>) -> Result<Option<EvalScore>, RefineError> {
+    fn evaluate_with(&self, draw: impl FnMut(&ViewInfo, u32, u32) -> Vec<f32>) -> Result<Option<EvalScore>, RefineError> {
         let (width, views) = self.eval_plan();
+        self.score_views(width, &views, draw)
+    }
+
+    /// Scores `draw` against the photographs of `views` at `width`.
+    fn score_views(&self, width: u32, views: &[ViewInfo], mut draw: impl FnMut(&ViewInfo, u32, u32) -> Vec<f32>) -> Result<Option<EvalScore>, RefineError> {
         if views.is_empty() {
             return Ok(None);
         }
         let region = self.trainer.region;
         let mut sum = EvalScore::default();
-        for view in &views {
+        for view in views {
             let width = width.min(view.cam.width);
             // Not through the cache: evaluations are rare and must not push
             // training views out.
@@ -528,10 +574,18 @@ impl RefineJob {
     /// Scores a model on the held-out photographs, drawn as the viewer
     /// draws an imported splat file.
     pub fn evaluate(&self, model: &Gaussians) -> Result<Option<EvalScore>, RefineError> {
+        self.evaluate_views(model, &self.eval_plan().1)
+    }
+
+    /// [`Self::evaluate`] on the photographs of any views of the capture,
+    /// for instance some of the training views (`self.trainer.views`): the
+    /// gap between their score and the held-out one is how much of the fit
+    /// is memorised.
+    pub fn evaluate_views(&self, model: &Gaussians, views: &[ViewInfo]) -> Result<Option<EvalScore>, RefineError> {
         let background = EVAL_BACKGROUND.map(|v| v as f32 / 255.0);
         let mut raster = CpuRasterizer::default();
         let mut out = Rendered::default();
-        self.evaluate_with(|view, width, height| {
+        self.score_views(self.config.train.width, views, |view, width, height| {
             let cam = view.cam.resized(width, height);
             self.pool.install(|| raster.forward(model, &View::from_camera(&cam, background), &mut out));
             out.color.clone()
@@ -549,18 +603,27 @@ impl RefineJob {
         })
     }
 
-    /// Registers every view on the cloud (when poses are optimised). The
+    /// Registers every view on the cloud (when poses are optimised) at the
+    /// current iteration, going on where a stopped registration of the same
+    /// iteration left off. Returns `false` when it was stopped again. The
     /// time counts as optimisation time.
-    fn align_poses(&mut self, cancel: &CancelToken, progress: &mut dyn FnMut(&Progress)) -> Result<(), RefineError> {
+    fn align_poses(&mut self, cancel: &CancelToken, progress: &mut dyn FnMut(&Progress)) -> Result<bool, RefineError> {
         if !self.config.train.pose || self.config.train.pose_align_steps == 0 {
-            return Ok(());
+            return Ok(true);
         }
         let (wall, cpu) = (Instant::now(), cpu_time::ProcessTime::now());
         let mut report = self.progress_now(Stage::Poses, 0);
-        report.total = self.trainer.views.len() as u64;
+        let views = self.trainer.views.len();
+        report.total = views as u64;
         let (iteration, steps) = (self.trainer.iteration, self.config.train.pose_align_steps);
-        for index in 0..self.trainer.views.len() {
+        let from = match self.warm_up.registration {
+            Some((at, done)) if at == iteration => done,
+            _ => 0,
+        };
+        let mut finished = true;
+        for index in from..views {
             if cancel.is_cancelled() {
+                finished = false;
                 break;
             }
             if index % 4 == 0 {
@@ -569,10 +632,59 @@ impl RefineJob {
             }
             let (trainer, capture, cache) = (&mut self.trainer, &self.capture, &mut self.cache);
             self.pool.install(|| trainer.align_pose(index, iteration, capture, cache, steps))?;
+            self.warm_up.registration = Some((iteration, index + 1));
+        }
+        if finished {
+            self.warm_up.registration = Some((iteration, views));
         }
         self.wall_s += wall.elapsed().as_secs_f64();
         self.cpu_s += cpu.elapsed().as_secs_f64();
-        Ok(())
+        Ok(finished)
+    }
+
+    /// Whether the poses were registered at the current iteration.
+    fn registered_here(&self) -> bool {
+        !self.config.train.pose || self.config.train.pose_align_steps == 0 || self.warm_up.registration == Some((self.trainer.iteration, self.trainer.views.len()))
+    }
+
+    /// The passes before the first step: the exposure of every view against
+    /// the starting cloud, the first pose registration, the scores of the
+    /// fusion and of the start. Every part goes on where a stop left it.
+    /// Returns `false` when it was stopped.
+    fn warm_up(&mut self, cancel: &CancelToken, progress: &mut dyn FnMut(&Progress)) -> Result<bool, RefineError> {
+        let views = self.trainer.views.len();
+        if self.config.train.exposure && !self.warm_up.settled {
+            let mut report = self.progress_now(Stage::Exposure, 0);
+            report.total = views as u64;
+            for index in self.warm_up.exposure_views..views {
+                if cancel.is_cancelled() {
+                    return Ok(false);
+                }
+                if index % 8 == 0 {
+                    report.done = index as u64;
+                    progress(&report);
+                }
+                let (trainer, capture, cache) = (&mut self.trainer, &self.capture, &mut self.cache);
+                self.pool.install(|| trainer.prefit_exposure(index, capture, cache))?;
+                self.warm_up.exposure_views = index + 1;
+            }
+            self.trainer.settle_exposures();
+        }
+        self.warm_up.settled = true;
+        if !self.registered_here() && !self.align_poses(cancel, progress)? {
+            return Ok(false);
+        }
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
+        progress(&self.progress_now(Stage::Evaluate, 0));
+        if self.fusion_score.is_none() {
+            self.fusion_score = self.evaluate_fusion()?;
+        }
+        let score = self.evaluate(&self.trainer.model)?;
+        self.record_eval(score);
+        self.warm_up.done = true;
+        Ok(true)
     }
 
     fn progress_now(&self, stage: Stage, width: u32) -> Progress {
@@ -589,10 +701,11 @@ impl RefineJob {
             width,
             elapsed_s: self.wall_s,
             eta_s: eta,
-            psnr: self.evals.last().map(|e| e.score.psnr),
+            psnr: self.interim.as_ref().or(self.evals.last()).map(|e| e.score.psnr),
         }
     }
 
+    /// Records a scheduled evaluation of the current state.
     fn record_eval(&mut self, score: Option<EvalScore>) {
         let Some(score) = score else { return };
         let iteration = self.trainer.iteration;
@@ -611,42 +724,29 @@ impl RefineJob {
 
     /// [`Self::run`] that also stops once `stop_at` iterations are done
     /// (a pause: the schedules still refer to the whole run).
+    ///
+    /// A stop, by `stop_at` or by the token, leaves no trace in what
+    /// follows: going on, in this job or in one resumed from its checkpoint,
+    /// gives the model, the scores and the result of an uninterrupted run.
     pub fn run_to(&mut self, stop_at: u32, cancel: &CancelToken, progress: &mut dyn FnMut(&Progress)) -> Result<Outcome, RefineError> {
         let total = self.config.train.iterations;
-        if self.trainer.iteration == 0 && self.evals.is_empty() {
-            if self.config.train.exposure {
-                let mut report = self.progress_now(Stage::Exposure, 0);
-                report.total = self.trainer.views.len() as u64;
-                for index in 0..self.trainer.views.len() {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    if index % 8 == 0 {
-                        report.done = index as u64;
-                        progress(&report);
-                    }
-                    let (trainer, capture, cache) = (&mut self.trainer, &self.capture, &mut self.cache);
-                    self.pool.install(|| trainer.prefit_exposure(index, capture, cache))?;
-                }
-                self.trainer.settle_exposures();
+        self.interim = None;
+        if !self.warm_up.done && !self.warm_up(cancel, progress)? {
+            // Stopped before the first step: nothing was scored. The
+            // checkpoint remembers how far the passes came.
+            if self.checkpoint.is_some() {
+                self.save_checkpoint()?;
             }
-            self.align_poses(cancel, progress)?;
-            progress(&self.progress_now(Stage::Evaluate, 0));
-            if self.fusion_score.is_none() {
-                self.fusion_score = self.evaluate_fusion()?;
-            }
-            let score = self.evaluate(&self.trainer.model)?;
-            self.record_eval(score);
+            return Ok(Outcome { completed: false, iterations_done: self.trainer.iteration });
         }
         let eval_every = if self.config.evals > 0 { (total / (self.config.evals + 1)).max(1) } else { u32::MAX };
         let curve_every = (total / 200).max(1);
         let (mut last_report, mut last_checkpoint) = (Instant::now(), Instant::now());
-        let mut width = 0;
         while self.trainer.iteration < total.min(stop_at) && !cancel.is_cancelled() {
             let native = self.trainer.views.first().map_or(0, |v| v.cam.width);
-            if self.trainer.iteration > 0 && self.config.train.level_starts(self.trainer.iteration, native) {
-                // The cloud is sharper than at the start: register again.
-                self.align_poses(cancel, progress)?;
+            // The cloud is sharper than at the start: register again.
+            if self.trainer.iteration > 0 && self.config.train.level_starts(self.trainer.iteration, native) && !self.registered_here() && !self.align_poses(cancel, progress)? {
+                break;
             }
             let (wall, cpu) = (Instant::now(), cpu_time::ProcessTime::now());
             let (trainer, capture, cache) = (&mut self.trainer, &self.capture, &mut self.cache);
@@ -655,16 +755,16 @@ impl RefineJob {
             self.cpu_s += cpu.elapsed().as_secs_f64();
             let loss = step.loss.total as f32;
             let it = self.trainer.iteration;
-            if step.width != width {
+            if step.width != self.last_width {
                 // The previous level's pictures are of no further use, and
                 // its losses do not compare with those of this one.
                 self.cache.keep_only(step.width);
-                width = step.width;
+                self.last_width = step.width;
                 self.loss_ema = loss;
             }
             self.loss_ema = if it <= 1 || self.loss_ema == 0.0 { loss } else { 0.98 * self.loss_ema + 0.02 * loss };
             if it.is_multiple_of(curve_every) || it == total {
-                self.curve.push(CurvePoint { iteration: it, wall_s: self.wall_s, cpu_s: self.cpu_s, loss: self.loss_ema, gaussians: self.trainer.model.len(), width });
+                self.curve.push(CurvePoint { iteration: it, wall_s: self.wall_s, cpu_s: self.cpu_s, loss: self.loss_ema, gaussians: self.trainer.model.len(), width: self.last_width });
             }
             if it.is_multiple_of(eval_every) && it < total {
                 let score = self.evaluate(&self.trainer.model)?;
@@ -672,29 +772,39 @@ impl RefineJob {
             }
             if last_report.elapsed().as_secs_f32() >= 0.5 || it == total {
                 last_report = Instant::now();
-                progress(&self.progress_now(Stage::Optimise, width));
+                progress(&self.progress_now(Stage::Optimise, self.last_width));
             }
             if self.checkpoint.is_some() && last_checkpoint.elapsed().as_secs_f32() >= self.config.checkpoint_every_s.max(1.0) {
                 last_checkpoint = Instant::now();
                 self.save_checkpoint()?;
             }
         }
-        self.completed = self.trainer.iteration >= total;
-        // The final state competes with the best one seen on the way.
-        progress(&self.progress_now(Stage::Evaluate, width));
-        let score = self.evaluate(&self.trainer.model)?;
-        self.record_eval(score);
+        let it = self.trainer.iteration;
+        self.completed = it >= total;
+        // The state the run ends in is scored too. The last state of a
+        // completed run is a scheduled evaluation; the state of a stop
+        // competes for this job's result only.
+        if self.evals.iter().all(|e| e.iteration != it) {
+            progress(&self.progress_now(Stage::Evaluate, self.last_width));
+            let score = self.evaluate(&self.trainer.model)?;
+            if self.completed {
+                self.record_eval(score);
+            } else {
+                self.interim = score.map(|score| EvalPoint { iteration: it, wall_s: self.wall_s, score });
+            }
+        }
         if self.checkpoint.is_some() {
             self.save_checkpoint()?;
         }
-        progress(&self.progress_now(Stage::Optimise, width));
-        Ok(Outcome { completed: self.completed, iterations_done: self.trainer.iteration })
+        progress(&self.progress_now(Stage::Optimise, self.last_width));
+        Ok(Outcome { completed: self.completed, iterations_done: it })
     }
 
     /// The report of the job so far.
     pub fn report(&self) -> Report {
         let (model, result_iteration) = self.result();
-        let at = |iteration: u32| self.evals.iter().find(|e| e.iteration == iteration).map(|e| e.score);
+        let evals: Vec<EvalPoint> = self.evals.iter().chain(&self.interim).copied().collect();
+        let at = |iteration: u32| evals.iter().find(|e| e.iteration == iteration).map(|e| e.score);
         Report {
             config: self.config.clone(),
             capture: self.info.clone(),
@@ -709,8 +819,8 @@ impl RefineJob {
             start: at(0),
             refined: at(result_iteration).filter(|_| result_iteration > 0),
             result_iteration,
-            evals: self.evals.clone(),
             curve: self.curve.clone(),
+            evals,
         }
     }
 }
@@ -719,7 +829,7 @@ impl RefineJob {
 // Checkpoints
 // ---------------------------------------------------------------------------
 
-const CHECKPOINT_MAGIC: [u8; 8] = *b"GSRFCK1\0";
+const CHECKPOINT_MAGIC: [u8; 8] = *b"GSRFCK2\0";
 /// Floats of one view's state in a checkpoint.
 const VIEW_FLOATS: usize = 6 + 9 + 3 + 1;
 
@@ -739,6 +849,11 @@ struct CheckpointHeader {
     evals: Vec<EvalPoint>,
     fusion_score: Option<EvalScore>,
     fused_splats: usize,
+    /// Score and iteration of the best scheduled evaluation, and the size
+    /// of its model (stored last in the file).
+    best: Option<(f32, u32, usize)>,
+    warm_up: WarmUp,
+    last_width: u32,
 }
 
 fn view_floats(state: &ViewState) -> [f32; VIEW_FLOATS] {
@@ -794,7 +909,7 @@ impl ByteReader<'_> {
 impl RefineJob {
     /// The whole state of the job as bytes: a JSON header, then the raw
     /// arrays (model, moments, densification statistics, view states, fused
-    /// cloud), little-endian.
+    /// cloud, best model so far), little-endian.
     pub fn checkpoint_bytes(&self) -> Vec<u8> {
         let t = &self.trainer;
         let header = CheckpointHeader {
@@ -811,9 +926,13 @@ impl RefineJob {
             evals: self.evals.clone(),
             fusion_score: self.fusion_score,
             fused_splats: self.fused.len(),
+            best: self.best.as_ref().map(|(score, iteration, model)| (*score, *iteration, model.len())),
+            warm_up: self.warm_up,
+            last_width: self.last_width,
         };
         let json = serde_json::to_vec(&header).expect("the header serialises");
-        let mut out = Vec::with_capacity(16 + json.len() + t.model.len() * PARAMS * 12 + self.fused.len() * 44);
+        let best_len = self.best.as_ref().map_or(0, |b| b.2.len());
+        let mut out = Vec::with_capacity(16 + json.len() + (t.model.len() * 12 + best_len * 4) * PARAMS + self.fused.len() * 44);
         out.extend_from_slice(&CHECKPOINT_MAGIC);
         out.extend_from_slice(&(json.len() as u32).to_le_bytes());
         out.extend_from_slice(&json);
@@ -831,6 +950,11 @@ impl RefineJob {
             floats_to_bytes(&view_floats(v), &mut out);
         }
         out.extend_from_slice(bytemuck::cast_slice(&self.fused));
+        if let Some((_, _, best)) = &self.best {
+            for g in &best.data {
+                floats_to_bytes(g, &mut out);
+            }
+        }
         out
     }
 
@@ -846,8 +970,8 @@ impl RefineJob {
 
     /// Restores a job from a checkpoint. The capture is looked for at
     /// `capture_path`, or where it was when the checkpoint was written.
-    /// The best state seen before the stop is not part of a checkpoint: the
-    /// resumed job judges from its own evaluations.
+    /// The restored job goes on exactly as the stopped one would have: the
+    /// best state seen so far is part of the checkpoint.
     pub fn resume(checkpoint: &Path, capture_path: Option<&Path>) -> Result<Self, RefineError> {
         let bad = |why: &str| RefineError::Checkpoint(why.to_string());
         let bytes = std::fs::read(checkpoint)?;
@@ -863,8 +987,13 @@ impl RefineJob {
             return Err(bad("the capture is not the one this checkpoint was made from"));
         }
         let n = header.gaussians;
-        if n > bytes.len() / (PARAMS * 4) || header.views > bytes.len() / (VIEW_FLOATS * 4) {
+        let best_len = header.best.map_or(0, |b| b.2);
+        if n > bytes.len() / (PARAMS * 4) || best_len > bytes.len() / (PARAMS * 4) || header.views > bytes.len() / (VIEW_FLOATS * 4) {
             return Err(bad("sizes do not fit the file"));
+        }
+        let selection = &header.info.selection;
+        if selection.train.iter().chain(&selection.holdout).any(|&frame| frame >= capture.frames.len()) {
+            return Err(bad("a view is not in the capture"));
         }
         let rows = |flat: Vec<f32>| -> Vec<[f32; PARAMS]> { flat.chunks_exact(PARAMS).map(|c| c.try_into().expect("a full row")).collect() };
         let model = Gaussians { data: rows(reader.floats(n * PARAMS)?) };
@@ -877,6 +1006,10 @@ impl RefineJob {
         let view_state: Vec<ViewState> = reader.floats(header.views * VIEW_FLOATS)?.chunks_exact(VIEW_FLOATS).map(view_from_floats).collect();
         let fused_bytes = reader.take(header.fused_splats.checked_mul(std::mem::size_of::<Splat>()).ok_or_else(|| bad("size overflow"))?)?;
         let fused: Vec<Splat> = fused_bytes.chunks_exact(std::mem::size_of::<Splat>()).map(bytemuck::pod_read_unaligned).collect();
+        let best = match header.best {
+            Some((score, iteration, len)) => Some((score, iteration, Gaussians { data: rows(reader.floats(len * PARAMS)?) })),
+            None => None,
+        };
 
         let views = views_of(&capture, &header.info.selection.train, header.info.floor_y);
         let holdout = views_of(&capture, &header.info.selection.holdout, header.info.floor_y);
@@ -896,7 +1029,7 @@ impl RefineJob {
         trainer.iteration = header.iteration;
         Ok(Self {
             pool: build_pool(config.threads)?,
-            cache: ViewCache::new(config.cache_mb.max(16) << 20),
+            cache: view_cache(&config, &capture),
             config,
             capture,
             info: header.info,
@@ -911,7 +1044,10 @@ impl RefineJob {
             curve: header.curve,
             evals: header.evals,
             fusion_score: header.fusion_score,
-            best: None,
+            best,
+            interim: None,
+            warm_up: header.warm_up,
+            last_width: header.last_width,
             completed: false,
         })
     }

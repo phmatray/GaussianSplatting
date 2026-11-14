@@ -63,7 +63,7 @@ async function timeline(browser, base) {
     }),
   );
   check('replay: every control of the time line is labelled and reachable by keyboard', controls.every((c) => c.label && c.label.length > 3 && c.focusable), JSON.stringify(controls));
-  check('replay: the time line shows time and duration', (await page.locator('#tl-time').innerText()) === '0:00,0 / 0:05', await page.locator('#tl-time').innerText());
+  check('replay: the time line shows time and duration', (await page.locator('#tl-time').innerText()) === '0:00,0 / 0:05,0', await page.locator('#tl-time').innerText());
   check('replay: the cameras of the recording have their tiles', s.previews.ids.length === 8 && (await page.locator('#tiles .tile').count()) === 8);
 
   // ---- play, pause
@@ -418,6 +418,11 @@ async function recordingInMemory(browser, base) {
   s = await waitState(page, (s) => s.replay.status.playing && s.replay.status.time > 0.5, 30000);
   check('record: the take replays at once, from memory', s.replay.origin.take === take.id && Math.abs(s.replay.status.duration - take.durationS) < 0.01 && s.replay.title === take.title && (await row.getAttribute('class')).includes('playing'), JSON.stringify(s.replay.origin));
   // ---- deleting the take that plays returns to the live source
+  // The bin asks once more: the first click arms it, the second deletes.
+  await row.locator('.take-delete').click();
+  await sleep(300);
+  const armed = { takes: (await state(page)).takes.length, label: await row.locator('.take-delete').getAttribute('aria-label'), text: await row.locator('.take-delete').innerText() };
+  check('record: the first click on the bin only asks for a confirmation', armed.takes === 1 && /Confirmer la suppression/.test(armed.label) && /Supprimer/.test(armed.text), JSON.stringify(armed));
   await row.locator('.take-delete').click();
   s = await waitState(page, (s) => !s.replay && s.takes.length === 0 && s.layers.dynamic > 0 && s.counts.stats > 0, 30000);
   check('record: deleting the take on screen returns to the live source', (await page.locator('#takes').count()) === 0);
@@ -485,10 +490,12 @@ async function headset(browser, base) {
   check('vr replay: the left Y button pauses it', !s.replay.status.playing);
   // Scrubbing: left grip held, left stick to the right; the user stays put.
   const before = { time: s.replay.status.time, rig: s.xr.session.rig.slice(0, 3) };
-  await page.evaluate(() => {
+  // (Towards the middle of the recording: the pause may have come near
+  // either end, where a scrub outwards has nowhere to go.)
+  await page.evaluate((direction) => {
     xrdev.controllers.left.updateButtonValue('squeeze', 1);
-    xrdev.controllers.left.updateAxes('thumbstick', 1, 0);
-  });
+    xrdev.controllers.left.updateAxes('thumbstick', direction, 0);
+  }, before.time > s.replay.status.duration / 2 ? -1 : 1);
   s = await waitState(page, (s, t) => Math.abs(s.replay.status.time - t) > 0.5, 30000, before.time);
   await page.evaluate(() => {
     xrdev.controllers.left.updateAxes('thumbstick', 0, 0);

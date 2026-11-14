@@ -38,11 +38,15 @@ Options de l'optimisation :
   --vues <n>                   nombre maximal de vues d'entraînement
   --evaluation <n>             une vue sur n est mise de côté (0 : aucune)
   --threads <n>                nombre de fils d'exécution (défaut : tous)
-  --poses                      affine aussi la pose de chaque image
+  --poses                      recale aussi la pose de chaque image (à réserver
+                               aux captures dont les poses sont bruitées :
+                               sur une capture propre le résultat est moins bon)
   --sans-exposition            ne corrige pas l'exposition par image
   --graine <n>                 graine des tirages aléatoires
   --splat                      écrit aussi un fichier .splat
   --reprise <fichier>          reprend une optimisation interrompue
+  --voxel <m>                  taille des cellules de la fusion de départ
+  --cache <Mo>                 mémoire pour les photos décodées (défaut : 1024)
   --set <chemin=valeur>        règle un paramètre avancé (voir le rapport JSON)
   --silencieux                 n'affiche pas la progression
 
@@ -75,8 +79,6 @@ impl Args {
 
     /// The first argument that is neither an option nor an option's value.
     fn positional(&self, skip: usize) -> Option<&str> {
-        const WITH_VALUE: [&str; 15] =
-            ["-o", "--sortie", "--preset", "--iterations", "--largeur", "--gaussiennes", "--vues", "--evaluation", "--threads", "--graine", "--reprise", "--set", "--format", "--voxel", "--cache"];
         let mut i = skip;
         while i < self.0.len() {
             let a = self.0[i].as_str();
@@ -90,7 +92,39 @@ impl Args {
         }
         None
     }
+
+    /// Refuses what the tool would otherwise drop in silence: an option it
+    /// does not know, an option without its value, a second file. A
+    /// misspelt `--iterations` must not start the default run instead.
+    fn check(&self, skip: usize) -> Result<(), String> {
+        let (mut i, mut files) = (skip, 0);
+        while i < self.0.len() {
+            let a = self.0[i].as_str();
+            if WITH_VALUE.contains(&a) {
+                if i + 1 >= self.0.len() {
+                    return Err(format!("il manque une valeur après {a}"));
+                }
+                i += 2;
+            } else if FLAGS.contains(&a) {
+                i += 1;
+            } else if a.starts_with('-') {
+                return Err(format!("option inconnue : {a}. « gs-refine aide » liste les options."));
+            } else {
+                files += 1;
+                if files > 1 {
+                    return Err(format!("argument en trop : {a}"));
+                }
+                i += 1;
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Options that take a value, and those that do not.
+const WITH_VALUE: [&str; 15] =
+    ["-o", "--sortie", "--preset", "--iterations", "--largeur", "--gaussiennes", "--vues", "--evaluation", "--threads", "--graine", "--reprise", "--set", "--format", "--voxel", "--cache"];
+const FLAGS: [&str; 4] = ["--poses", "--sans-exposition", "--splat", "--silencieux"];
 
 fn french_number(n: usize) -> String {
     let digits = n.to_string();
@@ -297,6 +331,11 @@ fn refine(args: &Args) -> Result<ExitCode, String> {
             eprintln!("Attention : l'enregistrement est tronqué, seules les images complètes sont utilisées.");
         }
     }
+    // Before the long part: a result that cannot be written is found out
+    // now, and the checkpoint needs the directory as well.
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("impossible de créer {} : {e}", parent.display()))?;
+    }
     let checkpoint = output.with_extension("reprise");
     job.checkpoint_to(Some(checkpoint.clone()));
 
@@ -305,9 +344,6 @@ fn refine(args: &Args) -> Result<ExitCode, String> {
     reporter.end_line();
 
     let splats = job.splats();
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|e| format!("impossible de créer {} : {e}", parent.display()))?;
-    }
     std::fs::write(&output, gs_core::io::write_ply(&splats)).map_err(|e| format!("impossible d'écrire {} : {e}", output.display()))?;
     if args.flag(&["--splat"]) {
         let path = output.with_extension("splat");
@@ -335,6 +371,9 @@ fn refine(args: &Args) -> Result<ExitCode, String> {
         let score = |s: &gs_refine::job::EvalScore| format!("{} dB (SSIM {})", decimal(s.psnr as f64, 2), decimal(s.ssim as f64, 3));
         if let (Some(fusion), Some(refined)) = (&report.fusion, &report.refined) {
             eprintln!("Vues mises de côté : fusion temps réel {}, résultat {} (itération {}).", score(fusion), score(refined), french_number(report.result_iteration as usize));
+            // Measured in simulation: a gain of 9 dB here went with 1 to 4 dB
+            // from viewpoints a meter away from the path.
+            eprintln!("Ces vues sont voisines des vues d'entraînement : loin du trajet de l'appareil, le gain est nettement plus faible.");
         }
         eprintln!("{} : {} gaussiennes. Rapport : {}", output.display(), french_number(splats.len()), report_path.display());
     }
@@ -456,9 +495,9 @@ fn main() -> ExitCode {
             println!("{HELP}");
             return ExitCode::SUCCESS;
         }
-        Some("info") => info(&args),
-        Some("export") => export(&args),
-        Some(_) => refine(&args),
+        Some("info") => args.check(1).and_then(|()| info(&args)),
+        Some("export") => args.check(1).and_then(|()| export(&args)),
+        Some(_) => args.check(0).and_then(|()| refine(&args)),
     };
     match result {
         Ok(code) => code,

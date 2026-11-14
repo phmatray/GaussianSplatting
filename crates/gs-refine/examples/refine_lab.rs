@@ -12,7 +12,13 @@
 //!     [--sheets] [--diff] [--ply] [--label text] [--probe] [--bench]
 //! ```
 //!
-//! Scenarios: `bedroom`, `house`, `object`, `person` (as `gscap_write`).
+//! Scenarios: `bedroom`, `house`, `object`, `person` (as `gscap_write`) and
+//! `living` (a sweep of the living room on a path of its own).
+//! `--seed N` changes the noise of the simulated phone, `--stage-time T` the
+//! pose of the subject of `object` and `person`. `--train-photos` scores
+//! training and held-out photographs with one instrument; `--floaters`
+//! measures what hangs in front of the true surfaces from viewpoints the
+//! phone was never near and writes sheets of them.
 //! `--set` patches any field of the job's configuration by its JSON path.
 //! Everything here is simulated; nothing has seen a real phone.
 
@@ -25,7 +31,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use common::{house_views, observed_mask, save_png, Exposures, BACKGROUND};
+use common::{house_look_around_views, house_views, observed_mask, save_png, Exposures, BACKGROUND};
 use gs_core::capture::{render_reference, render_rgbd, CaptureOptions};
 use gs_core::experimental::metrics::{self, classify, MaskParams, Summary, INTERIOR, SILHOUETTE, TEXTURE};
 use gs_core::experimental::sheet;
@@ -38,10 +44,15 @@ use gs_core::scene::stage::StageScene;
 use gs_core::scene::{make_scene, Scene, SceneKind, SceneSnapshot};
 use gs_core::{Camera, RgbdFrame, Splat};
 use gs_refine::job::{CancelToken, Preset, RefineConfig, RefineJob};
+use gs_refine::model::Gaussians;
+use gs_refine::raster::{CpuRasterizer, Rasterizer, Rendered, View};
 use ingest_sim::{orbit_pose, room_sweep, CaptureWorld, HouseWalk, Phone, PhoneSim};
 
 const BEDROOM_LOOP: [[f32; 2]; 7] = [[-1.3, 2.0], [-1.7, 1.78], [-2.35, 1.36], [-2.92, 1.78], [-2.8, 2.38], [-2.25, 2.6], [-1.68, 2.28]];
 const DANCER: Vec3 = Vec3::new(0.0, 1.0, 0.0);
+/// Around the coffee table of the living room (waypoints of the house walk,
+/// which is known to be free of furniture), filmed as a spiral sweep.
+const LIVING_LOOP: [[f32; 2]; 8] = [[-1.3, -1.12], [-2.4, -1.18], [-3.4, -1.18], [-4.08, -1.5], [-4.08, -2.45], [-3.45, -2.92], [-2.3, -2.92], [-1.15, -2.55]];
 
 struct Args(Vec<String>);
 
@@ -75,9 +86,13 @@ struct Scenario {
     cameras: Vec<Camera>,
 }
 
-fn scenario(name: &str, sim: &PhoneSim, frames: Option<usize>) -> Scenario {
+fn scenario(name: &str, sim: &PhoneSim, frames: Option<usize>, stage_time: f32) -> Scenario {
     let house = || make_scene(SceneKind::House).snapshot(0.0);
     match name {
+        "living" => {
+            let n = frames.unwrap_or(300);
+            Scenario { mode: "room", frames: n, snap: house(), empty: None, region: None, cameras: (0..n).map(|i| sim.camera(room_sweep(&LIVING_LOOP, i, n, 47.0))).collect() }
+        }
         "bedroom" => {
             let n = frames.unwrap_or(220);
             Scenario { mode: "room", frames: n, snap: house(), empty: None, region: None, cameras: (0..n).map(|i| sim.camera(room_sweep(&BEDROOM_LOOP, i, n, 55.0))).collect() }
@@ -101,7 +116,7 @@ fn scenario(name: &str, sim: &PhoneSim, frames: Option<usize>) -> Scenario {
             Scenario {
                 mode: if masked { "person" } else { "object" },
                 frames: n,
-                snap: stage.snapshot(1.0),
+                snap: stage.snapshot(stage_time),
                 empty: masked.then(|| stage.snapshot_static()),
                 region: Some((DANCER, radius)),
                 cameras,
@@ -111,8 +126,10 @@ fn scenario(name: &str, sim: &PhoneSim, frames: Option<usize>) -> Scenario {
     }
 }
 
-/// Writes the capture and returns its world.
-fn write_capture(path: &Path, sc: &Scenario, sim: PhoneSim) -> CaptureWorld {
+/// Writes the capture and returns its world. With `hole`, a sphere in
+/// scene coordinates, the depth sensor returns nothing from inside it (a
+/// window, a mirror, a black sofa): the photographs still show it.
+fn write_capture(path: &Path, sc: &Scenario, sim: PhoneSim, hole: Option<(Vec3, f32)>) -> CaptureWorld {
     let mut phone = Phone::new(sim, &sc.cameras[0]);
     let world = phone.world;
     if path.exists() {
@@ -132,7 +149,21 @@ fn write_capture(path: &Path, sc: &Scenario, sim: PhoneSim) -> CaptureWorld {
     let file = std::fs::File::create(&tmp).expect("cannot create the capture");
     let mut writer = GscapWriter::new(BufWriter::new(file), &header, gs_core::ingest::file::HEADER_PAD).expect("header");
     for (i, cam) in sc.cameras.iter().enumerate() {
-        let shot = phone.shoot(&sc.snap, sc.empty.as_ref(), cam, i as f64 / 10.0);
+        let mut shot = phone.shoot(&sc.snap, sc.empty.as_ref(), cam, i as f64 / 10.0);
+        if let Some((center, radius)) = hole {
+            let frame = &mut shot.frame;
+            let (dw, dh) = (frame.depth_width as usize, frame.depth_height as usize);
+            let depth_cam = shot.cam.resized(dw as u32, dh as u32);
+            for at in 0..dw * dh {
+                let z = frame.depth_mm[at] as f32 * 1e-3;
+                if z > 0.0 && depth_cam.unproject((at % dw) as f32 + 0.5, (at / dw) as f32 + 0.5, z).distance(center) < radius {
+                    frame.depth_mm[at] = 0;
+                    if let Some(confidence) = frame.confidence.as_mut() {
+                        confidence[at] = 0;
+                    }
+                }
+            }
+        }
         writer.append(&encode_frame(&shot.frame).expect("frame")).expect("write");
     }
     drop(writer);
@@ -163,7 +194,7 @@ fn truth_views(name: &str, sc: &Scenario, width: u32, far: f32, probe: bool) -> 
     let exposures = Exposures { frames, max_range: far };
 
     let cams: Vec<(String, Camera)> = match name {
-        "bedroom" => house_views().into_iter().filter(|v| v.name.starts_with("bedroom")).map(|v| (v.name, v.cam)).collect(),
+        "bedroom" | "living" => house_views().into_iter().filter(|v| v.name.starts_with(name)).map(|v| (v.name, v.cam)).collect(),
         "house" => house_views().into_iter().map(|v| (v.name, v.cam)).collect(),
         _ => (0..8)
             .map(|k| {
@@ -371,6 +402,132 @@ fn bench(capture: &Path, config: &RefineConfig, args: &Args) {
     }
 }
 
+/// Colour, mean depth and coverage of a cloud (scene coordinates) drawn the
+/// way the optimiser and the viewer of an imported file draw it.
+fn sorted_picture(splats: &[Splat], cam: &Camera) -> (Image, Vec<f32>, Vec<f32>) {
+    let model = Gaussians::from_splats(splats, 1.0, 1.0, 0.0);
+    let mut out = Rendered::default();
+    CpuRasterizer::default().forward(&model, &View::from_camera(cam, BACKGROUND.map(|v| v as f32 / 255.0)), &mut out);
+    let depth = out.depth.iter().zip(&out.alpha).map(|(d, a)| if *a > 1e-3 { d / a } else { 0.0 }).collect();
+    (out.to_image(), depth, out.alpha)
+}
+
+/// Share of the pixels with a true surface where the cloud is closed
+/// (coverage of a half or more) and its mean depth is more than 10 % short
+/// of the truth, and the mean shortfall over those pixels: what hangs in the
+/// air in front of the scene.
+fn in_front(depth: &[f32], alpha: &[f32], truth: &RgbdFrame) -> (f32, f32) {
+    let (mut surface, mut front, mut shortfall) = (0usize, 0usize, 0.0f64);
+    for i in 0..depth.len() {
+        let z = truth.depth[i];
+        if z <= 0.0 {
+            continue;
+        }
+        surface += 1;
+        if alpha[i] >= 0.5 && depth[i] < 0.9 * z {
+            front += 1;
+            shortfall += (1.0 - depth[i] / z) as f64;
+        }
+    }
+    (100.0 * front as f32 / surface.max(1) as f32, (shortfall / front.max(1) as f64) as f32)
+}
+
+/// Floaters: viewpoints the phone was never near (ceilings, corners, the
+/// floor, low and high in the room), scored against the true depth, and
+/// viewpoints outside the room (from above with the ceiling cut away, from
+/// behind a wall) as pictures only. Three clouds each: the fusion as the
+/// viewer shows it, the optimiser's start, the refined result.
+#[allow(clippy::too_many_arguments)]
+fn floaters(name: &str, sc: &Scenario, out: &Path, tag: &str, fused: &[Splat], start: &[Splat], refined: &[Splat], views: &[TruthView], fusion: &Scores, width: u32) {
+    let height = width * 3 / 4;
+    println!("\n### floaters, {tag}");
+    if sc.region.is_some() {
+        // Subjects: coverage where the truth shows nothing at all.
+        let ghost = |alphas: &dyn Fn(usize) -> Vec<f32>| {
+            let (mut sum, mut n) = (0.0f64, 0usize);
+            for (i, view) in views.iter().enumerate() {
+                let alpha = alphas(i);
+                for (k, a) in alpha.iter().enumerate() {
+                    if view.reference.depth[k] <= 0.0 && view.observed[k] {
+                        sum += *a as f64;
+                        n += 1;
+                    }
+                }
+            }
+            100.0 * sum / n.max(1) as f64
+        };
+        println!(
+            "mean coverage where the truth is empty, %: fusion (viewer) {:.3}, start {:.3}, refined {:.3}",
+            ghost(&|i| fusion.alphas[i].clone()),
+            ghost(&|i| sorted_picture(start, &views[i].cam).2),
+            ghost(&|i| sorted_picture(refined, &views[i].cam).2)
+        );
+    }
+    // Viewpoints with a ground truth.
+    let (lo, hi) = match name {
+        "bedroom" => ([-5.5f32, 0.2], [-1.0f32, 4.0]),
+        "living" => ([-5.5, -4.0], [0.5, 0.2]),
+        _ => ([-5.5, -4.0], [5.5, 4.0]),
+    };
+    let center = Vec3::new(0.5 * (lo[0] + hi[0]), 1.2, 0.5 * (lo[1] + hi[1]));
+    let mut cams: Vec<(String, Camera, bool)> = Vec::new();
+    if sc.region.is_none() {
+        for v in house_look_around_views() {
+            if name == "house" || v.name.starts_with(name) {
+                cams.push((v.name, v.cam, true));
+            }
+        }
+        // Low in one corner and high in the opposite one, looking across.
+        let low = Vec3::new(lo[0] + 0.7, 0.3, lo[1] + 0.7);
+        let high = Vec3::new(hi[0] - 0.7, 2.25, hi[1] - 0.7);
+        cams.push(("low_corner".into(), Camera::look_at(low, center, Vec3::Y, 75f32.to_radians(), 640, 480), true));
+        cams.push(("high_corner".into(), Camera::look_at(high, Vec3::new(center.x, 0.6, center.z), Vec3::Y, 75f32.to_radians(), 640, 480), true));
+        // From behind the wall and from above: no truth to compare with.
+        let behind = Vec3::new(lo[0] - 0.5, 1.5, center.z);
+        cams.push(("behind_wall".into(), Camera::look_at(behind, center, Vec3::Y, 75f32.to_radians(), 640, 480), false));
+        cams.push(("from_above".into(), Camera::look_at(Vec3::new(center.x, 7.5, center.z), Vec3::new(center.x, 0.0, center.z), Vec3::NEG_Z, 55f32.to_radians(), 640, 480), false));
+    } else {
+        for (k, (eye, target)) in [(Vec3::new(0.4, 4.6, 0.7), Vec3::new(0.0, 0.6, 0.0)), (Vec3::new(3.4, 0.35, 0.6), DANCER), (Vec3::new(-0.9, 1.5, -0.9), DANCER)].into_iter().enumerate() {
+            cams.push((format!("far{k}"), Camera::look_at(eye, target, Vec3::Y, 50f32.to_radians(), 640, 480), false));
+        }
+    }
+    println!("| view | fusion (viewer) in front % | start in front % | refined in front % | refined mean shortfall | refined coverage % |");
+    println!("|---|---|---|---|---|---|");
+    let (mut sums, mut scored) = ([0.0f32; 3], 0);
+    for (view_name, cam, has_truth) in cams {
+        let cam = cam.resized(width, height);
+        // The room without its ceiling for the view from above.
+        let cut = |splats: &[Splat]| -> Vec<Splat> { splats.iter().filter(|s| view_name != "from_above" || s.pos[1] < 2.2).copied().collect() };
+        let (fused_cut, start_cut, refined_cut) = (cut(fused), cut(start), cut(refined));
+        let shown = wblend::render(&[Layer { splats: &fused_cut, weight: 1.0 }], &cam, &WblendOptions::normalized_soft());
+        let (start_image, start_depth, start_alpha) = sorted_picture(&start_cut, &cam);
+        let (refined_image, refined_depth, refined_alpha) = sorted_picture(&refined_cut, &cam);
+        let mut panels = Vec::new();
+        if has_truth {
+            let truth = render_reference(&sc.snap, &cam, true, 2, BACKGROUND);
+            // The viewer's blending has no mean depth: its own depth is
+            // the visible surface, which cannot float. Scored on coverage
+            // and the sorted clouds only.
+            let fusion_sorted = sorted_picture(&fused_cut, &cam);
+            let (a, b, c) = (in_front(&fusion_sorted.1, &fusion_sorted.2, &truth), in_front(&start_depth, &start_alpha, &truth), in_front(&refined_depth, &refined_alpha, &truth));
+            let coverage = 100.0 * refined_alpha.iter().filter(|a| **a >= 0.5).count() as f32 / refined_alpha.len() as f32;
+            println!("| {view_name} | {:.2} | {:.2} | {:.2} | {:.3} | {coverage:.1} |", a.0, b.0, c.0, c.1);
+            sums = [sums[0] + a.0, sums[1] + b.0, sums[2] + c.0];
+            scored += 1;
+            panels.push(("ground truth".to_string(), Image::from_frame(&truth)));
+        }
+        panels.push(("fusion (viewer)".to_string(), shown.over(BACKGROUND)));
+        panels.push(("start (sorted)".to_string(), start_image));
+        panels.push(("refined".to_string(), refined_image));
+        let labelled: Vec<Image> = panels.iter().map(|(text, image)| sheet::labelled(image, text, 2)).collect();
+        save_png(&out.join(format!("floaters/{tag}_{view_name}.png")), &sheet::beside(&labelled, 6, [255, 255, 255]));
+    }
+    if scored > 0 {
+        let n = scored as f32;
+        println!("| mean of {scored} | {:.2} | {:.2} | {:.2} | | |", sums[0] / n, sums[1] / n, sums[2] / n);
+    }
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let (Some(name), Some(out)) = (raw.first().cloned(), raw.get(1).map(PathBuf::from)) else {
@@ -388,11 +545,27 @@ fn main() {
     sim.depth_noise = args.number("--depth-noise").unwrap_or(sim.depth_noise);
     sim.pose_jitter = args.number("--pose-jitter").unwrap_or(sim.pose_jitter);
     sim.pose_drift = args.number("--pose-drift").unwrap_or(sim.pose_drift);
-    let sc = scenario(&name, &sim, args.number("--frames"));
-    let tag = format!("{name}_{}f_{}w_e{}_d{}_j{}_r{}", sc.frames, sim.color_width, sim.exposure_drift, sim.depth_noise, sim.pose_jitter, sim.pose_drift);
+    sim.seed = args.number("--seed").unwrap_or(sim.seed);
+    let stage_time = args.number("--stage-time").unwrap_or(1.0);
+    let sc = scenario(&name, &sim, args.number("--frames"), stage_time);
+    let mut tag = format!("{name}_{}f_{}w_e{}_d{}_j{}_r{}", sc.frames, sim.color_width, sim.exposure_drift, sim.depth_noise, sim.pose_jitter, sim.pose_drift);
+    if sim.seed != 1 {
+        tag.push_str(&format!("_s{}", sim.seed));
+    }
+    if stage_time != 1.0 {
+        tag.push_str(&format!("_t{stage_time}"));
+    }
+    // `--depth-hole R`: no depth within R meters of the point the first
+    // ground-truth view looks at.
+    let hole = args.number::<f32>("--depth-hole").map(|radius| {
+        let cam = truth_views(&name, &sc, 64, 5.0, false).first().expect("a ground-truth view").cam.resized(3, 3);
+        let depth = render_rgbd(&sc.snap, &cam, &CaptureOptions { shadows: false, min_range: 0.05, max_range: 50.0, ..CaptureOptions::default() }).depth[4];
+        tag.push_str(&format!("_h{radius}"));
+        (cam.unproject(1.5, 1.5, depth), radius)
+    });
     let capture_path = out.join(format!("{tag}.gscap"));
     let started = Instant::now();
-    let world = write_capture(&capture_path, &sc, sim);
+    let world = write_capture(&capture_path, &sc, sim, hole);
     eprintln!("capture {} ({:.0} s)", capture_path.display(), started.elapsed().as_secs_f64());
 
     let mut config = RefineConfig::preset(args.text("--preset").map_or(Preset::Rapide, |p| Preset::from_name(p).expect("unknown preset")));
@@ -447,6 +620,8 @@ fn main() {
     eval_at.dedup();
     let mut last_pictures = Vec::new();
     let mut last_psnr = fusion.inner.psnr_observed;
+    // The cloud the optimiser starts from, in scene coordinates.
+    let start_scene = world.to_scene(&job.trainer.model.to_splats(), floor_y);
     for &stop in &eval_at {
         if stop > 0 {
             job.run_to(stop, &cancel, &mut |_| {}).expect("run");
@@ -471,6 +646,32 @@ fn main() {
     std::fs::write(out.join(format!("{tag}_{label}.json")), serde_json::to_string_pretty(&report).expect("report")).expect("write report");
     if args.flag("--ply") {
         std::fs::write(out.join(format!("{tag}_{label}.ply")), gs_core::io::write_ply(&job.splats())).expect("write ply");
+    }
+
+    if args.flag("--train-photos") {
+        // The classic check for memorising: the same score on photographs
+        // the optimiser trained on and on those it never saw.
+        let n = job.trainer.views.len();
+        let some: Vec<_> = (0..12.min(n)).map(|k| job.trainer.views[k * n / 12.min(n)]).collect();
+        let train = job.evaluate_views(&job.trainer.model, &some).expect("evaluation");
+        let held = job.evaluate_views(&job.trainer.model, job.holdout()).expect("evaluation");
+        if let (Some(train), Some(held)) = (train, held) {
+            println!(
+                "photographs, final state: training views {:.2} dB (SSIM {:.3}, {} views), held-out views {:.2} dB (SSIM {:.3}, {} views), gap {:.2} dB",
+                train.psnr,
+                train.ssim,
+                train.views,
+                held.psnr,
+                held.ssim,
+                held.views,
+                train.psnr - held.psnr
+            );
+        }
+    }
+
+    if args.flag("--floaters") {
+        let refined_scene = world.to_scene(&job.trainer.model.to_splats(), floor_y);
+        floaters(&name, &sc, &out, &format!("{tag}_{label}"), &fused_scene, &start_scene, &refined_scene, &views, &fusion, eval_width.min(640));
     }
 
     if args.flag("--exposure-stats") {

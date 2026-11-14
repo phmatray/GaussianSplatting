@@ -19,8 +19,39 @@ function synth(name, { frames = 80, mode = 'room', title = 'Salon', depth = 64, 
   return file;
 }
 
+// The same capture walked `times` times, forth and back: the frames are
+// repeated with new indices and times. An import must last long enough to
+// be watched and stopped, however fast the machine: the reference tool
+// renders its frames in pure Python, so they are reused instead.
+function stretch(file, times) {
+  const script = `
+import struct, sys
+sys.path.insert(0, sys.argv[1])
+import gscap
+header, frames, _ = gscap.read_gscap(sys.argv[2])
+def walk():
+    n = 0
+    for lap in range(int(sys.argv[3])):
+        for frame in (frames if lap % 2 == 0 else frames[::-1]):
+            data = bytearray(frame)
+            struct.pack_into('<I', data, 8, n)
+            struct.pack_into('<d', data, 16, 100.0 + n / 10.0)
+            n += 1
+            yield bytes(data)
+gscap.write_gscap(sys.argv[2] + '.tmp', header, walk())
+`;
+  const r = spawnSync('python3', ['-c', script, path.join(REPO, 'tools'), file, String(times)], { encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(`stretching ${file} failed: ${r.stderr}`);
+  fs.renameSync(`${file}.tmp`, file);
+  return file;
+}
+
+// Frames of the room capture and of the object capture below.
+const ROOM_FRAMES = 150 * 4;
+const OBJECT_FRAMES = 300 * 3;
+
 async function run({ browser, url }) {
-  const room = synth('room.gscap', { frames: 150, depth: 256, color: 640 });
+  const room = stretch(synth('room.gscap', { frames: 150, depth: 256, color: 640 }), 4);
   const { ctx, page, logs } = await newPage(browser);
   let s = await open(page, url);
   await page.locator('#section-phone').scrollIntoViewIfNeeded();
@@ -45,8 +76,8 @@ async function run({ browser, url }) {
   await shot(page, 'capture-import.png');
 
   s = await waitState(page, (s) => s.import.progress.done, 300000);
-  check('capture: the import ends with every frame read and the capture finished', s.import.progress.frames === 150 && s.import.progress.error === null && !s.import.progress.truncated && s.capture.stats.finished && s.capture.stats.frames_received === 150 && s.capture.state === 'finished' && s.layers.static > mid, `${s.layers.static} splats, ${JSON.stringify(s.import.progress)}`);
-  check('capture: a notice sums the import up', /Capture importée/.test(s.notice.text) && /150 images lues/.test(s.notice.text) && !s.notice.error, s.notice.text);
+  check('capture: the import ends with every frame read and the capture finished', s.import.progress.frames === ROOM_FRAMES && s.import.progress.error === null && !s.import.progress.truncated && s.capture.stats.finished && s.capture.stats.frames_received === ROOM_FRAMES && s.capture.state === 'finished' && s.layers.static > mid, `${s.layers.static} splats, ${JSON.stringify(s.import.progress)}`);
+  check('capture: a notice sums the import up', /Capture importée/.test(s.notice.text) && s.notice.text.includes(`${ROOM_FRAMES} images lues`) && !s.notice.error, s.notice.text);
   check('capture: Stats and viewer agree on the map', s.stats.splats_static === s.layers.static && s.stats.scan.state === 'done');
   await sleep(400);
   const view = await viewShot(page, 'capture-room-view.png');
@@ -76,12 +107,12 @@ async function run({ browser, url }) {
   check('capture: a mode button leaves the capture for the simulation', (await page.locator('#capture-card').count()) === 0 && (await page.locator('#cam-count').count()) === 1 && s.nav === 'orbit');
 
   // ---- an object capture, stopped half way
-  const object = synth('object.gscap', { frames: 300, mode: 'object', title: 'Vase', depth: 192, color: 320 });
+  const object = stretch(synth('object.gscap', { frames: 300, mode: 'object', title: 'Vase', depth: 192, color: 320 }), 3);
   await page.setInputFiles('#gscap-input', object);
   s = await waitState(page, (s) => s.import && s.capture && s.capture.info.mode === 'object' && s.import.progress.frames >= 5, 120000);
   await page.click('#import-cancel');
   s = await waitState(page, (s) => s.import.progress.done, 60000);
-  check('capture: an import can be stopped, what was fused stays', s.import.progress.frames < 300 && s.capture.stats.finished && s.sceneName === 'capture' && /Objet/.test(await page.locator('#capture-mode').innerText()), `${s.import.progress.frames} of 300 frames`);
+  check('capture: an import can be stopped, what was fused stays', s.import.progress.frames < OBJECT_FRAMES && s.capture.stats.finished && s.sceneName === 'capture' && /Objet/.test(await page.locator('#capture-mode').innerText()), `${s.import.progress.frames} of ${OBJECT_FRAMES} frames`);
   await page.click('#import-dismiss');
 
   // ---- files that are not captures
@@ -96,7 +127,7 @@ async function run({ browser, url }) {
   await page.click('#import-dismiss');
   await page.setInputFiles('#gscap-input', cut);
   s = await waitState(page, (s) => s.import && s.import.progress.done && s.import.file === 'cut.gscap', 120000);
-  check('capture: a capture cut short keeps its complete frames and says so', s.import.progress.truncated && s.import.progress.error === null && s.import.progress.frames > 10 && s.import.progress.frames < 150 && /incomplet/.test(s.notice.text) && s.layers.static > 500, JSON.stringify(s.import.progress));
+  check('capture: a capture cut short keeps its complete frames and says so', s.import.progress.truncated && s.import.progress.error === null && s.import.progress.frames > 10 && s.import.progress.frames < ROOM_FRAMES && /incomplet/.test(s.notice.text) && s.layers.static > 500, JSON.stringify(s.import.progress));
   for (const file of [bad, cut, object]) fs.rmSync(file, { force: true });
 
   s = await state(page);
@@ -105,5 +136,5 @@ async function run({ browser, url }) {
   await ctx.close();
 }
 
-module.exports = { run, synth };
+module.exports = { run, synth, stretch };
 if (require.main === module) require('./standalone.cjs')(run);

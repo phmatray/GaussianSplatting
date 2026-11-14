@@ -98,7 +98,10 @@ impl Core {
                             core.import_bytes(&name, &bytes);
                             core.apply_start_view(start);
                         }
-                        Err(DownloadError::Status(status)) => core.import_failed(replay::error_text(&format!("http_{status}")).replace("L'enregistrement", "Le fichier")),
+                        Err(DownloadError::Status(status)) => {
+                            let text = replay::error_text(&format!("http_{status}"));
+                            core.import_failed(text.replace("L'enregistrement", "Le fichier").replace("cet enregistrement", "ce fichier"))
+                        }
                         Err(DownloadError::TooLarge) => core.import_failed("Le fichier du lien est trop volumineux.".to_string()),
                         Err(DownloadError::Network(reason)) => core.import_failed(format!(
                             "Le fichier du lien n'a pas pu être téléchargé ({reason}). Vérifiez l'adresse, et pour un autre site que celui-ci, qu'il autorise le partage (CORS)."

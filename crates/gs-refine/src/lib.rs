@@ -36,6 +36,24 @@
 //!
 //! The command-line tool `gs-refine` (French messages) wraps 6 and 7.
 //!
+//! # Presets
+//!
+//! [`job::Preset`] fixes the size of the pictures at the last level, the
+//! number of training views and how often each is visited; the number of
+//! iterations follows from the capture (`passes x views`, with a minimum).
+//!
+//! | Preset | Width | Views at most | Passes | Iterations at least | Room cells | Gaussians at most |
+//! |---|---|---|---|---|---|---|
+//! | `rapide` | 480 | 300 | 6 | 1 500 | 2.4 cm | 1 000 000 |
+//! | `standard` | 640 | 600 | 15 | 4 000 | 1.6 cm | 2 000 000 |
+//! | `fin` | 960 | 1 200 | 30 | 12 000 | 1.6 cm | 4 000 000 |
+//!
+//! One iteration on one thread of the 4-core development machine, for a
+//! room of 140 000 Gaussians: 77 ms at 320 pixels, 130 ms at 480, 205 ms at
+//! 640, 400 ms at 960; four threads are 3.1 times faster. Two fifths of it
+//! is the backward pass over the pixels, a quarter each the forward
+//! compositing and the loss (`examples/refine_lab.rs --bench`).
+//!
 //! # Coordinates
 //!
 //! Everything is in the world viewers see: the capture's world (ARKit:
@@ -58,6 +76,17 @@
 //!
 //! A port is validated against this code by mirroring its tests:
 //!
+//! * `tests/gradients.rs` holds a second implementation of the image
+//!   formation model and of the loss in `f64`, written from their
+//!   documentation with no tiles and no shared code. The CPU forward pass
+//!   agrees with it within `3e-6`, and every analytic gradient of the whole
+//!   loss (14 parameters, camera twist, colour correction) agrees with its
+//!   central differences within `1e-5` to `6e-4`, cut-offs on, for
+//!   overlapping, clipped, near-plane, sub-pixel and saturated scenes. It
+//!   is the reference to hold a port to. Finite differences there freeze
+//!   which Gaussians contribute to which pixel: the picture jumps a little
+//!   wherever a pixel center crosses a cut-off, and a twist of the camera
+//!   moves every such boundary at once.
 //! * `raster::tests::gradients_match_*`: central differences of a random
 //!   linear functional of the three images, for every parameter and for the
 //!   camera twist, with the cut-offs switched off
@@ -72,8 +101,10 @@
 //!   `1e-5` per channel where the depth order is unambiguous.
 //! * `loss::tests::the_gradient_of_*`: finite differences of the loss
 //!   (agreement to `1e-4`).
-//! * `tests/refine.rs`: a run is bit-identical for any number of threads
-//!   and across a checkpoint. A GPU cannot promise the first (sums over
+//! * `tests/refine.rs` and `tests/robustness.rs`: a run is bit-identical
+//!   for any number of threads, and a run stopped anywhere (the passes
+//!   before the first step included) and resumed from its checkpoint gives
+//!   the model, the scores and the result of the uninterrupted one. A GPU cannot promise the first (sums over
 //!   pixels are atomically ordered there); compare final held-out PSNR
 //!   within 0.1 dB instead.
 

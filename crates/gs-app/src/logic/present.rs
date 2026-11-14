@@ -21,6 +21,44 @@ const RIG_COLOR: [f32; 3] = [0.36, 0.72, 1.0];
 const HANDHELD_COLOR: [f32; 3] = [1.0, 0.5, 0.3];
 const GRID_COLOR: [f32; 3] = [0.3, 0.36, 0.46];
 
+/// Most cameras of a session that get a thumbnail and a gizmo. The
+/// pipeline's ring has at most a few dozen.
+pub const MAX_CAMERAS: usize = 64;
+/// Most points of a scan path drawn (a capture sends at most 1024).
+pub const MAX_PATH_POINTS: usize = 4096;
+/// Longest name of a session shown, in characters (the server cuts the
+/// names of a capture to 120).
+pub const MAX_NAME_CHARS: usize = 200;
+/// Largest coordinate of a proposed camera position, meters.
+const MAX_START_COORDINATE: f32 = 1.0e5;
+
+/// Bounds what a `State` message makes the interface build. The live
+/// pipeline and the server never exceed these limits; a recording somebody
+/// made up may announce a hundred thousand cameras or a name of a
+/// megabyte, and every camera is a thumbnail, every point a line.
+pub fn bound_state(state: &mut SessionState) {
+    fn clip(text: &mut String) {
+        if let Some((at, _)) = text.char_indices().nth(MAX_NAME_CHARS) {
+            text.truncate(at);
+        }
+    }
+    state.cameras.truncate(MAX_CAMERAS);
+    if let Some(scan) = &mut state.scan {
+        scan.path.truncate(MAX_PATH_POINTS);
+    }
+    clip(&mut state.scene);
+    if let Some(capture) = &mut state.capture {
+        clip(&mut capture.name);
+        clip(&mut capture.device);
+        clip(&mut capture.app);
+    }
+    // JSON has no NaN, but 1e39 reads as an infinite f32.
+    let usable = |p: &[f32; 3]| p.iter().all(|c| c.is_finite() && c.abs() <= MAX_START_COORDINATE);
+    if !usable(&state.viewer_start.eye) || !usable(&state.viewer_start.target) {
+        state.viewer_start = Default::default();
+    }
+}
+
 /// Navigation a scene starts with: orbit around the stage, walk through
 /// the house.
 pub fn default_nav(scene: SceneKind) -> NavMode {
@@ -242,6 +280,34 @@ pub fn robust_bounds(splats: &[Splat]) -> Option<Aabb> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_made_up_state_is_cut_down_to_size() {
+        use gs_core::protocol::{CaptureInfo, ScanInfo};
+        let mut state = SessionState {
+            cameras: (0..50_000).map(|id| CameraInfo { id, ..CameraInfo::default() }).collect(),
+            scan: Some(ScanInfo { path: vec![[0.0; 3]; 100_000], duration: 1.0 }),
+            scene: "é".repeat(5000),
+            capture: Some(CaptureInfo { name: "n".repeat(100_000), device: "\u{202e}d".repeat(1000), app: "a".repeat(300), ..CaptureInfo::default() }),
+            ..SessionState::default()
+        };
+        state.viewer_start.eye = [f32::INFINITY, 0.0, 0.0];
+        super::bound_state(&mut state);
+        assert_eq!((state.cameras.len(), state.scan.as_ref().unwrap().path.len()), (super::MAX_CAMERAS, super::MAX_PATH_POINTS));
+        let capture = state.capture.as_ref().unwrap();
+        for text in [&state.scene, &capture.name, &capture.device, &capture.app] {
+            assert_eq!(text.chars().count(), super::MAX_NAME_CHARS);
+        }
+        assert_eq!(state.viewer_start, Default::default());
+        assert!(super::camera_ids(&state).len() <= super::MAX_CAMERAS);
+
+        // What the pipeline sends goes through untouched.
+        let mut usual = SessionState { cameras: vec![CameraInfo::default(); 8], scene: "stage".into(), ..SessionState::default() };
+        usual.viewer_start.eye = [3.0, 1.6, -4.0];
+        let before = usual.clone();
+        super::bound_state(&mut usual);
+        assert_eq!(usual, before);
+    }
+
     use gs_core::pipeline::Pipeline;
     use gs_core::protocol::PipelineConfig;
     use gs_render::nav::perspective;

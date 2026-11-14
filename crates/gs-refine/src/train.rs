@@ -109,9 +109,15 @@ pub struct TrainConfig {
     /// balance of each photograph), anchored so that they average to the
     /// identity over the capture.
     pub exposure: bool,
+    /// Room captures: also fit the photographs where the depth sensor
+    /// measured nothing the fusion uses (no return, no confidence, beyond
+    /// its range). See [`crate::dataset::decode_view_measured`].
+    pub photo_beyond_sensor: bool,
     /// Correct the pose of every view: a registration of each photograph
     /// on the cloud before the first step and at every new level
-    /// ([`Trainer::align_pose`]).
+    /// ([`Trainer::align_pose`]). Off by default: in simulation it gained
+    /// 0.6 dB on a capture with jittered poses, cost 2 dB on a clean one and
+    /// nearly tripled the time.
     pub pose: bool,
     /// Descent steps of one registration.
     pub pose_align_steps: u32,
@@ -129,6 +135,7 @@ impl Default for TrainConfig {
             loss: LossWeights::default(),
             densify: DensifyParams::default(),
             exposure: true,
+            photo_beyond_sensor: true,
             pose: false,
             pose_align_steps: 6,
         }
@@ -347,8 +354,12 @@ impl<R: Rasterizer> Trainer<R> {
 
     fn position_rate(&self) -> f32 {
         let r = &self.config.rates;
+        // A rate of zero freezes the centers; so do a negative one and NaN.
+        if r.position.is_nan() || r.position <= 0.0 {
+            return 0.0;
+        }
         let progress = self.iteration as f32 / self.config.iterations.max(1) as f32;
-        r.position * (r.position_final / r.position).max(1e-6).powf(progress.clamp(0.0, 1.0))
+        r.position * (r.position_final / r.position).clamp(1e-6, 1e6).powf(progress.clamp(0.0, 1.0))
     }
 
     /// One optimisation step on one view.
@@ -708,6 +719,31 @@ mod tests {
         // Broken numbers are pruned whatever their statistics.
         t.model.data[0][POS + 1] = f32::NAN;
         assert_eq!(t.densify().1, 1);
+    }
+
+    #[test]
+    fn a_position_rate_of_zero_freezes_the_centers() {
+        // A rate of zero is how a parameter group is frozen (the baseline
+        // "colours and opacities only"): it must stay zero, not turn into
+        // 0 x infinity.
+        let rates = LearningRates { position: 0.0, ..LearningRates::default() };
+        let mut t = trainer(vec![disc(0.0, 0.8)], TrainConfig { iterations: 100, rates, ..TrainConfig::default() });
+        for iteration in [0, 1, 50, 100, 400] {
+            t.iteration = iteration;
+            assert_eq!(t.position_rate(), 0.0, "iteration {iteration}");
+        }
+        // The usual schedule: from the first rate to the final one, never
+        // outside the two, also past the end and with a final rate of zero.
+        let mut t = trainer(vec![disc(0.0, 0.8)], TrainConfig { iterations: 100, ..TrainConfig::default() });
+        let r = LearningRates::default();
+        t.iteration = 0;
+        assert_eq!(t.position_rate(), r.position);
+        t.iteration = 50;
+        assert!((t.position_rate() - (r.position * r.position_final).sqrt()).abs() < 1e-7);
+        t.iteration = 1000;
+        assert!((t.position_rate() - r.position_final).abs() < 1e-9);
+        t.config.rates.position_final = 0.0;
+        assert!(t.position_rate() >= 0.0 && t.position_rate().is_finite());
     }
 
     #[test]

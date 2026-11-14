@@ -465,10 +465,10 @@ mod tests {
         assert!(capture.is_done() && !capture.has_session());
         let file = capture_file(2);
         let mut capture = LocalCapture::new(file.len() as u64);
-        capture.push(&file[..600]);
-        assert!(!capture.has_session());
-        let step = capture.step(1);
-        assert!(capture.has_session() && step.starved && step.frames == 0 && !step.messages.is_empty());
+        capture.push(&file[..8]);
+        assert!(capture.step(1).starved && !capture.has_session());
+        capture.push(&file[8..]);
+        assert!(!capture.step(1).messages.is_empty() && capture.has_session() && !capture.is_done());
         // Nothing happens after the end.
         let (mut capture, _) = import(&capture_file(1), 64);
         capture.push(b"more");

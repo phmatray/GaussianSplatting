@@ -116,7 +116,17 @@ atteint sa capacité, le panneau le dit. Un fichier `.gscap` s'importe par
 le même panneau : le serveur le reçoit (`POST /api/captures`) ; sans
 serveur, le worker le reconstruit lui-même, image par image
 (`gs_worker::capture`), ce qui permet d'ouvrir une capture sur un simple
-hébergement statique.
+hébergement statique. Le worker lit d'abord l'en-tête du fichier : un
+fichier qui n'est pas une capture est refusé sans rien interrompre de ce
+qui est à l'écran. Les images d'un vrai téléphone pèsent quelques centaines
+de kilo-octets chacune, bien plus que le morceau lu d'un coup : le worker
+lit la suite tant qu'une image est incomplète (`LocalCapture::wants_bytes`).
+
+Ce qu'un enregistrement ou un flux fait construire à l'interface est borné
+(`logic::present::bound_state`) : 64 caméras, 4096 points de trajet, noms
+de 200 caractères, vignettes d'un mégapixel au plus. La corbeille d'un
+enregistrement demande confirmation : un premier clic l'arme pour quatre
+secondes, le second supprime.
 
 ## Rendu
 

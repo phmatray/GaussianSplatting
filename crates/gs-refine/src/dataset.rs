@@ -446,6 +446,17 @@ pub fn level_height(cam: &Camera, width: u32) -> u32 {
 /// `width`, the depth planes and, with a region, the class of every depth
 /// pixel. `cam` is the view's colour camera in viewer coordinates.
 pub fn decode_view(frame: &CaptureFrame, cam: &Camera, width: u32, region: Option<&RegionMask>) -> Result<ViewData, DatasetError> {
+    decode_view_measured(frame, cam, width, region, None)
+}
+
+/// [`decode_view`] that, without a region and with `measured = (near, far)`
+/// in meters, marks every depth pixel the fusion could not use (no value,
+/// no confidence, outside that range) as [`IGNORE`]: the photograph is then
+/// compared only where the sensor measured the surface it shows. What lies
+/// beyond the sensor's range (the next room through a door, the garden
+/// through a window) has no geometry in the cloud; asked to paint it, the
+/// optimiser stretches the nearest Gaussians into halos.
+pub fn decode_view_measured(frame: &CaptureFrame, cam: &Camera, width: u32, region: Option<&RegionMask>, measured: Option<(f32, f32)>) -> Result<ViewData, DatasetError> {
     let width = width.clamp(16, cam.width.max(16));
     let height = level_height(cam, width);
     let decoded = decode_jpeg(&frame.color, width, height).map_err(|e| DatasetError::Unusable(format!("frame {}: {e}", frame.index)))?;
@@ -517,6 +528,13 @@ pub fn decode_view(frame: &CaptureFrame, cam: &Camera, width: u32, region: Optio
             })
             .collect();
         class = softened;
+    } else if let Some((near, far)) = measured {
+        class = (0..n)
+            .map(|i| {
+                let z = depth_mm[i] as f32 * 1.0e-3;
+                if depth_weight[i] > 0 && z >= near && z <= far { SCENE } else { IGNORE }
+            })
+            .collect();
     }
     Ok(ViewData { width, height, rgb: image.rgb, depth_width: dw as u32, depth_height: dh as u32, depth_mm, depth_weight, class })
 }
@@ -529,11 +547,13 @@ pub struct ViewCache {
     entries: HashMap<(usize, u32), (Arc<ViewData>, u64)>,
     /// Decodes so far (cache misses).
     pub decodes: u64,
+    /// Passed to [`decode_view_measured`]; set before the first [`Self::get`].
+    pub measured: Option<(f32, f32)>,
 }
 
 impl ViewCache {
     pub fn new(budget_bytes: usize) -> Self {
-        Self { budget: budget_bytes, used: 0, clock: 0, entries: HashMap::new(), decodes: 0 }
+        Self { budget: budget_bytes, used: 0, clock: 0, entries: HashMap::new(), decodes: 0, measured: None }
     }
 
     /// Bytes of decoded views held right now.
@@ -549,7 +569,7 @@ impl ViewCache {
             *stamp = self.clock;
             return Ok(data.clone());
         }
-        let data = Arc::new(decode_view(&capture.frame(view.frame)?, &view.cam, width, region)?);
+        let data = Arc::new(decode_view_measured(&capture.frame(view.frame)?, &view.cam, width, region, self.measured)?);
         self.decodes += 1;
         let size = data.bytes();
         // Make room; the new entry itself always fits, however small the

@@ -15,6 +15,9 @@ use crate::logic::source::{Link, SourceKind};
 use crate::logic::qr;
 use crate::state::{use_ui, Take, TakePlace, Ui};
 
+/// How long the bin of a recording stays armed after the first click.
+const DELETE_CONFIRM: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// True when a recording can start: a live source is on screen.
 pub fn can_record(ui: Ui) -> bool {
     ui.replay.with(Option::is_none) && ui.file.with(Option::is_none) && ui.link.get() == Link::Connected && ui.scene.get().is_some()
@@ -73,6 +76,24 @@ fn TakeRow(take: Take) -> impl IntoView {
     };
     let label = |action: &str| format!("{action} «\u{a0}{}\u{a0}»", take.title);
     let (play_label, download_label, share_label, delete_label) = (label("Relire"), label("Télécharger"), label("Partager"), label("Supprimer"));
+    let confirm_label = label("Confirmer la suppression de");
+    // A recording cannot be brought back: the bin asks once more. The
+    // first click arms it for a few seconds, the second one deletes.
+    let armed = RwSignal::new(false);
+    let delete = move |_| {
+        if armed.get_untracked() {
+            with_core(|core| core.delete_take(id));
+        } else {
+            armed.set(true);
+            // The row may be gone by then: `try_set` on a disposed signal does nothing.
+            set_timeout(
+                move || {
+                    armed.try_set(false);
+                },
+                DELETE_CONFIRM,
+            );
+        }
+    };
     view! {
         <li class="take" class:playing=playing data-place=if server { "server" } else { "memory" } data-file=take.file.clone()>
             <div class="take-text">
@@ -101,11 +122,18 @@ fn TakeRow(take: Take) -> impl IntoView {
                     <button
                         type="button"
                         class="icon-btn take-delete"
-                        title="Supprimer"
-                        aria-label=delete_label.clone()
-                        on:click=move |_| with_core(|core| core.delete_take(id))
+                        class:confirm=move || armed.get()
+                        title=move || if armed.get() { "Cliquer encore pour supprimer définitivement" } else { "Supprimer" }
+                        aria-label={
+                            let (delete_label, confirm_label) = (delete_label.clone(), confirm_label.clone());
+                            move || if armed.get() { confirm_label.clone() } else { delete_label.clone() }
+                        }
+                        on:click=delete
                     >
                         <Icon name="trash" />
+                        <Show when=move || armed.get()>
+                            <span class="take-confirm">"Supprimer\u{a0}?"</span>
+                        </Show>
                     </button>
                 </Show>
             </div>

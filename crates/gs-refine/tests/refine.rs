@@ -349,8 +349,11 @@ fn cancelling_keeps_a_usable_result() {
         })
         .unwrap();
     assert!(!outcome.completed && outcome.iterations_done >= 5 && outcome.iterations_done < 100_000);
+    // The state at the stop was scored, and the result is the best state
+    // seen (after so few steps that may still be the start).
     let report = job.report();
-    assert!(!report.completed && report.refined.is_some());
+    assert!(!report.completed && report.evals.last().unwrap().iteration == outcome.iterations_done);
+    assert!(report.result_iteration == 0 || report.refined.is_some());
     assert!(job.splats().len() > 2000);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -827,7 +830,9 @@ fn the_command_line_tool_refines_describes_and_exports() {
         assert!(text.contains(expected), "« {expected} » is missing from:\n{text}");
     }
 
-    let out = dir.join("resultat.ply");
+    // Into a directory that does not exist yet.
+    let outputs = dir.join("sorties");
+    let out = outputs.join("resultat.ply");
     let run = tool(&[
         capture, "-o", out.to_str().unwrap(), "--preset", "rapide", "--iterations", "25", "--largeur", "96", "--threads", "2", "--evaluation", "5", "--splat", "--set", "evals=0",
     ]);
@@ -837,12 +842,12 @@ fn the_command_line_tool_refines_describes_and_exports() {
     assert!(!log.contains('\u{2014}'), "no em dash in messages");
     let splats = gs_core::io::read_ply(&std::fs::read(&out).unwrap()).unwrap();
     assert!(splats.len() > 2000);
-    assert_eq!(gs_core::io::read_splat(&std::fs::read(dir.join("resultat.splat")).unwrap()).unwrap().len(), splats.len());
-    let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("resultat.json")).unwrap()).unwrap();
+    assert_eq!(gs_core::io::read_splat(&std::fs::read(outputs.join("resultat.splat")).unwrap()).unwrap().len(), splats.len());
+    let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(outputs.join("resultat.json")).unwrap()).unwrap();
     assert_eq!(report["iterations_done"].as_u64(), Some(25));
     assert_eq!(report["completed"].as_bool(), Some(true));
     assert!(report["refined"]["psnr"].as_f64().unwrap() > report["start"]["psnr"].as_f64().unwrap());
-    assert!(!dir.join("resultat.reprise").exists(), "a finished run leaves no checkpoint");
+    assert!(!outputs.join("resultat.reprise").exists(), "a finished run leaves no checkpoint");
 
     let export = tool(&["export", capture, "--format", "colmap", "-o", dir.join("colmap").to_str().unwrap(), "--silencieux"]);
     assert!(export.status.success(), "{}", String::from_utf8_lossy(&export.stderr));

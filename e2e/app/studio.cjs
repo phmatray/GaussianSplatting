@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 const { check, REPO, OUT, DIST, PORT, newPage, pinBlend, serve, consoleErrors, state, waitState, open, shot, viewShot, content, setSlider, sleep, startServer, SERVER_BIN: BIN } = require('./lib.cjs');
 const { verify, ready } = require('./replay.cjs');
-const { synth } = require('./capture.cjs');
+const { synth, stretch } = require('./capture.cjs');
 const { waitFor } = require('./embed.cjs');
 
 const getJson = async (url, init) => {
@@ -201,8 +201,10 @@ async function run({ browser }) {
       check('studio: the server gives the pairing URI the code stands for', /^splatlive:\/\/pair\?host=.+&port=\d+&fp=[0-9a-f]{64}&token=[0-9a-f]{32}$/.test(pairing.body.uri), pairing.body.uri.replace(/token=.*/, 'token=...'));
 
       // ---- a phone plays a capture while the page watches
-      const room = synth('studio-room.gscap', { frames: 90, title: 'Salon', depth: 128, color: 320 });
-      const phone = fakePhone(room, pairing.body.uri, ['--realtime', '--speed', '2']);
+      // About half a minute of capture at the phone's own pace: long
+      // enough to be watched on any machine.
+      const room = stretch(synth('studio-room.gscap', { frames: 90, title: 'Salon', depth: 128, color: 320 }), 3);
+      const phone = fakePhone(room, pairing.body.uri, ['--realtime']);
       s = await waitState(page, (s) => s.capture && s.capture.stats && s.capture.stats.frames_received >= 8 && s.layers.static > 1000 && s.sceneName === 'capture', 120000);
       await page.locator('#section-capture').scrollIntoViewIfNeeded();
       const card = await page.locator('#capture-card').innerText();
@@ -269,7 +271,9 @@ async function run({ browser }) {
 
     // ---------------------------------------------------------------- delete
     const count = s.takes.length;
+    // Two clicks: the bin asks once more before it deletes a file.
     await page.locator(`#takes .take[data-file="${take.file}"] .take-delete`).click();
+    await page.locator(`#takes .take[data-file="${take.file}"] .take-delete.confirm`).click();
     s = await waitState(page, (s, n) => s.takes.length === n - 1, 30000, count);
     const after = await getJson(`${url}api/recordings`);
     check('studio: deleting removes the recording from the server', !after.body.recordings.some((r) => r.file === take.file) && (await fetch(`${url}recordings/${encodeURIComponent(take.file)}`)).status === 404);

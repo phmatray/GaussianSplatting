@@ -32,6 +32,27 @@ fn typing(event: &ev::KeyboardEvent) -> bool {
     }
 }
 
+/// Keeps the Tab key inside the share dialog while it is open: the
+/// interface behind it is not reachable by pointer either.
+fn trap_tab(event: &ev::KeyboardEvent) {
+    let Some(dialog) = dom::element_by_id::<web_sys::Element>("share-dialog") else { return };
+    let Ok(nodes) = dialog.query_selector_all("button:not([disabled]), a[href], input:not([disabled]), textarea") else { return };
+    let stops: Vec<web_sys::HtmlElement> = (0..nodes.length()).filter_map(|i| nodes.get(i)?.dyn_into().ok()).collect();
+    let (Some(first), Some(last)) = (stops.first(), stops.last()) else { return };
+    let active = web_sys::window().and_then(|w| w.document()).and_then(|d| d.active_element());
+    let inside = active.as_ref().is_some_and(|a| dialog.contains(Some(a)));
+    let on = |stop: &web_sys::HtmlElement| active.as_ref().is_some_and(|a| a.is_same_node(Some(stop)));
+    let wrap_to = if event.shift_key() {
+        (!inside || on(first)).then_some(last)
+    } else {
+        (!inside || on(last)).then_some(first)
+    };
+    if let Some(stop) = wrap_to {
+        event.prevent_default();
+        let _ = stop.focus();
+    }
+}
+
 fn dragged_files(event: &ev::DragEvent) -> bool {
     event.data_transfer().is_some_and(|data| data.types().iter().any(|t| t.as_string().as_deref() == Some("Files")))
 }
@@ -40,6 +61,16 @@ fn install_window_listeners(ui: Ui) {
     // H hides the interface, P pauses. Never while typing, never with a
     // modifier (browser shortcuts).
     let _ = window_event_listener(ev::keydown, move |event| {
+        // The share dialog is modal: while it is open the shortcuts of the
+        // interface behind it (record, pause, hide) are off.
+        if ui.share.with_untracked(Option::is_some) {
+            match event.key().as_str() {
+                "Escape" => ui.share.set(None),
+                "Tab" => trap_tab(&event),
+                _ => {}
+            }
+            return;
+        }
         if event.ctrl_key() || event.meta_key() || event.alt_key() || event.repeat() || typing(&event) {
             return;
         }
@@ -48,14 +79,7 @@ fn install_window_listeners(ui: Ui) {
             "h" if !ui.embed.get_untracked() => ui.ui_hidden.update(|hidden| *hidden = !*hidden),
             "p" => with_core(|core| core.toggle_pause()),
             "r" if !replay => with_core(|core| core.toggle_record()),
-            "escape" => {
-                // The dialog first, then the hidden interface.
-                if ui.share.with_untracked(Option::is_some) {
-                    ui.share.set(None);
-                } else {
-                    ui.ui_hidden.set(false);
-                }
-            }
+            "escape" => ui.ui_hidden.set(false),
             // The time line of a replay. None of these is a fly key.
             "k" if replay => with_core(|core| core.replay_toggle()),
             "j" if replay => with_core(|core| core.replay_seek_by(-SKIP_S)),

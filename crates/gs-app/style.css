@@ -1347,6 +1347,19 @@ input[type="range"].tl-scrub::-moz-range-track {
   background: var(--control);
 }
 
+/* The bin, armed by a first click: it asks before it deletes. */
+.icon-btn.take-delete.confirm {
+  width: auto;
+  padding: 0 12px;
+  gap: 6px;
+  border-radius: 18px;
+  border-color: rgba(248, 113, 113, 0.6);
+  background: rgba(248, 113, 113, 0.16);
+  color: #fecaca;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
 .take.playing {
   border-color: rgba(92, 200, 255, 0.55);
 }

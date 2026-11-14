@@ -53,6 +53,9 @@ const INFO_TIMEOUT_MS: i32 = 2500;
 const BLEND_KEY: &str = "splat-live.blend";
 /// Time given to `share.json`, which only an unpacked share archive has.
 const MANIFEST_TIMEOUT_MS: i32 = 1500;
+/// Largest thumbnail painted, pixels (the sensors deliver 320 x 240 at most,
+/// the phone's depth map is 256 x 192).
+const MAX_PREVIEW_PIXELS: usize = 1 << 20;
 /// The camera counts as untouched while it is this close to where the
 /// automatic framing of a capture left it, meters.
 const AUTO_VIEW_TOLERANCE: f32 = 1.0e-3;
@@ -515,13 +518,14 @@ impl Core {
     }
 
     fn on_state(&self, json: &str) {
-        let state: SessionState = match serde_json::from_str(json) {
+        let mut state: SessionState = match serde_json::from_str(json) {
             Ok(state) => state,
             Err(error) => {
                 self.report_error(format!("État de session illisible\u{a0}: {error}"));
                 return;
             }
         };
+        present::bound_state(&mut state);
         let scene = state.config.scene;
         // A capture reports the house scene: its name tells it apart.
         let previous = self.session.borrow().as_ref().map(|s| (s.config.scene, s.scene.clone()));
@@ -711,6 +715,12 @@ impl Core {
     fn on_preview(&self, msg: PreviewMsg) {
         let id = msg.camera_id;
         if !self.ui.camera_ids.with_untracked(|ids| ids.contains(&u32::from(id))) {
+            return;
+        }
+        // A thumbnail is a small picture: one of many megapixels (in a
+        // recording somebody made up) would cost every tile a canvas of
+        // that size.
+        if usize::from(msg.width) * usize::from(msg.height) > MAX_PREVIEW_PIXELS {
             return;
         }
         {

@@ -101,7 +101,9 @@ fn Transport() -> impl IntoView {
                 {move || if playing() { view! { <Icon name="pause" /> } } else { view! { <Icon name="play" /> } }}
             </button>
             <output class="tl-time" id="tl-time" for="tl-scrub">
-                {move || format!("{} / {}", replay::clock(time(), tenths()), replay::clock(duration(), false))}
+                // Both with the same precision: "0:02,9 / 0:02" would read
+                // as a head beyond the end.
+                {move || format!("{} / {}", replay::clock(time(), tenths()), replay::clock(duration(), tenths()))}
             </output>
             <input
                 type="range"
