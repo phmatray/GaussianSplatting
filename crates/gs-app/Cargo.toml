@@ -1,0 +1,38 @@
+[package]
+name = "gs-app"
+description = "Splat Live user interface: Leptos CSR application built with Trunk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+gs-core.workspace = true
+gs-render.workspace = true
+gs-worker = { path = "../gs-worker" }
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# The interface only exists in the browser. On other targets the binary is a
+# stub (so that `cargo build` at the workspace root works without a web
+# toolchain) and the pure logic in `src/logic` is unit-tested natively.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+leptos = { version = "0.8.23", features = ["csr"] }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+console_error_panic_hook.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+workspace = true
+features = [
+  "Window", "Document", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlInputElement", "HtmlAnchorElement",
+  "CssStyleDeclaration", "DomRect", "Location", "Navigator", "Performance", "UrlSearchParams", "Url", "console",
+  "Event", "EventTarget", "KeyboardEvent", "MouseEvent", "PointerEvent", "DragEvent", "DataTransfer",
+  "File", "FileList", "Blob", "BlobPropertyBag",
+  "CanvasRenderingContext2d", "ImageData",
+  "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "ErrorEvent",
+  "Worker", "WorkerOptions", "WorkerType",
+  "RequestInit", "Response", "Headers", "AbortController", "AbortSignal",
+]

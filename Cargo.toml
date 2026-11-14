@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "src-tauri"]
+# The desktop shell needs the system WebKitGTK libraries and is built on
+# demand (`cargo build -p splat-live`, see src-tauri/README.md); a plain
+# `cargo build` or `cargo test` at the root leaves it out.
+default-members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"

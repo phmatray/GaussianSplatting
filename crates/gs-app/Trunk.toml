@@ -1,0 +1,16 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Relative URLs only: the same dist is served by gs-server at "/", embedded in
+# the Tauri shell (tauri://localhost/) and may sit under any sub-path of a
+# static host.
+public_url = "./"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8100
+open = false
+
+[watch]
+watch = [".", "../gs-worker", "../gs-render", "../gs-core"]
+ignore = ["dist"]
