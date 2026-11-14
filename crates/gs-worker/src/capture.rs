@@ -62,6 +62,8 @@ pub struct LocalCapture {
     done: bool,
     truncated: bool,
     error: Option<String>,
+    /// The last [`LocalCapture::step`] ran out of complete records.
+    starved: bool,
 }
 
 impl LocalCapture {
@@ -77,18 +79,34 @@ impl LocalCapture {
             done: false,
             truncated: false,
             error: None,
+            starved: false,
         }
     }
 
-    /// Bytes the parser holds that it has not turned into frames yet. The
-    /// host reads more of the file only while this is small, so that never
-    /// much more than one frame record is buffered.
+    /// Bytes the parser holds that it has not turned into frames yet.
     pub fn buffered(&self) -> usize {
         self.parser.buffered()
     }
 
+    /// True when the host should read the next piece of the file: the
+    /// parser holds less than `low_water` bytes, or what it holds is the
+    /// beginning of a record whose end has not been read yet. A frame of a
+    /// real phone is a few hundred kilobytes, far more than a sensible
+    /// `low_water`, so the second condition is what keeps such a file
+    /// moving. What is buffered stays bounded all the same: the parser
+    /// refuses a record above 64 MiB before its bytes are asked for.
+    pub fn wants_bytes(&self, low_water: usize) -> bool {
+        !self.done && (self.starved || self.parser.buffered() < low_water)
+    }
+
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// True once the file header has been read and accepted: from here on
+    /// the file is a capture, whatever its frames turn out to be.
+    pub fn has_session(&self) -> bool {
+        self.session.is_some()
     }
 
     /// Hands over the next bytes of the file.
@@ -96,6 +114,8 @@ impl LocalCapture {
         if !self.done {
             self.bytes += chunk.len() as u64;
             self.parser.push(chunk);
+            // There may be a complete record now: the next step finds out.
+            self.starved = false;
         }
     }
 
@@ -114,6 +134,7 @@ impl LocalCapture {
                 Ok(Some(item)) => item,
                 Ok(None) => {
                     step.starved = true;
+                    self.starved = true;
                     break;
                 }
                 Err(error) => {
@@ -207,7 +228,11 @@ mod tests {
     /// A frame looking at a wall 2 m ahead from `x` meters to the right,
     /// with a flat colour image.
     fn frame(index: u32, x: f32) -> Vec<u8> {
-        let (w, h) = (64u16, 48u16);
+        sized_frame(index, x, 64, 48, true)
+    }
+
+    /// The same with a depth map of `w` x `h`, stored deflated or not.
+    fn sized_frame(index: u32, x: f32, w: u16, h: u16, compressed: bool) -> Vec<u8> {
         let mut world_from_cam = [0.0f32; 16];
         for i in [0, 5, 10, 15] {
             world_from_cam[i] = 1.0;
@@ -218,7 +243,7 @@ mod tests {
             index,
             timestamp: f64::from(index) * 0.1,
             world_from_cam,
-            intrinsics: [60.0, 60.0, 32.0, 24.0],
+            intrinsics: [f32::from(w) * 0.94, f32::from(w) * 0.94, f32::from(w) / 2.0, f32::from(h) / 2.0],
             tracking: Tracking::Normal,
             orientation: Orientation::LandscapeNative,
             color_width: w,
@@ -229,7 +254,7 @@ mod tests {
             depth_mm: vec![2000; usize::from(w) * usize::from(h)],
             confidence: Some(vec![2; usize::from(w) * usize::from(h)]),
             mask: None,
-            compressed: true,
+            compressed,
             reserved: 0,
         };
         encode_frame(&frame).unwrap()
@@ -336,6 +361,68 @@ mod tests {
         assert!(whole.2 > 0);
     }
 
+    /// Runs an import with the reading policy of the worker's glue: one
+    /// frame per step, and a piece of the file whenever
+    /// [`LocalCapture::wants_bytes`] says so. Panics if it stops advancing.
+    fn host_import(file: &[u8], piece: usize, low_water: usize) -> LocalCapture {
+        let mut capture = LocalCapture::new(file.len() as u64);
+        let mut offset = 0;
+        let mut turns = 0;
+        while !capture.is_done() {
+            turns += 1;
+            assert!(turns < 100_000, "the import stalls at byte {offset} of {}, {} frames in", file.len(), capture.progress().frames);
+            let step = capture.step(1);
+            if step.starved && offset >= file.len() {
+                capture.finish();
+            } else if capture.wants_bytes(low_water) && offset < file.len() {
+                let end = (offset + piece).min(file.len());
+                capture.push(&file[offset..end]);
+                offset = end;
+            }
+        }
+        capture
+    }
+
+    #[test]
+    fn frames_larger_than_the_read_buffer_are_read_to_their_end() {
+        // What a phone sends: a frame record of a few hundred kilobytes,
+        // several times the piece the host reads and its low-water mark.
+        let header = GscapHeader { mode: "room".into(), name: "Salon".into(), ..Default::default() };
+        let mut file = encode_file_header(&header, 0).unwrap();
+        let mut largest = 0;
+        for i in 0..6 {
+            let bytes = sized_frame(i, i as f32 * 0.05, 256, 192, false);
+            largest = largest.max(bytes.len());
+            file.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            file.extend_from_slice(&bytes);
+        }
+        let (piece, low_water) = (16 * 1024, 4 * 1024);
+        assert!(largest > 4 * (piece + low_water), "{largest} bytes per frame");
+        let capture = host_import(&file, piece, low_water);
+        let progress = capture.progress();
+        assert_eq!((progress.frames, progress.bytes, &progress.error, progress.truncated), (6, file.len() as u64, &None, false));
+        assert!(progress.used >= 5, "{} frames used", progress.used);
+        // Never much more than one record is buffered on the way.
+        let mut capture = LocalCapture::new(file.len() as u64);
+        let (mut offset, mut peak) = (0, 0);
+        while !capture.is_done() {
+            let step = capture.step(1);
+            if step.starved && offset >= file.len() {
+                capture.finish();
+            } else if capture.wants_bytes(low_water) && offset < file.len() {
+                let end = (offset + piece).min(file.len());
+                capture.push(&file[offset..end]);
+                offset = end;
+                peak = peak.max(capture.buffered());
+            }
+        }
+        assert!(peak <= largest + 4 + piece + low_water, "{peak} bytes buffered, frames of {largest}");
+        // The small files of the other tests behave the same under this policy.
+        assert_eq!(host_import(&capture_file(5), 1024, 64 * 1024).progress().frames, 5);
+        let file = capture_file(3);
+        assert!(host_import(&file[..file.len() - 100], 512, 64).progress().truncated);
+    }
+
     #[test]
     fn a_file_cut_short_keeps_its_complete_frames() {
         let file = capture_file(6);
@@ -370,6 +457,18 @@ mod tests {
             let (capture, _) = import(&file[..cut], 64);
             assert!(capture.progress().done);
         }
+        // A file that is not a capture never gets a session; a capture
+        // has one as soon as its header is read, before any frame.
+        let mut capture = LocalCapture::new(32);
+        capture.push(b"GSREC1\0\0 this is another format");
+        capture.step(1);
+        assert!(capture.is_done() && !capture.has_session());
+        let file = capture_file(2);
+        let mut capture = LocalCapture::new(file.len() as u64);
+        capture.push(&file[..600]);
+        assert!(!capture.has_session());
+        let step = capture.step(1);
+        assert!(capture.has_session() && step.starved && step.frames == 0 && !step.messages.is_empty());
         // Nothing happens after the end.
         let (mut capture, _) = import(&capture_file(1), 64);
         capture.push(b"more");

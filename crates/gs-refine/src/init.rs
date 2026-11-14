@@ -16,9 +16,14 @@ use crate::dataset::{Capture, DatasetError};
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct InitParams {
-    /// Cell size of the fusion in meters; `0` keeps the real-time default
-    /// of the capture's mode (2.4 cm for a room, 8 mm for an object).
+    /// Cell size of the fusion in meters, whatever the capture's mode; `0`
+    /// keeps the default of the mode (2.4 cm for a room unless
+    /// `room_voxel_size` says otherwise, 8 mm for an object, 1 cm for a
+    /// person).
     pub voxel_size: f32,
+    /// Cell size for room captures when `voxel_size` is `0`; `0` keeps the
+    /// real-time 2.4 cm.
+    pub room_voxel_size: f32,
     /// Upper bound on fused cells.
     pub max_voxels: usize,
     /// Multiplies the standard deviations of the fused splats: they are
@@ -32,7 +37,7 @@ pub struct InitParams {
 
 impl Default for InitParams {
     fn default() -> Self {
-        Self { voxel_size: 0.0, max_voxels: 3_000_000, splat_scale: 1.4, opacity: 0.7 }
+        Self { voxel_size: 0.0, room_voxel_size: 0.0, max_voxels: 3_000_000, splat_scale: 1.4, opacity: 0.7 }
     }
 }
 
@@ -55,6 +60,9 @@ pub struct Fused {
 /// The ingest parameters of an offline fusion.
 pub fn ingest_params(mode: CaptureMode, init: &InitParams) -> IngestParams {
     let mut params = IngestParams { max_voxels: init.max_voxels.max(1000), ..IngestParams::default() };
+    if init.voxel_size <= 0.0 && init.room_voxel_size > 0.0 && mode == CaptureMode::Room {
+        params.room.voxel_size = init.room_voxel_size;
+    }
     if init.voxel_size > 0.0 {
         match mode {
             CaptureMode::Room => params.room.voxel_size = init.voxel_size,

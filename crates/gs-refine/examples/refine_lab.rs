@@ -329,8 +329,8 @@ fn bench(capture: &Path, config: &RefineConfig, args: &Args) {
     let list = |name: &str, default: &str| -> Vec<u32> { args.text(name).unwrap_or(default).split(',').filter_map(|v| v.parse().ok()).collect() };
     let steps = args.number::<u32>("--bench-steps").unwrap_or(30);
     println!("\n### time per iteration, {}", capture.file_name().unwrap().to_string_lossy());
-    println!("| width | threads | Gaussians | pairs | wall ms | cpu ms | view | project | bin | sort | composite | loss | backward pixels | reduce | chain | update | load |");
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("| width | threads | Gaussians | pairs | wall ms | cpu ms | view | project | bin | sort | composite | loss | of which blurs | backward pixels | reduce | chain | update | load |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for width in list("--bench-widths", "320,480,640,960") {
         for threads in list("--bench-threads", "1,4") {
             let mut config = config.clone();
@@ -349,7 +349,7 @@ fn bench(capture: &Path, config: &RefineConfig, args: &Args) {
             let (after, t1, r1) = (job.report(), job.trainer.timing, job.trainer.raster.timing);
             let ms = |a: f64, b: f64| 1000.0 * (b - a) / steps as f64;
             println!(
-                "| {width} | {threads} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
+                "| {width} | {threads} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
                 job.trainer.model.len(),
                 job.trainer.raster.pairs(),
                 ms(before.wall_s, after.wall_s),
@@ -360,6 +360,7 @@ fn bench(capture: &Path, config: &RefineConfig, args: &Args) {
                 ms(r0.sort, r1.sort),
                 ms(r0.composite, r1.composite),
                 ms(t0.loss, t1.loss),
+                ms(t0.loss_blurs, t1.loss_blurs),
                 ms(r0.backward_pixels, r1.backward_pixels),
                 ms(r0.reduce, r1.reduce),
                 ms(r0.chain, r1.chain),
@@ -438,7 +439,10 @@ fn main() {
     println!("{}", row("fusion (viewer)", 0, 0.0, 0.0, fused_scene.len(), &fusion, fusion_holdout));
 
     let mut eval_at: Vec<u32> = args.text("--eval-at").map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect()).unwrap_or_default();
-    eval_at.push(config.train.iterations);
+    // The job has settled how many iterations an automatic preset runs.
+    let iterations = job.config.train.iterations;
+    eval_at.retain(|&at| at < iterations);
+    eval_at.push(iterations);
     eval_at.sort_unstable();
     eval_at.dedup();
     let mut last_pictures = Vec::new();

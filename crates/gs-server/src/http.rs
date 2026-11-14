@@ -185,8 +185,12 @@ pub(crate) fn router(core: Arc<Core>, listener: Listener, stop: watch::Receiver<
             )
             .layer(axum::middleware::from_fn(loopback_host_only));
     }
-    app.layer(axum::middleware::from_fn(move |request: Request, next: Next| access_log(listener, request, next)))
-        .with_state(AppState { core, listener, stop })
+    let logged = core.clone();
+    app.layer(axum::middleware::from_fn(move |request: Request, next: Next| {
+        let core = logged.clone();
+        async move { access_log(listener, core.pairing_token(), request, next).await }
+    }))
+    .with_state(AppState { core, listener, stop })
 }
 
 /// Refuses, on the loopback listener, a request addressed to another host
@@ -211,16 +215,35 @@ async fn loopback_host_only(request: Request, next: Next) -> Response {
     }
 }
 
+/// `target` without the pairing token, in whatever letter case: a client
+/// that mistakes the URL for the place of the token (it belongs in the
+/// `hello` or in `Authorization`) must not find it in a log file later.
+fn without_token(target: String, token: &str) -> String {
+    // ASCII lower-casing keeps every byte offset.
+    let lower = target.to_ascii_lowercase();
+    if token.is_empty() || !lower.contains(token) {
+        return target;
+    }
+    let mut out = String::with_capacity(target.len());
+    let mut rest = 0;
+    for (at, found) in lower.match_indices(token) {
+        out.push_str(&target[rest..at]);
+        out.push_str("<token>");
+        rest = at + found.len();
+    }
+    out.push_str(&target[rest..]);
+    out
+}
+
 /// One debug line per request: what was asked, by which origin, and what
 /// was answered. Costs nothing unless debug logging is on.
-async fn access_log(listener: Listener, request: Request, next: Next) -> Response {
+async fn access_log(listener: Listener, token: &str, request: Request, next: Next) -> Response {
     if !log::log_enabled!(log::Level::Debug) {
         return next.run(request).await;
     }
     let method = request.method().clone();
-    // The path only: a client that mistakes the query string for the place
-    // of the pairing token must not find it in a log file afterwards.
-    let target = request.uri().path().to_string();
+    let target = request.uri().path_and_query().map_or_else(|| request.uri().path().to_string(), |pq| pq.to_string());
+    let target = without_token(target, token);
     let origin = request.headers().get(header::ORIGIN).and_then(|o| o.to_str().ok()).unwrap_or("-").to_string();
     let response = next.run(request).await;
     log::debug!("{listener:?} {method} {target} (origin {origin}) -> {}", response.status().as_u16());
@@ -388,5 +411,18 @@ mod tests {
         ] {
             assert!(!is_loopback_host(host), "{host}");
         }
+    }
+
+    #[test]
+    fn the_token_stays_out_of_the_log() {
+        let token = "07008962c8cdfa72a02f8cd32dfd9281";
+        let clean = |target: &str| without_token(target.to_string(), token);
+        assert_eq!(clean("/api/captures"), "/api/captures");
+        assert_eq!(clean("/api/qr.svg?i=1"), "/api/qr.svg?i=1");
+        assert_eq!(clean(&format!("/api/captures?token={token}")), "/api/captures?token=<token>");
+        assert_eq!(clean(&format!("/ingest?t={}&é=1", token.to_uppercase())), "/ingest?t=<token>&é=1");
+        assert_eq!(clean(&format!("/{token}/{token}x")), "/<token>/<token>x");
+        assert_eq!(clean(&format!("/api/captures?token={}", &token[..31])), format!("/api/captures?token={}", &token[..31]));
+        assert_eq!(without_token("/api/info".to_string(), ""), "/api/info");
     }
 }

@@ -11,8 +11,8 @@ use super::{worker, Mode, Worker};
 
 /// The file is read in pieces of this size.
 const READ_BYTES: f64 = 1024.0 * 1024.0;
-/// More of the file is read only while the parser holds less than this:
-/// one piece of the file, plus the frame that straddles its end.
+/// More of the file is read while the parser holds less than this, or
+/// holds only the beginning of a record (`LocalCapture::wants_bytes`).
 const BUFFER_LOW: usize = 64 * 1024;
 /// Frames are fused for about this long before the event loop gets its
 /// turn (acknowledgements, a cancel, the page's other requests).
@@ -31,12 +31,50 @@ pub(super) struct Host {
 }
 
 impl Worker {
+    /// Opens a capture file. Its header is read first, and only a file
+    /// that really is a capture takes the place of what the worker was
+    /// doing: a wrong file must not cost the user the scan on screen.
     pub(super) fn open_capture(&self, blob: Blob) {
-        self.leave_mode();
-        self.mode.set(Mode::Capture);
-        let capture = LocalCapture::new(blob.size() as u64);
-        *self.capture.borrow_mut() = Some(Host { capture, blob, offset: 0.0, reading: false, reported_ms: f64::NEG_INFINITY });
-        self.pump_capture();
+        let serial = self.capture_opens.get().wrapping_add(1);
+        self.capture_opens.set(serial);
+        spawn_local(async move {
+            let this = worker();
+            let size = blob.size();
+            let mut capture = LocalCapture::new(size as u64);
+            let mut messages = Vec::new();
+            let mut offset = 0.0;
+            while !capture.is_done() && !capture.has_session() {
+                messages.extend(capture.step(1).messages);
+                if capture.is_done() || capture.has_session() {
+                    break;
+                }
+                if offset >= size {
+                    messages.extend(capture.finish());
+                    break;
+                }
+                match io::read_blob(&blob, offset, offset + READ_BYTES).await {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        offset += bytes.len() as f64;
+                        capture.push(&bytes);
+                    }
+                    // Unreadable: the file ends here.
+                    _ => offset = size,
+                }
+                // Another file was opened meanwhile: it is the one that counts.
+                if this.capture_opens.get() != serial {
+                    return;
+                }
+            }
+            if !capture.has_session() {
+                this.post_event(&WorkerEvent::Capture(capture.progress()));
+                return;
+            }
+            this.leave_mode();
+            this.mode.set(Mode::Capture);
+            *this.capture.borrow_mut() = Some(Host { capture, blob, offset, reading: false, reported_ms: f64::NEG_INFINITY });
+            this.send_capture(messages);
+            this.pump_capture();
+        });
     }
 
     /// Stops reading the file. The session built so far stays on screen.
@@ -120,7 +158,7 @@ impl Worker {
         let mut guard = self.capture.borrow_mut();
         let Some(host) = guard.as_mut() else { return };
         let done = host.capture.is_done();
-        let read = !done && !host.reading && host.capture.buffered() < BUFFER_LOW && host.offset < host.blob.size();
+        let read = !host.reading && host.capture.wants_bytes(BUFFER_LOW) && host.offset < host.blob.size();
         if read {
             host.reading = true;
             let (blob, from, epoch) = (host.blob.clone(), host.offset, self.epoch.get());

@@ -27,10 +27,22 @@ pub async fn fetch(scope: &DedicatedWorkerGlobalScope, url: &str, range: Option<
     JsFuture::from(scope.fetch_with_str_and_init(url, &init)).await?.dyn_into()
 }
 
-/// The whole body of a response.
-pub async fn body_bytes(response: &Response) -> Result<Vec<u8>, JsValue> {
-    let buffer = JsFuture::from(response.array_buffer()?).await?;
-    Ok(Uint8Array::new(&buffer).to_vec())
+/// The body of a response, at most `max_bytes` of it: a server that
+/// answers a `Range` request with more than was asked for (the rest of the
+/// file, or an endless stream) is cut off there.
+pub async fn body_bytes(response: &Response, max_bytes: u64) -> Result<Vec<u8>, JsValue> {
+    let Some(body) = BodyReader::new(response) else { return Ok(Vec::new()) };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await? {
+        let room = max_bytes.saturating_sub(bytes.len() as u64);
+        if chunk.len() as u64 >= room {
+            bytes.extend_from_slice(&chunk[..room as usize]);
+            body.cancel();
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Total size announced by a `Content-Range: bytes 0-4095/123456` header,
@@ -56,6 +68,11 @@ impl BodyReader {
     pub fn new(response: &Response) -> Option<Self> {
         let reader = response.body()?.get_reader().dyn_into().ok()?;
         Some(Self { reader })
+    }
+
+    /// Gives the rest of the body up: the download stops.
+    pub fn cancel(&self) {
+        let _ = self.reader.cancel();
     }
 
     /// The next chunk; `None` at the end of the body.

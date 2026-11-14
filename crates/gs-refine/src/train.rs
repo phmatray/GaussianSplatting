@@ -1,5 +1,6 @@
-//! The optimiser: Adam over the Gaussians, the per-image colour correction
-//! and (optionally) the per-image pose, with densification and pruning.
+//! The optimiser: Adam over the Gaussians with densification and pruning,
+//! a gain per image and channel fitted in closed form, and (optionally) a
+//! registration of every image's pose.
 //!
 //! [`Trainer`] holds every piece of state an optimisation has and advances
 //! it one view at a time ([`Trainer::step`]). It knows nothing about files,
@@ -33,7 +34,8 @@ pub struct LearningRates {
     pub opacity: f32,
     /// Colour, units of full scale.
     pub color: f32,
-    /// Per-image pose: radians and meters per step; decays like `position`.
+    /// Per-image pose: length of the first step of a registration, radians
+    /// and meters.
     pub pose_rotation: f32,
     pub pose_translation: f32,
 }
@@ -47,8 +49,8 @@ impl Default for LearningRates {
             rotation: 2.0e-3,
             opacity: 3.0e-2,
             color: 4.0e-3,
-            pose_rotation: 5.0e-4,
-            pose_translation: 1.0e-3,
+            pose_rotation: 1.0e-3,
+            pose_translation: 2.0e-3,
         }
     }
 }
@@ -76,34 +78,6 @@ pub struct DensifyParams {
 impl Default for DensifyParams {
     fn default() -> Self {
         Self { from: 0.05, until: 0.8, every: 200, grad_threshold: 2.0e-4, split_px: 1.5, prune_opacity: 0.02, max_sigma: 0.5 }
-    }
-}
-
-/// How far a Gaussian may leave the surface the depth sensor measured.
-///
-/// Every Gaussian remembers the plane of the fused surfel it descends from
-/// (its *anchor*). Photographs taken along one path see most surfaces from
-/// a narrow range of directions: without this, small Gaussians tilt and
-/// stack into flakes that look right from the path and ragged from
-/// anywhere else. The depth sensor knows where the surface is; the
-/// photographs decide what is painted on it.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SurfacePrior {
-    /// Largest distance of a center from its anchor plane, meters
-    /// (negative: no limit).
-    pub max_offset: f32,
-    /// Largest angle between the thin axis and the anchor normal, degrees
-    /// (negative: no limit).
-    pub max_tilt_deg: f32,
-    /// Largest standard deviation along the thin axis, meters (negative:
-    /// no limit).
-    pub max_thickness: f32,
-}
-
-impl Default for SurfacePrior {
-    fn default() -> Self {
-        Self { max_offset: 0.01, max_tilt_deg: 10.0, max_thickness: 0.004 }
     }
 }
 
@@ -135,9 +109,12 @@ pub struct TrainConfig {
     /// balance of each photograph), anchored so that they average to the
     /// identity over the capture.
     pub exposure: bool,
-    /// Optimise a small correction of every camera pose.
+    /// Correct the pose of every view: a registration of each photograph
+    /// on the cloud before the first step and at every new level
+    /// ([`Trainer::align_pose`]).
     pub pose: bool,
-    pub surface: SurfacePrior,
+    /// Descent steps of one registration.
+    pub pose_align_steps: u32,
 }
 
 impl Default for TrainConfig {
@@ -153,12 +130,17 @@ impl Default for TrainConfig {
             densify: DensifyParams::default(),
             exposure: true,
             pose: false,
-            surface: SurfacePrior::default(),
+            pose_align_steps: 6,
         }
     }
 }
 
 impl TrainConfig {
+    /// Whether `iteration` is the first of a new level.
+    pub fn level_starts(&self, iteration: u32, native_width: u32) -> bool {
+        iteration > 0 && self.level_width(iteration, native_width) != self.level_width(iteration - 1, native_width)
+    }
+
     /// Width of the pictures at `iteration`, a multiple of 8.
     pub fn level_width(&self, iteration: u32, native_width: u32) -> u32 {
         let progress = iteration as f32 / self.iterations.max(1) as f32;
@@ -175,53 +157,9 @@ impl TrainConfig {
 const SPLIT_OFFSET: f32 = 0.5;
 const SPLIT_SHRINK: f32 = 0.866;
 
-/// The anchor of a fresh Gaussian: its center and the direction of its
-/// thinnest axis.
-pub fn anchor_of(g: &Gaussian) -> [f32; 6] {
-    let q = Quat::from_xyzw(g[ROT], g[ROT + 1], g[ROT + 2], g[ROT + 3]);
-    let q = if q.length_squared() > 1e-12 && q.is_finite() { q.normalize() } else { Quat::IDENTITY };
-    let thin = (0..3).min_by(|&a, &b| g[SCALE + a].total_cmp(&g[SCALE + b])).expect("three axes");
-    let mut axis = Vec3::ZERO;
-    axis[thin] = 1.0;
-    let n = q * axis;
-    [g[POS], g[POS + 1], g[POS + 2], n.x, n.y, n.z]
-}
-
-/// Brings a Gaussian back within the limits of the surface prior.
-fn hold_to_surface(g: &mut Gaussian, anchor: &[f32; 6], thin: usize, prior: &SurfacePrior) {
-    let normal = Vec3::new(anchor[3], anchor[4], anchor[5]);
-    if prior.max_offset >= 0.0 {
-        let p = Vec3::new(g[POS], g[POS + 1], g[POS + 2]);
-        let height = (p - Vec3::new(anchor[0], anchor[1], anchor[2])).dot(normal);
-        let excess = height - height.clamp(-prior.max_offset, prior.max_offset);
-        if excess != 0.0 {
-            g[POS..POS + 3].copy_from_slice(&(p - normal * excess).to_array());
-        }
-    }
-    if prior.max_thickness >= 0.0 {
-        g[SCALE + thin] = g[SCALE + thin].min(prior.max_thickness.max(1e-6).ln());
-    }
-    if prior.max_tilt_deg >= 0.0 {
-        let q = Quat::from_xyzw(g[ROT], g[ROT + 1], g[ROT + 2], g[ROT + 3]);
-        if q.length_squared() > 1e-12 && q.is_finite() {
-            let q = q.normalize();
-            let mut axis = Vec3::ZERO;
-            axis[thin] = 1.0;
-            let mut n = q * axis;
-            // A normal and its opposite are the same plane.
-            if n.dot(normal) < 0.0 {
-                n = -n;
-            }
-            let angle = n.dot(normal).clamp(-1.0, 1.0).acos();
-            let limit = prior.max_tilt_deg.to_radians();
-            if angle > limit {
-                let around = n.cross(normal).normalize_or_zero();
-                let back = Quat::from_axis_angle(around, angle - limit) * q;
-                g[ROT..ROT + 4].copy_from_slice(&back.to_array());
-            }
-        }
-    }
-}
+/// Each step of a pose registration is this much shorter than the one
+/// before.
+const ALIGN_DECAY: f32 = 0.75;
 
 /// How far a view's colour correction moves toward its least-squares fit
 /// each time the view comes up.
@@ -290,14 +228,13 @@ pub struct DensifyStat {
     pub radius_px: f32,
 }
 
-/// Per-view state: colour correction, and pose with its moments.
+/// Per-view state: colour correction and pose.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewState {
     pub correction: ColorCorrection,
     /// World-to-camera transform, refined when the pose is optimised.
     pub rot: Mat3,
     pub trans: Vec3,
-    pub pose_moments: Moments<6>,
     /// How often the view was used.
     pub steps: u32,
 }
@@ -309,7 +246,6 @@ impl ViewState {
             correction: ColorCorrection::default(),
             rot: Mat3::from(cam_from_world.matrix3),
             trans: Vec3::from(cam_from_world.translation),
-            pose_moments: Moments::default(),
             steps: 0,
         }
     }
@@ -322,8 +258,10 @@ pub struct StepTiming {
     pub view: f64,
     pub forward: f64,
     pub loss: f64,
+    /// The part of `loss` spent in the blurs of the structural term.
+    pub loss_blurs: f64,
     pub backward: f64,
-    /// Adam, the surface prior, the view's own parameters.
+    /// Adam on the visible Gaussians.
     pub update: f64,
     pub densify: f64,
 }
@@ -346,8 +284,6 @@ pub struct Trainer<R: Rasterizer> {
     pub model: Gaussians,
     pub moments: Vec<Moments<PARAMS>>,
     pub stats: Vec<DensifyStat>,
-    /// Per Gaussian: a point and the unit normal of its anchor plane.
-    pub anchors: Vec<[f32; 6]>,
     pub views: Vec<ViewInfo>,
     pub view_state: Vec<ViewState>,
     /// Next iteration to run, from 0.
@@ -368,7 +304,6 @@ impl<R: Rasterizer> Trainer<R> {
     pub fn new(config: TrainConfig, model: Gaussians, views: Vec<ViewInfo>, region: Option<RegionMask>, raster: R) -> Self {
         let view_state = views.iter().map(ViewState::new).collect();
         Self {
-            anchors: model.data.iter().map(anchor_of).collect(),
             moments: vec![Moments::default(); model.len()],
             stats: vec![DensifyStat::default(); model.len()],
             config,
@@ -442,7 +377,8 @@ impl<R: Rasterizer> Trainer<R> {
         let correction = self.view_state[index].correction;
         let (value, _) = loss::evaluate(&self.rendered, &correction, &data.target(), &self.config.loss, &mut self.image_grads, &mut self.scratch);
         lap(&mut self.timing.loss);
-        self.raster.backward(&self.model, &view, &self.image_grads, self.config.pose, &mut self.grads);
+        self.timing.loss_blurs = self.scratch.blur_seconds;
+        self.raster.backward(&self.model, &view, &self.image_grads, false, &mut self.grads);
         lap(&mut self.timing.backward);
 
         // Gaussians: Adam on the visible ones.
@@ -456,7 +392,6 @@ impl<R: Rasterizer> Trainer<R> {
         rate[OPACITY] = rates.opacity;
         rate[COLOR..COLOR + 3].fill(rates.color);
         let max_logit = crate::model::logit(MAX_OPACITY);
-        let surface = self.config.surface;
         for (slot, &i) in self.grads.visible.iter().enumerate() {
             let i = i as usize;
             let direction = self.moments[i].advance(&self.grads.grads[i], t);
@@ -473,25 +408,9 @@ impl<R: Rasterizer> Trainer<R> {
             for c in &mut g[COLOR..COLOR + 3] {
                 *c = c.clamp(0.0, 1.0);
             }
-            let thin = (0..3).min_by(|&a, &b| g[SCALE + a].total_cmp(&g[SCALE + b])).expect("three axes");
-            hold_to_surface(g, &self.anchors[i], thin, &surface);
         }
 
-        // The view's own parameters.
-        let progress_rate = position_rate / rates.position.max(1e-12);
-        let state = &mut self.view_state[index];
-        state.steps += 1;
-        if self.config.pose {
-            let state = &mut self.view_state[index];
-            let grad: [f32; 6] = std::array::from_fn(|k| self.grads.pose[k] as f32);
-            let direction = state.pose_moments.advance(&grad, state.steps);
-            let turn = Vec3::new(direction[0], direction[1], direction[2]) * (-rates.pose_rotation * progress_rate);
-            let shift = Vec3::new(direction[3], direction[4], direction[5]) * (-rates.pose_translation * progress_rate);
-            let turn = Mat3::from_quat(Quat::from_scaled_axis(turn));
-            state.rot = turn * state.rot;
-            state.trans = turn * state.trans + shift;
-        }
-
+        self.view_state[index].steps += 1;
         let mut report = StepReport { loss: value, view: index, width: data.width, visible: self.grads.visible.len(), ..StepReport::default() };
         lap(&mut self.timing.update);
         self.iteration += 1;
@@ -519,8 +438,8 @@ impl<R: Rasterizer> Trainer<R> {
         let mask: Vec<bool> = self.rendered.alpha.iter().enumerate().map(|(i, &a)| a > 0.9 && scene.as_ref().is_none_or(|m| m[i])).collect();
         let fit = loss::fit_gain(&self.rendered.color, target.rgb, Some(&mask));
         let correction = &mut self.view_state[index].correction;
-        for c in 0..3 {
-            correction.gain[c] += blend * (fit[c] - correction.gain[c]);
+        for (gain, fitted) in correction.gain.iter_mut().zip(fit) {
+            *gain += blend * (fitted - *gain);
         }
     }
 
@@ -534,6 +453,57 @@ impl<R: Rasterizer> Trainer<R> {
                 s.correction.gain[c] /= gain;
             }
         }
+    }
+
+    /// Registers view `index` on the cloud as it is: `steps` descent steps
+    /// on its pose alone, at the size of the pictures at `iteration`, with
+    /// steps that shrink from the pose rates of the configuration. Returns
+    /// the loss before and after; a pose that does not lower the loss is
+    /// not kept.
+    ///
+    /// A view comes up a handful of times in a run, which is too rarely to
+    /// find its pose one optimiser step at a time. Registering each
+    /// photograph on the cloud that all of them built (frame to model) is
+    /// the classic remedy, and the cloud does not move meanwhile.
+    pub fn align_pose(&mut self, index: usize, iteration: u32, capture: &Capture, cache: &mut ViewCache, steps: u32) -> Result<(f64, f64), DatasetError> {
+        let width = self.config.level_width(iteration, self.views[index].cam.width);
+        let data = cache.get(capture, &self.views[index], width, self.region.as_ref())?;
+        let rates = self.config.rates;
+        let mut best = (f64::INFINITY, self.view_state[index].rot, self.view_state[index].trans);
+        let mut first = f64::INFINITY;
+        for k in 0..=steps {
+            let view = self.render_view(index, data.width, data.height, [0.5; 3]);
+            self.raster.forward(&self.model, &view, &mut self.rendered);
+            if self.config.exposure {
+                self.fit_exposure(index, &data, 1.0);
+            }
+            let correction = self.view_state[index].correction;
+            let (value, _) = loss::evaluate(&self.rendered, &correction, &data.target(), &self.config.loss, &mut self.image_grads, &mut self.scratch);
+            if k == 0 {
+                first = value.total;
+            }
+            if value.total < best.0 {
+                best = (value.total, self.view_state[index].rot, self.view_state[index].trans);
+            }
+            if k == steps {
+                break;
+            }
+            self.raster.backward(&self.model, &view, &self.image_grads, true, &mut self.grads);
+            // Normalised steepest descent, turn and shift apart: the two
+            // gradients have different units and very different sizes.
+            let g = self.grads.pose;
+            let (turn, shift) = (Vec3::new(g[0] as f32, g[1] as f32, g[2] as f32), Vec3::new(g[3] as f32, g[4] as f32, g[5] as f32));
+            let shrink = ALIGN_DECAY.powi(k as i32);
+            let turn = -turn.normalize_or_zero() * (rates.pose_rotation * shrink);
+            let shift = -shift.normalize_or_zero() * (rates.pose_translation * shrink);
+            let state = &mut self.view_state[index];
+            let turn = Mat3::from_quat(Quat::from_scaled_axis(turn));
+            state.rot = turn * state.rot;
+            state.trans = turn * state.trans + shift;
+        }
+        let state = &mut self.view_state[index];
+        (state.rot, state.trans) = (best.1, best.2);
+        Ok((first, best.0))
     }
 
     /// Before the first step, for every view: fits its exposure against
@@ -599,7 +569,7 @@ impl<R: Rasterizer> Trainer<R> {
         let room = self.config.max_gaussians.saturating_sub(n - removed);
         candidates.truncate(room);
 
-        let mut added: Vec<(Gaussian, [f32; 6])> = Vec::with_capacity(candidates.len());
+        let mut added: Vec<Gaussian> = Vec::with_capacity(candidates.len());
         for &(_, i) in &candidates {
             let i = i as usize;
             let g = self.model.data[i];
@@ -622,7 +592,7 @@ impl<R: Rasterizer> Trainer<R> {
                 };
                 self.model.data[i] = child(1.0);
                 self.moments[i] = Moments::default();
-                added.push((child(-1.0), self.anchors[i]));
+                added.push(child(-1.0));
             } else {
                 // A copy half a standard deviation to the side, in a random
                 // direction within the surfel: the gradients do the rest.
@@ -637,7 +607,7 @@ impl<R: Rasterizer> Trainer<R> {
                 let mut copy = g;
                 let p = Vec3::new(g[POS], g[POS + 1], g[POS + 2]) + q * side * 0.5;
                 copy[POS..POS + 3].copy_from_slice(&p.to_array());
-                added.push((copy, self.anchors[i]));
+                added.push(copy);
             }
         }
 
@@ -645,13 +615,10 @@ impl<R: Rasterizer> Trainer<R> {
         self.model.data.retain(|_| (keep[index], index += 1).0);
         index = 0;
         self.moments.retain(|_| (keep[index], index += 1).0);
-        index = 0;
-        self.anchors.retain(|_| (keep[index], index += 1).0);
         let count = added.len();
-        for (g, anchor) in added {
+        for g in added {
             self.model.data.push(g);
             self.moments.push(Moments::default());
-            self.anchors.push(anchor);
         }
         // A new round of statistics.
         self.stats.clear();
@@ -709,10 +676,9 @@ mod tests {
         t.stats[3] = DensifyStat { grad_sum: 0.5 * threshold, views: 1.0, radius_px: 6.0 };
         t.moments[0].m[0] = 1.0;
         assert_eq!(t.densify(), (2, 1));
-        assert_eq!((t.model.len(), t.moments.len(), t.stats.len(), t.anchors.len()), (5, 5, 5, 5));
+        assert_eq!((t.model.len(), t.moments.len(), t.stats.len()), (5, 5, 5));
         // The split: two halves along the long axis (x), half a standard
-        // deviation either side, shorter along it, with fresh moments and
-        // the anchor of the parent.
+        // deviation either side, shorter along it, with fresh moments.
         let halves: Vec<&Gaussian> = t.model.data.iter().filter(|g| g[POS].abs() < 0.5).collect();
         assert_eq!(halves.len(), 2);
         let mut xs = [halves[0][POS], halves[1][POS]];
@@ -723,7 +689,6 @@ mod tests {
             assert_eq!((half[POS + 1], half[POS + 2]), (0.0, 0.0));
         }
         assert_eq!(t.moments[0], Moments::default());
-        assert!(t.anchors.iter().filter(|a| a[0] == 0.0 && a[5] == 1.0).count() == 2, "{:?}", t.anchors);
         // The clone: a second disc within its own footprint, in the plane.
         let copies: Vec<&Gaussian> = t.model.data.iter().filter(|g| (g[POS] - 1.0).abs() < 0.5).collect();
         assert_eq!(copies.len(), 2);
@@ -743,48 +708,6 @@ mod tests {
         // Broken numbers are pruned whatever their statistics.
         t.model.data[0][POS + 1] = f32::NAN;
         assert_eq!(t.densify().1, 1);
-    }
-
-    #[test]
-    fn the_surface_prior_holds_offset_tilt_and_thickness() {
-        let prior = SurfacePrior { max_offset: 0.01, max_tilt_deg: 10.0, max_thickness: 0.004 };
-        let anchor = anchor_of(&disc(0.0, 0.8));
-        assert_eq!(anchor, [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
-
-        // Within the limits nothing changes.
-        let mut g = disc(0.3, 0.8);
-        g[POS + 2] = 0.005;
-        let before = g;
-        hold_to_surface(&mut g, &anchor, 2, &prior);
-        assert_eq!(g, before);
-
-        // Too far off the plane: brought back to the limit, sliding kept.
-        g[POS + 2] = -0.05;
-        hold_to_surface(&mut g, &anchor, 2, &prior);
-        assert!((g[POS + 2] + 0.01).abs() < 1e-6 && g[POS] == 0.3);
-
-        // Too thick, and tilted by 40 degrees about X: back to 10.
-        g[SCALE + 2] = 0.02f32.ln();
-        g[ROT..ROT + 4].copy_from_slice(&Quat::from_rotation_x(40f32.to_radians()).to_array());
-        hold_to_surface(&mut g, &anchor, 2, &prior);
-        assert!((g[SCALE + 2].exp() - 0.004).abs() < 1e-6);
-        let normal = Quat::from_xyzw(g[ROT], g[ROT + 1], g[ROT + 2], g[ROT + 3]) * Vec3::Z;
-        assert!((normal.z.acos().to_degrees() - 10.0).abs() < 0.01, "{normal}");
-        // A flipped surfel is the same plane.
-        g[ROT..ROT + 4].copy_from_slice(&Quat::from_rotation_x(175f32.to_radians()).to_array());
-        let before = g;
-        hold_to_surface(&mut g, &anchor, 2, &prior);
-        assert_eq!(g[ROT..ROT + 4], before[ROT..ROT + 4]);
-
-        // Switched off, anything goes.
-        let free = SurfacePrior { max_offset: -1.0, max_tilt_deg: -1.0, max_thickness: -1.0 };
-        let mut wild = disc(0.0, 0.8);
-        wild[POS + 2] = 3.0;
-        wild[SCALE + 2] = 0.0;
-        wild[ROT..ROT + 4].copy_from_slice(&Quat::from_rotation_x(1.0).to_array());
-        let before = wild;
-        hold_to_surface(&mut wild, &anchor, 2, &free);
-        assert_eq!(wild, before);
     }
 
     #[test]

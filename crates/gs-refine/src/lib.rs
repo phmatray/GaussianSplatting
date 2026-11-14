@@ -27,8 +27,8 @@
 //!    colour correction, a depth term against the LiDAR, a coverage term
 //!    outside the region of interest.
 //! 5. [`train`]: Adam, coarse-to-fine sizes, densification by splitting
-//!    surfels in their plane, pruning, a prior that keeps every Gaussian on
-//!    the sensed surface, optional pose refinement.
+//!    surfels along their longest axis, pruning, a gain per image fitted in
+//!    closed form, optional registration of the poses.
 //! 6. [`job`]: the whole thing as a job with progress, cancellation,
 //!    evaluation on held-out photographs, checkpoints and a JSON report.
 //! 7. [`export`]: the capture as a COLMAP or nerfstudio dataset for

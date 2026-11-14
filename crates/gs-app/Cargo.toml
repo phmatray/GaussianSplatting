@@ -38,5 +38,5 @@ features = [
   "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "ErrorEvent",
   "Worker", "WorkerOptions", "WorkerType",
   "RequestInit", "Response", "Headers", "AbortController", "AbortSignal", "Storage", "Clipboard",
-  "HtmlTextAreaElement", "HtmlSelectElement",
+  "HtmlTextAreaElement", "HtmlSelectElement", "ReadableStream", "ReadableStreamDefaultReader",
 ]

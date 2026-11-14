@@ -447,6 +447,54 @@ fn wandering_exposure_is_absorbed_per_view_and_the_scene_keeps_its_brightness() 
 }
 
 #[test]
+fn a_registration_brings_a_displaced_view_back_toward_its_pose() {
+    let dir = scratch("pose");
+    let written = write_capture(&dir.join("a.gscap"), "bedroom", 30, small_sim(), |_, _| {});
+    let mut config = tiny_config(10);
+    config.train.pose = true;
+    // Steps to the scale of the test: at 96 pixels across, a pixel is more
+    // than a centimeter of the room.
+    config.train.rates.pose_rotation = 6.0e-3;
+    config.train.rates.pose_translation = 1.0e-2;
+    let mut job = prepare(&written.path, config);
+    let mut cache = ViewCache::new(64 << 20);
+    let mut improved = 0;
+    for index in [3usize, 11, 19] {
+        let truth = job.trainer.view_state[index];
+        // The pose the phone reported is off by 3 cm and 1.5 degrees.
+        let twist = [0.015, -0.02, 0.01, 0.02, -0.015, 0.02];
+        let moved = job.trainer.render_view(index, 96, 72, [0.0; 3]).moved(twist);
+        (job.trainer.view_state[index].rot, job.trainer.view_state[index].trans) = (moved.rot, moved.trans);
+        let error = |state: &gs_refine::train::ViewState| {
+            let turn = Quat::from_mat3(&(state.rot * truth.rot.transpose())).to_axis_angle().1.abs();
+            (turn.min(std::f32::consts::TAU - turn), (state.trans - truth.trans).length())
+        };
+        let before = error(&job.trainer.view_state[index]);
+        let (loss_before, loss_after) = job.trainer.align_pose(index, 0, &job.capture, &mut cache, 14).unwrap();
+        let after = error(&job.trainer.view_state[index]);
+        assert!(loss_after <= loss_before, "view {index}: the loss went from {loss_before} to {loss_after}");
+        // Turn and shift trade against each other in a narrow view: judge
+        // them together, a radian against the two meters to the walls.
+        let (was, is) = (before.0 * 2.0 + before.1, after.0 * 2.0 + after.1);
+        improved += (is < 0.8 * was) as usize;
+        assert!(is < 1.05 * was, "view {index}: pose error {before:?} -> {after:?}");
+    }
+    assert!(improved >= 2, "only {improved} of 3 displaced views came closer to their pose");
+
+    // A view that is where it should be stays there (a step that does not
+    // lower the loss is not kept).
+    let untouched = job.trainer.view_state[23];
+    job.trainer.align_pose(23, 0, &job.capture, &mut cache, 6).unwrap();
+    let state = job.trainer.view_state[23];
+    assert!((state.trans - untouched.trans).length() < 0.012, "{} m", (state.trans - untouched.trans).length());
+
+    // And a whole run with registration on completes and reports.
+    let outcome = job.run(&CancelToken::default(), &mut |_| {}).unwrap();
+    assert!(outcome.completed && job.report().refined.is_some());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn depth_that_hangs_between_two_surfaces_is_not_trusted() {
     let dir = scratch("flying");
     let floor = |capture: &Capture| capture.header.floor.unwrap();

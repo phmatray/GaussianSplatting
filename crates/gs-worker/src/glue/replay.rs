@@ -279,7 +279,9 @@ impl Worker {
             let bytes = match from {
                 From::Blob(blob) => io::read_blob(&blob, range.start as f64, range.end as f64).await.map_err(|_| "read".to_string()),
                 From::Url(url, signal) => match io::fetch(&this.scope, &url, Some(&range.http_header()), signal.as_ref()).await {
-                    Ok(response) if response.status() == 206 => io::body_bytes(&response).await.map_err(|_| "network".to_string()),
+                    Ok(response) if response.status() == 206 => {
+                        io::body_bytes(&response, range.end.saturating_sub(range.start)).await.map_err(|_| "network".to_string())
+                    }
                     Ok(response) => Err(format!("http_{}", response.status())),
                     Err(_) => Err("network".to_string()),
                 },

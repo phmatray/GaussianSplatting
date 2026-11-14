@@ -78,6 +78,9 @@ struct Worker {
     record_reported_ms: Cell<f64>,
     replay: RefCell<Option<replay::Host>>,
     capture: RefCell<Option<capture::Host>>,
+    /// Number of the latest capture file opened: one that is still being
+    /// checked when the next arrives gives way.
+    capture_opens: Cell<u32>,
 }
 
 thread_local! {
@@ -436,6 +439,7 @@ pub fn run() {
         record_reported_ms: Cell::new(f64::NEG_INFINITY),
         replay: RefCell::new(None),
         capture: RefCell::new(None),
+        capture_opens: Cell::new(0),
     }));
     WORKER.with(|w| *w.borrow_mut() = Some(instance));
 

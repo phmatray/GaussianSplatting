@@ -222,6 +222,7 @@ impl Reporter {
             Stage::Select => self.line(&format!("Lecture de la capture et choix des vues ({} images)", french_number(p.total as usize))),
             Stage::Fuse => self.line(&format!("Fusion du nuage de départ : image {} sur {}", french_number(p.done as usize), french_number(p.total as usize))),
             Stage::Exposure => self.line(&format!("Mesure de l'exposition des vues : {} sur {}", french_number(p.done as usize), french_number(p.total as usize))),
+            Stage::Poses => self.line(&format!("Recalage des poses : vue {} sur {}", french_number(p.done as usize), french_number(p.total as usize))),
             Stage::Evaluate => self.line("Évaluation sur les vues mises de côté"),
             Stage::Optimise => {
                 let percent = 100.0 * p.iteration as f64 / p.iterations.max(1) as f64;

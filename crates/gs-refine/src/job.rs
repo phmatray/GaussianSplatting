@@ -113,16 +113,20 @@ impl RefineConfig {
     /// each costs and gains.
     pub fn preset(preset: Preset) -> Self {
         let (passes, min_iterations, width, max_gaussians, max_views) = match preset {
-            Preset::Rapide => (6.0, 1_500, 480, 600_000, 300),
-            Preset::Standard => (15.0, 4_000, 640, 1_200_000, 600),
-            Preset::Fin => (30.0, 12_000, 960, 2_500_000, 1_200),
+            Preset::Rapide => (6.0, 1_500, 480, 1_000_000, 300),
+            Preset::Standard => (15.0, 4_000, 640, 2_000_000, 600),
+            Preset::Fin => (30.0, 12_000, 960, 4_000_000, 1_200),
         };
+        // A room fused at 1.6 cm instead of the real-time 2.4 cm gave +0.8 dB
+        // near the phone's path for a quarter more time per iteration; the
+        // quick preset keeps the coarser start.
+        let room_voxel_size = if preset == Preset::Rapide { 0.0 } else { 0.016 };
         Self {
             train: TrainConfig { iterations: 0, width, max_gaussians, ..TrainConfig::default() },
             passes,
             min_iterations,
             select: SelectParams { max_views, ..SelectParams::default() },
-            init: InitParams::default(),
+            init: InitParams { room_voxel_size, ..InitParams::default() },
             threads: 0,
             cache_mb: 1024,
             eval_views: 12,
@@ -181,6 +185,8 @@ pub enum Stage {
     Fuse,
     /// Measuring the exposure of every view against the starting cloud.
     Exposure,
+    /// Registering every view on the cloud (pose refinement).
+    Poses,
     Evaluate,
     Optimise,
 }
@@ -189,7 +195,8 @@ pub enum Stage {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Progress {
     pub stage: Stage,
-    /// Within `Select`, `Fuse` and `Exposure`: frames done and to do.
+    /// Within `Select`, `Fuse`, `Exposure` and `Poses`: frames done and
+    /// to do.
     pub done: u64,
     pub total: u64,
     pub iteration: u32,
@@ -542,6 +549,32 @@ impl RefineJob {
         })
     }
 
+    /// Registers every view on the cloud (when poses are optimised). The
+    /// time counts as optimisation time.
+    fn align_poses(&mut self, cancel: &CancelToken, progress: &mut dyn FnMut(&Progress)) -> Result<(), RefineError> {
+        if !self.config.train.pose || self.config.train.pose_align_steps == 0 {
+            return Ok(());
+        }
+        let (wall, cpu) = (Instant::now(), cpu_time::ProcessTime::now());
+        let mut report = self.progress_now(Stage::Poses, 0);
+        report.total = self.trainer.views.len() as u64;
+        let (iteration, steps) = (self.trainer.iteration, self.config.train.pose_align_steps);
+        for index in 0..self.trainer.views.len() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if index % 4 == 0 {
+                report.done = index as u64;
+                progress(&report);
+            }
+            let (trainer, capture, cache) = (&mut self.trainer, &self.capture, &mut self.cache);
+            self.pool.install(|| trainer.align_pose(index, iteration, capture, cache, steps))?;
+        }
+        self.wall_s += wall.elapsed().as_secs_f64();
+        self.cpu_s += cpu.elapsed().as_secs_f64();
+        Ok(())
+    }
+
     fn progress_now(&self, stage: Stage, width: u32) -> Progress {
         let (it, total) = (self.trainer.iteration, self.config.train.iterations);
         let eta = (it > 0 && it < total).then(|| self.wall_s / it as f64 * (total - it) as f64);
@@ -597,6 +630,7 @@ impl RefineJob {
                 }
                 self.trainer.settle_exposures();
             }
+            self.align_poses(cancel, progress)?;
             progress(&self.progress_now(Stage::Evaluate, 0));
             if self.fusion_score.is_none() {
                 self.fusion_score = self.evaluate_fusion()?;
@@ -609,6 +643,11 @@ impl RefineJob {
         let (mut last_report, mut last_checkpoint) = (Instant::now(), Instant::now());
         let mut width = 0;
         while self.trainer.iteration < total.min(stop_at) && !cancel.is_cancelled() {
+            let native = self.trainer.views.first().map_or(0, |v| v.cam.width);
+            if self.trainer.iteration > 0 && self.config.train.level_starts(self.trainer.iteration, native) {
+                // The cloud is sharper than at the start: register again.
+                self.align_poses(cancel, progress)?;
+            }
             let (wall, cpu) = (Instant::now(), cpu_time::ProcessTime::now());
             let (trainer, capture, cache) = (&mut self.trainer, &self.capture, &mut self.cache);
             let step = self.pool.install(|| trainer.step(capture, cache))?;
@@ -682,7 +721,7 @@ impl RefineJob {
 
 const CHECKPOINT_MAGIC: [u8; 8] = *b"GSRFCK1\0";
 /// Floats of one view's state in a checkpoint.
-const VIEW_FLOATS: usize = 6 + 9 + 3 + 12 + 1;
+const VIEW_FLOATS: usize = 6 + 9 + 3 + 1;
 
 /// The JSON part of a checkpoint.
 #[derive(Serialize, Deserialize)]
@@ -713,21 +752,17 @@ fn view_floats(state: &ViewState) -> [f32; VIEW_FLOATS] {
     put(&mut at, &state.correction.offset);
     put(&mut at, &state.rot.to_cols_array());
     put(&mut at, &state.trans.to_array());
-    put(&mut at, &state.pose_moments.m);
-    put(&mut at, &state.pose_moments.v);
     put(&mut at, &[state.steps as f32]);
     out
 }
 
 fn view_from_floats(f: &[f32]) -> ViewState {
     let take = |from: usize, n: usize| &f[from..from + n];
-    let array = |from: usize| -> [f32; 6] { take(from, 6).try_into().expect("six floats") };
     ViewState {
         correction: crate::loss::ColorCorrection { gain: take(0, 3).try_into().expect("three"), offset: take(3, 3).try_into().expect("three") },
         rot: glam::Mat3::from_cols_slice(take(6, 9)),
         trans: glam::Vec3::from_slice(take(15, 3)),
-        pose_moments: Moments { m: array(18), v: array(24) },
-        steps: f[30] as u32,
+        steps: f[18] as u32,
     }
 }
 
@@ -758,7 +793,7 @@ impl ByteReader<'_> {
 
 impl RefineJob {
     /// The whole state of the job as bytes: a JSON header, then the raw
-    /// arrays (model, moments, densification statistics, anchors, view states, fused
+    /// arrays (model, moments, densification statistics, view states, fused
     /// cloud), little-endian.
     pub fn checkpoint_bytes(&self) -> Vec<u8> {
         let t = &self.trainer;
@@ -791,9 +826,6 @@ impl RefineJob {
         }
         for s in &t.stats {
             floats_to_bytes(&[s.grad_sum, s.views, s.radius_px], &mut out);
-        }
-        for a in &t.anchors {
-            floats_to_bytes(a, &mut out);
         }
         for v in &t.view_state {
             floats_to_bytes(&view_floats(v), &mut out);
@@ -842,7 +874,6 @@ impl RefineJob {
             .map(|c| Moments { m: c[..PARAMS].try_into().expect("a full row"), v: c[PARAMS..].try_into().expect("a full row") })
             .collect();
         let stats: Vec<DensifyStat> = reader.floats(n * 3)?.chunks_exact(3).map(|c| DensifyStat { grad_sum: c[0], views: c[1], radius_px: c[2] }).collect();
-        let anchors: Vec<[f32; 6]> = reader.floats(n * 6)?.chunks_exact(6).map(|c| c.try_into().expect("six floats")).collect();
         let view_state: Vec<ViewState> = reader.floats(header.views * VIEW_FLOATS)?.chunks_exact(VIEW_FLOATS).map(view_from_floats).collect();
         let fused_bytes = reader.take(header.fused_splats.checked_mul(std::mem::size_of::<Splat>()).ok_or_else(|| bad("size overflow"))?)?;
         let fused: Vec<Splat> = fused_bytes.chunks_exact(std::mem::size_of::<Splat>()).map(bytemuck::pod_read_unaligned).collect();
@@ -861,7 +892,6 @@ impl RefineJob {
         let mut trainer = Trainer::new(config.train.clone(), model, views, region, CpuRasterizer::default());
         trainer.moments = moments;
         trainer.stats = stats;
-        trainer.anchors = anchors;
         trainer.view_state = view_state;
         trainer.iteration = header.iteration;
         Ok(Self {

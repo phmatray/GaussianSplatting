@@ -115,6 +115,8 @@ pub struct LossValue {
 /// Buffers reused from view to view.
 #[derive(Default)]
 pub struct LossScratch {
+    /// Seconds spent in the blurs so far (the part that runs in parallel).
+    pub blur_seconds: f64,
     x: Vec<f32>,
     y: Vec<f32>,
     weight: Vec<f32>,
@@ -233,136 +235,161 @@ pub fn evaluate(
     let has_depth = weights.depth > 0.0 && depth_pixels > 0 && target.depth_mm.len() == depth_pixels && target.depth_weight.len() == depth_pixels;
     assert!(target.class.is_empty() || target.class.len() == depth_pixels, "class plane of the wrong size");
 
-    // Corrected rendering and photograph, both blanked where ignored.
+    // Every pass below works row by row in parallel and returns its sums
+    // per row; adding those in row order keeps the result independent of
+    // the number of threads.
     let s = scratch;
+    let row3 = width * 3;
     for buffer in [&mut s.x, &mut s.y, &mut s.dx] {
         buffer.clear();
         buffer.resize(pixels * 3, 0.0);
     }
     s.weight.clear();
     s.weight.resize(pixels, 0.0);
-    let (mut scene, mut background) = (0usize, 0usize);
-    for y in 0..height {
-        for x in 0..width {
-            let i = y * width + x;
-            match class_at(target, x, y) {
-                SCENE => {
-                    scene += 1;
-                    s.weight[i] = 1.0;
-                    for c in 0..3 {
-                        // A camera clips at white: beyond it the photograph
-                        // says nothing about how bright the scene is.
-                        s.x[i * 3 + c] = (correction.gain[c] * rendered.color[i * 3 + c] + correction.offset[c]).min(1.0);
-                        s.y[i * 3 + c] = target.rgb[i * 3 + c] as f32 / 255.0;
+
+    // Pass 1: corrected rendering and photograph, both blanked where
+    // ignored; the sign of their difference; the absolute difference.
+    let counts: Vec<(usize, usize, f64)> = (s.x.par_chunks_mut(row3), s.y.par_chunks_mut(row3), s.dx.par_chunks_mut(row3), s.weight.par_chunks_mut(width))
+        .into_par_iter()
+        .enumerate()
+        .map(|(y, (xs, ys, signs, ws))| {
+            let (mut scene, mut background, mut l1) = (0usize, 0usize, 0.0f64);
+            for x in 0..width {
+                match class_at(target, x, y) {
+                    SCENE => {
+                        scene += 1;
+                        ws[x] = 1.0;
+                        let i = y * width + x;
+                        for c in 0..3 {
+                            // A camera clips at white: beyond it the photograph
+                            // says nothing about how bright the scene is.
+                            let shown = (correction.gain[c] * rendered.color[i * 3 + c] + correction.offset[c]).min(1.0);
+                            let photo = target.rgb[i * 3 + c] as f32 / 255.0;
+                            let diff = shown - photo;
+                            xs[x * 3 + c] = shown;
+                            ys[x * 3 + c] = photo;
+                            l1 += diff.abs() as f64;
+                            // Zero where the two agree exactly.
+                            signs[x * 3 + c] = if diff > 0.0 { 1.0 } else if diff < 0.0 { -1.0 } else { 0.0 };
+                        }
                     }
+                    BACKGROUND => background += 1,
+                    _ => {}
                 }
-                BACKGROUND => background += 1,
-                _ => {}
             }
-        }
-    }
+            (scene, background, l1)
+        })
+        .collect();
+    let (scene, background, l1) = counts.iter().fold((0, 0, 0.0), |a, r| (a.0 + r.0, a.1 + r.1, a.2 + r.2));
     value.pixels = scene;
     let norm = 1.0 / (3.0 * scene.max(1) as f32);
-
-    // L1.
     let l1_weight = (1.0 - weights.ssim) * norm;
-    let mut l1 = 0.0f64;
-    for ((d, &x), &y) in s.dx.iter_mut().zip(&s.x).zip(&s.y) {
-        let diff = x - y;
-        l1 += diff.abs() as f64;
-        // Zero where the two agree exactly (and where blanked).
-        *d = l1_weight * if diff > 0.0 { 1.0 } else if diff < 0.0 { -1.0 } else { 0.0 };
-    }
     value.l1 = l1 * l1_weight as f64;
 
     // Structural term.
-    if weights.ssim > 0.0 && scene > 0 {
+    let with_ssim = weights.ssim > 0.0 && scene > 0;
+    if with_ssim {
         let [xx, yy, xy] = &mut s.products;
         for buffer in [&mut *xx, &mut *yy, &mut *xy] {
             buffer.clear();
             buffer.resize(pixels * 3, 0.0);
         }
-        for i in 0..pixels * 3 {
-            xx[i] = s.x[i] * s.x[i];
-            yy[i] = s.y[i] * s.y[i];
-            xy[i] = s.x[i] * s.y[i];
-        }
+        (xx.par_chunks_mut(row3), yy.par_chunks_mut(row3), xy.par_chunks_mut(row3), s.x.par_chunks(row3), s.y.par_chunks(row3)).into_par_iter().for_each(|(xx, yy, xy, x, y)| {
+            for i in 0..row3 {
+                xx[i] = x[i] * x[i];
+                yy[i] = y[i] * y[i];
+                xy[i] = x[i] * y[i];
+            }
+        });
         for buffer in s.blurred.iter_mut().chain(s.partial.iter_mut()) {
             buffer.clear();
             buffer.resize(pixels * 3, 0.0);
         }
         let [mu_x, mu_y, bxx, byy, bxy] = &mut s.blurred;
+        let blur_clock = std::time::Instant::now();
         blur(&s.x, mu_x, &mut s.tmp, width, height);
         blur(&s.y, mu_y, &mut s.tmp, width, height);
         blur(xx, bxx, &mut s.tmp, width, height);
         blur(yy, byy, &mut s.tmp, width, height);
         blur(xy, bxy, &mut s.tmp, width, height);
+        s.blur_seconds += blur_clock.elapsed().as_secs_f64();
 
         // Per pixel and channel: SSIM, and the three partials that the
-        // adjoint blur spreads back (see the derivation in the tests).
+        // adjoint blur spreads back: with a = dS/dμx − 2μx·b − μy·c,
+        // b = dS/dσxx and c = dS/dσxy,
+        // dL/dx = G⋆(g·a) + 2x·G⋆(g·b) + y·G⋆(g·c).
         let g = -weights.ssim * norm;
         let [pa, pb, pc] = &mut s.partial;
-        let mut sum = 0.0f64;
-        for i in 0..pixels * 3 {
-            let w = s.weight[i / 3];
-            if w == 0.0 {
-                continue;
-            }
-            let (mx, my) = (mu_x[i], mu_y[i]);
-            let (sxx, syy, sxy) = (bxx[i] - mx * mx, byy[i] - my * my, bxy[i] - mx * my);
-            let (a1, a2) = (2.0 * mx * my + C1, 2.0 * sxy + C2);
-            let (b1, b2) = (mx * mx + my * my + C1, sxx + syy + C2);
-            let ssim = a1 * a2 / (b1 * b2);
-            sum += (1.0 - ssim) as f64;
-            let d_mu = 2.0 * (my * a2 - mx * ssim * b2) / (b1 * b2);
-            let d_sxx = -ssim / b2;
-            let d_sxy = 2.0 * a1 / (b1 * b2);
-            pa[i] = g * (d_mu - 2.0 * mx * d_sxx - my * d_sxy);
-            pb[i] = g * d_sxx;
-            pc[i] = g * d_sxy;
-        }
-        value.dssim = sum * (weights.ssim * norm) as f64;
-        // Reuse three of the forward buffers for the blurred partials.
+        let (mu_x_ref, mu_y_ref, bxx_ref, byy_ref, bxy_ref) = (&*mu_x, &*mu_y, &*bxx, &*byy, &*bxy);
+        let sums: Vec<f64> = (pa.par_chunks_mut(row3), pb.par_chunks_mut(row3), pc.par_chunks_mut(row3), s.weight.par_chunks(width))
+            .into_par_iter()
+            .enumerate()
+            .map(|(y, (pa, pb, pc, ws))| {
+                let mut sum = 0.0f64;
+                for k in 0..row3 {
+                    if ws[k / 3] == 0.0 {
+                        continue;
+                    }
+                    let i = y * row3 + k;
+                    let (mx, my) = (mu_x_ref[i], mu_y_ref[i]);
+                    let (sxx, syy, sxy) = (bxx_ref[i] - mx * mx, byy_ref[i] - my * my, bxy_ref[i] - mx * my);
+                    let (a1, a2) = (2.0 * mx * my + C1, 2.0 * sxy + C2);
+                    let (b1, b2) = (mx * mx + my * my + C1, sxx + syy + C2);
+                    let ssim = a1 * a2 / (b1 * b2);
+                    sum += (1.0 - ssim) as f64;
+                    let d_mu = 2.0 * (my * a2 - mx * ssim * b2) / (b1 * b2);
+                    let d_sxx = -ssim / b2;
+                    let d_sxy = 2.0 * a1 / (b1 * b2);
+                    pa[k] = g * (d_mu - 2.0 * mx * d_sxx - my * d_sxy);
+                    pb[k] = g * d_sxx;
+                    pc[k] = g * d_sxy;
+                }
+                sum
+            })
+            .collect();
+        value.dssim = sums.iter().sum::<f64>() * (weights.ssim * norm) as f64;
+        // Three of the forward buffers take the blurred partials.
+        let blur_clock = std::time::Instant::now();
         blur(pa, mu_x, &mut s.tmp, width, height);
         blur(pb, bxx, &mut s.tmp, width, height);
         blur(pc, bxy, &mut s.tmp, width, height);
-        for i in 0..pixels * 3 {
-            s.dx[i] += mu_x[i] + 2.0 * s.x[i] * bxx[i] + s.y[i] * bxy[i];
-        }
+        s.blur_seconds += blur_clock.elapsed().as_secs_f64();
     }
 
-    // Back through the blanking and the colour correction.
-    let mut correction_grad = [0.0f64; 6];
-    for i in 0..pixels {
-        if s.weight[i] == 0.0 {
-            continue;
-        }
-        for c in 0..3 {
-            if correction.gain[c] * rendered.color[i * 3 + c] + correction.offset[c] >= 1.0 {
-                continue;
-            }
-            let d = s.dx[i * 3 + c];
-            grads.color[i * 3 + c] = correction.gain[c] * d;
-            correction_grad[c] += (rendered.color[i * 3 + c] * d) as f64;
-            correction_grad[3 + c] += d as f64;
-        }
-    }
-
-    // Depth and coverage.
+    // Last pass: the gradient of the photometric terms back through the
+    // blanking, the clipping and the colour correction; depth and coverage.
     let depth_norm = weights.depth / scene.max(1) as f32;
     let alpha_norm = weights.alpha / background.max(1) as f32;
-    let (mut depth_sum, mut alpha_sum) = (0.0f64, 0.0f64);
-    if has_depth || (background > 0 && weights.alpha > 0.0) {
-        for y in 0..height {
+    let with_alpha = background > 0 && weights.alpha > 0.0;
+    let (blurred_a, blurred_b, blurred_c) = (&s.blurred[0], &s.blurred[2], &s.blurred[4]);
+    let (signs, xs, ys, ws) = (&s.dx, &s.x, &s.y, &s.weight);
+    let rows: Vec<([f64; 6], f64, f64)> = (grads.color.par_chunks_mut(row3), grads.depth.par_chunks_mut(width), grads.alpha.par_chunks_mut(width))
+        .into_par_iter()
+        .enumerate()
+        .map(|(y, (g_color, g_depth, g_alpha))| {
+            let (mut correction_grad, mut depth_sum, mut alpha_sum) = ([0.0f64; 6], 0.0f64, 0.0f64);
             for x in 0..width {
                 let i = y * width + x;
                 let coverage = rendered.alpha[i];
-                if s.weight[i] == 0.0 {
-                    if background > 0 && weights.alpha > 0.0 && class_at(target, x, y) == BACKGROUND {
+                if ws[i] == 0.0 {
+                    if with_alpha && class_at(target, x, y) == BACKGROUND {
                         alpha_sum += coverage as f64;
-                        grads.alpha[i] = alpha_norm;
+                        g_alpha[x] = alpha_norm;
                     }
                     continue;
+                }
+                for c in 0..3 {
+                    let k = i * 3 + c;
+                    if correction.gain[c] * rendered.color[k] + correction.offset[c] >= 1.0 {
+                        continue;
+                    }
+                    let mut d = l1_weight * signs[k];
+                    if with_ssim {
+                        d += blurred_a[k] + 2.0 * xs[k] * blurred_b[k] + ys[k] * blurred_c[k];
+                    }
+                    g_color[x * 3 + c] = correction.gain[c] * d;
+                    correction_grad[c] += (rendered.color[k] * d) as f64;
+                    correction_grad[3 + c] += d as f64;
                 }
                 if !has_depth || coverage < MIN_DEPTH_COVERAGE {
                     continue;
@@ -372,10 +399,20 @@ pub fn evaluate(
                 let relative = (mean - z) / z;
                 depth_sum += (trust * relative.abs()) as f64;
                 let g = depth_norm * trust / z * if relative > 0.0 { 1.0 } else if relative < 0.0 { -1.0 } else { 0.0 };
-                grads.depth[i] = g / coverage;
-                grads.alpha[i] = -g * mean / coverage;
+                g_depth[x] = g / coverage;
+                g_alpha[x] = -g * mean / coverage;
             }
+            (correction_grad, depth_sum, alpha_sum)
+        })
+        .collect();
+    let mut correction_grad = [0.0f64; 6];
+    let (mut depth_sum, mut alpha_sum) = (0.0f64, 0.0f64);
+    for (row_grad, row_depth, row_alpha) in &rows {
+        for k in 0..6 {
+            correction_grad[k] += row_grad[k];
         }
+        depth_sum += row_depth;
+        alpha_sum += row_alpha;
     }
     value.depth = depth_sum * depth_norm as f64;
     value.alpha = alpha_sum * alpha_norm as f64;

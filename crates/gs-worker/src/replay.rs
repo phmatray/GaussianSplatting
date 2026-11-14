@@ -60,6 +60,16 @@ pub struct ReplayStatus {
     pub dropped: u64,
 }
 
+/// Longest text of a file header repeated in a status, in characters. The
+/// header of a recording may hold a megabyte of JSON, and a status goes to
+/// the page many times per second.
+const MAX_STATUS_TEXT: usize = 200;
+
+/// `text` cut to [`MAX_STATUS_TEXT`] characters.
+fn clip(text: &str) -> String {
+    text.chars().take(MAX_STATUS_TEXT).collect()
+}
+
 /// What [`Replay::poll`] decided.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReplayPoll {
@@ -297,9 +307,9 @@ impl Replay {
             buffered: self.player.buffered_until(),
             ready: self.ready,
             seek: self.seek_done,
-            name: info.map(|i| i.name.clone()).unwrap_or_default(),
-            created: info.map(|i| i.created.clone()).unwrap_or_default(),
-            scene: info.map(|i| i.scene.clone()).unwrap_or_default(),
+            name: info.map(|i| clip(&i.name)).unwrap_or_default(),
+            created: info.map(|i| clip(&i.created)).unwrap_or_default(),
+            scene: info.map(|i| clip(&i.scene)).unwrap_or_default(),
             error,
             damaged: self.player.damage().is_some(),
             dropped: self.player.stats().dropped,
@@ -529,6 +539,32 @@ mod tests {
         assert!(pictures >= 1 && requests >= 2, "{pictures} pictures, {requests} requests");
         assert_eq!(status.seek, 7);
         assert!(status.ready && !status.buffering && (status.time - 1.2).abs() < 1e-9, "{status:?}");
+    }
+
+    #[test]
+    fn header_texts_are_clipped_in_the_status() {
+        // A header somebody made up: half a megabyte of name.
+        let mut recorder = Recorder::new(Vec::new(), RecorderOptions::named("essai"));
+        for message in Pipeline::new(PipelineConfig::light(SceneKind::Stage)).snapshot() {
+            recorder.push(0.0, &message.bytes).unwrap();
+        }
+        let file = recorder.finish().unwrap().0;
+        let json_len = u32::from_le_bytes(file[8..12].try_into().unwrap()) as usize;
+        let long = "é".repeat(250_000);
+        let json = String::from_utf8(file[12..12 + json_len].to_vec()).unwrap().replacen("essai", &long, 1);
+        let mut forged = file[..8].to_vec();
+        forged.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        forged.extend_from_slice(json.as_bytes());
+        // Without index and trailer (their offsets no longer fit): a
+        // recording cut short, which still plays.
+        let records_end = file.len() - 16;
+        forged.extend_from_slice(&file[12 + json_len..records_end]);
+        let mut replay = Replay::from_bytes(forged).unwrap();
+        assert!(replay.poll(0.0).batch.is_some());
+        let status = replay.status();
+        assert_eq!(status.name.chars().count(), MAX_STATUS_TEXT);
+        assert!(status.name.chars().all(|c| c == 'é') && status.to_owned().scene == "stage");
+        assert!(serde_json::to_string(&status).unwrap().len() < 2000);
     }
 
     #[test]

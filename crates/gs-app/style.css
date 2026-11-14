@@ -744,7 +744,9 @@ input[type="range"]::-moz-range-thumb {
 .stats {
   margin: 0;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* minmax(0, ...): a long value (a device name without a space) wraps
+     inside its cell instead of widening the column. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 6px;
 }
 
@@ -768,6 +770,7 @@ input[type="range"]::-moz-range-thumb {
   font-size: 15px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
 /* VR */

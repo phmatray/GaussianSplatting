@@ -96,6 +96,31 @@ pub enum DownloadError {
     Network(String),
 }
 
+/// Reads the body of `response` chunk by chunk, giving up as soon as more
+/// than `max_bytes` have arrived: a host that announces no length (or a
+/// false one) cannot make the page hold more than the limit.
+async fn bounded_body(response: &Response, max_bytes: u64) -> Result<Vec<u8>, DownloadError> {
+    let network = |error: JsValue| DownloadError::Network(describe(error));
+    let Some(stream) = response.body() else { return Ok(Vec::new()) };
+    let reader: web_sys::ReadableStreamDefaultReader = stream.get_reader().dyn_into().map_err(|_| DownloadError::Network("corps illisible".to_string()))?;
+    let mut bytes = Vec::new();
+    loop {
+        let result = JsFuture::from(reader.read()).await.map_err(network)?;
+        if js_sys::Reflect::get(&result, &"done".into()).map_err(network)?.is_truthy() {
+            return Ok(bytes);
+        }
+        let chunk: js_sys::Uint8Array = js_sys::Reflect::get(&result, &"value".into()).map_err(network)?.dyn_into().map_err(network)?;
+        if bytes.len() as u64 + u64::from(chunk.length()) > max_bytes {
+            // Stops the download; nothing is waiting for the answer.
+            let _ = reader.cancel();
+            return Err(DownloadError::TooLarge);
+        }
+        let start = bytes.len();
+        bytes.resize(start + chunk.length() as usize, 0);
+        chunk.copy_to(&mut bytes[start..]);
+    }
+}
+
 /// `GET url` as bytes, refusing answers above `max_bytes`.
 pub async fn download(url: &str, max_bytes: u64, timeout_ms: i32) -> Result<Vec<u8>, DownloadError> {
     let (response, done) = fetch("GET", url, Body::None, timeout_ms).await.map_err(DownloadError::Network)?;
@@ -107,14 +132,7 @@ pub async fn download(url: &str, max_bytes: u64, timeout_ms: i32) -> Result<Vec<
         if announced.is_some_and(|length| length > max_bytes) {
             return Err(DownloadError::TooLarge);
         }
-        let buffer = JsFuture::from(response.array_buffer().map_err(|e| DownloadError::Network(describe(e)))?)
-            .await
-            .map_err(|e| DownloadError::Network(describe(e)))?;
-        let bytes = js_sys::Uint8Array::new(&buffer);
-        if u64::from(bytes.length()) > max_bytes {
-            return Err(DownloadError::TooLarge);
-        }
-        Ok(bytes.to_vec())
+        bounded_body(&response, max_bytes).await
     }
     .await;
     done();
