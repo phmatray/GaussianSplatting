@@ -243,7 +243,41 @@ cargo run --release -p gs-refine -- export <capture>.gscap --format nerfstudio -
 cargo run --release -p gs-refine -- aide
 ```
 
-REMPLIR_ROUTES_AFFINAGE
+Le même affinage se lance depuis l'interface, section « Captures et affinage »
+du panneau : liste des captures conservées, choix du préréglage, choix
+« peindre au-delà du capteur » ou « laisser les trous », progression,
+annulation, puis « Voir le résultat », téléchargement et partage. Le serveur
+exécute un seul travail à la fois, sur un fil dédié dans son propre processus
+(`crates/gs-server/src/refine.rs`), avec tous les cœurs sauf un par défaut.
+
+| Route | Rôle |
+| --- | --- |
+| `POST /api/refine` | `{"action":"start","capture":"x.gscap","preset":"rapide"}`, `{"action":"export","capture":"x.gscap","format":"colmap"}` ou `{"action":"cancel"}`. Boucle locale uniquement. |
+| `GET /api/refine` | Travail en cours (étape, itération, temps restant estimé) et fin du dernier travail. |
+| `GET /api/refined` | Liste des résultats. |
+| `GET`, `HEAD`, `DELETE /refined/<nom>.ply` | Le fichier, avec `Range`. Suppression en boucle locale. |
+| `GET /api/share/refined/<nom>.zip` | Archive autonome : visionneuse et scène. |
+
+À savoir :
+
+- Les résultats sont dans `<données>/refined/<capture>-<préréglage>.ply`, avec
+  un `.json` voisin qui contient le rapport complet de gs-refine.
+- Un export COLMAP ou nerfstudio écrit un dossier dans `<données>/datasets/`.
+  L'interface affiche son chemin, elle ne le télécharge pas.
+- Un travail annulé ne garde rien et n'écrit pas de point de reprise. Pour un
+  travail très long ou à reprendre, utiliser la ligne de commande avec
+  `--reprise`.
+- Le score PSNR sur images retenues n'est jamais affiché : il ne mesure pas la
+  qualité en vue libre (voir plus bas).
+- Les durées annoncées dans l'interface (2 minutes en rapide, 10 minutes en
+  standard) ont été mesurées sur 220 photos simulées et 3 fils d'une machine
+  virtuelle. Une vraie capture en 1920x1440 de plusieurs minutes prendra plus
+  longtemps. Le préréglage `fin` n'a jamais été exécuté de bout en bout.
+- Options du serveur : `--refined-dir`, `--datasets-dir`, `--refine-threads N`,
+  et `--refine-iterations N` qui sert aux tests (un résultat obtenu ainsi est
+  flou, c'est attendu).
+- Sur le M5 Max, essayer `--refine-threads` égal au nombre de cœurs
+  performants et comparer le temps par itération lu dans `GET /api/refine`.
 
 ### Ce qui a été mesuré (captures simulées uniquement)
 
@@ -324,7 +358,7 @@ version CPU qui sert d'oracle.
 
 Les notes de conception de l'auteur, y compris tout ce qui a été essayé puis
 retiré avec la mesure correspondante, sont dans la documentation du crate
-(`crates/gs-refine/src/lib.rs` et `crates/gs-refine/README.md` s'il existe).
+(en tête de `crates/gs-refine/src/lib.rs`).
 
 ## 5. Risques au premier contact
 
