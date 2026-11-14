@@ -433,6 +433,66 @@ fn the_written_ply_is_the_cloud_the_optimiser_drew() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn photographs_can_be_fitted_only_where_the_sensor_measured() {
+    let dir = scratch("measured");
+    // No depth in the middle of every frame, and a far wall beyond 5 m in
+    // none of them: the bedroom is small, so shorten the range instead.
+    let written = write_capture(&dir.join("a.gscap"), "bedroom", 24, small_sim(), |_, frame| {
+        let (w, h) = (frame.depth_width as usize, frame.depth_height as usize);
+        for y in h / 3..h * 2 / 3 {
+            for x in w / 3..w * 2 / 3 {
+                frame.depth_mm[y * w + x] = 0;
+            }
+        }
+        if let Some(c) = frame.confidence.as_mut() {
+            c[..w].fill(0);
+        }
+    });
+    let capture = gs_refine::dataset::Capture::open(&written.path).unwrap();
+    let frame = capture.frame(5).unwrap();
+    let cam = gs_refine::dataset::color_camera(&capture.frames[5].header).unwrap();
+    let (near, far) = (0.25, 2.0);
+    let all = gs_refine::dataset::decode_view(&frame, &cam, 96, None).unwrap();
+    assert!(all.class.is_empty(), "a room view compares every pixel unless asked otherwise");
+    let measured = gs_refine::dataset::decode_view_measured(&frame, &cam, 96, None, Some((near, far))).unwrap();
+    let (w, h) = (measured.depth_width as usize, measured.depth_height as usize);
+    assert_eq!(measured.class.len(), w * h);
+    let (mut scene, mut ignored) = (0, 0);
+    for (i, class) in measured.class.iter().enumerate() {
+        let z = frame.depth_mm[i] as f32 * 1e-3;
+        let usable = z >= near && z <= far && frame.confidence.as_ref().unwrap()[i] >= 1;
+        assert_eq!(*class, if usable { gs_refine::loss::SCENE } else { gs_refine::loss::IGNORE }, "depth pixel {i}: {z} m");
+        scene += usable as usize;
+        ignored += !usable as usize;
+    }
+    assert!(scene > w * h / 4 && ignored > w * h / 5, "{scene} compared, {ignored} ignored");
+    assert_eq!(measured.class[h / 2 * w + w / 2], gs_refine::loss::IGNORE);
+    assert_eq!(measured.class[3], gs_refine::loss::IGNORE);
+
+    // A job with the option runs, improves, and adds no more Gaussians
+    // than one that paints the holes.
+    let run = |beyond: bool| {
+        let mut config = tiny_config(150);
+        config.train.photo_beyond_sensor = beyond;
+        let mut job = prepare(&written.path, config);
+        job.run(&CancelToken::default(), &mut |_| {}).unwrap();
+        let report = job.report();
+        assert!(report.refined.unwrap().psnr > report.start.unwrap().psnr, "beyond {beyond}");
+        // Coverage of the middle of a training view, where the sensor had nothing.
+        let view = job.trainer.views[5];
+        let cam = view.cam.resized(96, 72);
+        let mut out = Rendered::default();
+        CpuRasterizer::default().forward(job.result().0, &View::from_camera(&cam, [0.0; 3]), &mut out);
+        let inside: f32 = (30..42).flat_map(|y| (40..56).map(move |x| (x, y))).map(|(x, y)| out.alpha[y * 96 + x]).sum::<f32>() / (12.0 * 16.0);
+        (inside, job.result().0.len())
+    };
+    let (painted, measured_only) = (run(true), run(false));
+    eprintln!("coverage of the area without depth: {:.3} when painted, {:.3} when measured only; {} and {} Gaussians", painted.0, measured_only.0, painted.1, measured_only.1);
+    assert!(measured_only.0 <= painted.0 + 0.02, "measured only covers more of the hole: {:.3} against {:.3}", measured_only.0, painted.0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // ---------------------------------------------------------------------------
 // The command-line tool under Ctrl-C
 // ---------------------------------------------------------------------------

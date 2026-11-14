@@ -91,6 +91,7 @@ final class CaptureEngine: NSObject, ObservableObject, ARSessionDelegate {
     private var orientation: UInt8 = DisplayOrientation.portrait
     private var everWelcomed = false
     private var finishSent = false
+    private var finishProgressSeen = false
     private var pendingEncodes = 0
     /// Grows at every "Réinitialiser": a frame captured before it carries a
     /// pose in the old world origin and must not reach the server or the file.
@@ -295,14 +296,13 @@ final class CaptureEngine: NSObject, ObservableObject, ARSessionDelegate {
             if flow.isOpen {
                 link.send(text: ClientMessage.finish)
                 finishSent = true
-                if flow.inflight.isEmpty {
-                    closeServerCapture()
-                } else {
-                    // Wait for the last acks, but not for ever.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                        if self.phase == .finishing {
-                            self.closeServerCapture()
-                        }
+                finishProgressSeen = false
+                // The server answers a finish with the outstanding acks and
+                // a last progress report; on a large scan that takes about a
+                // second. Wait for both, but not for ever.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                    if self.phase == .finishing {
+                        self.closeServerCapture()
                     }
                 }
             } else {
@@ -439,12 +439,18 @@ final class CaptureEngine: NSObject, ObservableObject, ARSessionDelegate {
                     stats.usedByServer += 1
                 }
             }
-            if phase == .finishing, finishSent, flow.inflight.isEmpty {
+            if phase == .finishing, finishSent, finishProgressSeen, flow.inflight.isEmpty {
                 closeServerCapture()
             }
         case .progress(let frames, let splats):
             stats.serverFrames = frames
             stats.serverSplats = splats
+            if phase == .finishing, finishSent {
+                finishProgressSeen = true
+                if flow.inflight.isEmpty {
+                    closeServerCapture()
+                }
+            }
         case .error(_, let detail):
             if !detail.isEmpty {
                 notice = "Serveur : \(detail)"

@@ -210,7 +210,7 @@ def stream_capture(path: str, uri: str, mode=None, name=None, realtime: bool = F
                 ws.send_text(gscap.simple_message("finish"))
                 # The server answers a finish with a last progress report.
                 seen = stream.stats["progress_count"]
-                deadline = time.monotonic() + 2.0
+                deadline = time.monotonic() + 8.0
                 while stream.stats["progress_count"] == seen and time.monotonic() < deadline:
                     stream.pump(deadline - time.monotonic())
             ws.close(1000, "done")

@@ -42,6 +42,10 @@ Options de l'optimisation :
                                aux captures dont les poses sont bruitées :
                                sur une capture propre le résultat est moins bon)
   --sans-exposition            ne corrige pas l'exposition par image
+  --mesure-seule               n'ajuste les photos que là où le capteur de
+                               profondeur a mesuré la surface : ce qui est hors
+                               de sa portée (pièce voisine, vue par la fenêtre)
+                               reste un trou au lieu d'être peint en halos
   --graine <n>                 graine des tirages aléatoires
   --splat                      écrit aussi un fichier .splat
   --reprise <fichier>          reprend une optimisation interrompue
@@ -124,7 +128,7 @@ impl Args {
 /// Options that take a value, and those that do not.
 const WITH_VALUE: [&str; 15] =
     ["-o", "--sortie", "--preset", "--iterations", "--largeur", "--gaussiennes", "--vues", "--evaluation", "--threads", "--graine", "--reprise", "--set", "--format", "--voxel", "--cache"];
-const FLAGS: [&str; 4] = ["--poses", "--sans-exposition", "--splat", "--silencieux"];
+const FLAGS: [&str; 5] = ["--poses", "--sans-exposition", "--mesure-seule", "--splat", "--silencieux"];
 
 fn french_number(n: usize) -> String {
     let digits = n.to_string();
@@ -218,6 +222,7 @@ fn configuration(args: &Args) -> Result<RefineConfig, String> {
     }
     config.train.pose |= args.flag(&["--poses"]);
     config.train.exposure &= !args.flag(&["--sans-exposition"]);
+    config.train.photo_beyond_sensor &= !args.flag(&["--mesure-seule"]);
     patch(&mut config, &args.all("--set"))?;
     Ok(config)
 }

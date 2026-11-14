@@ -111,7 +111,15 @@ pub struct TrainConfig {
     pub exposure: bool,
     /// Room captures: also fit the photographs where the depth sensor
     /// measured nothing the fusion uses (no return, no confidence, beyond
-    /// its range). See [`crate::dataset::decode_view_measured`].
+    /// its range). The cloud has no geometry there; the optimiser paints
+    /// such places by stretching what is near them. Measured in simulation
+    /// (1 500 iterations at 480 px): with it, a 0.6 m area without depth is
+    /// filled with a fog of the right colours (+2.2 dB from viewpoints like
+    /// the phone's, twice the mass in front of the true surfaces from
+    /// elsewhere) and far fragments grow halos; without it, holes stay
+    /// holes, 0.2 dB is lost over the whole picture and nothing changes
+    /// where the cloud is closed. Which is better on a real capture is not
+    /// known. See [`crate::dataset::decode_view_measured`].
     pub photo_beyond_sensor: bool,
     /// Correct the pose of every view: a registration of each photograph
     /// on the cloud before the first step and at every new level
