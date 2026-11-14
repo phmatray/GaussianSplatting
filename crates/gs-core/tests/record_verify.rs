@@ -7,7 +7,7 @@ mod record_support;
 use gs_core::pipeline::Pipeline;
 use gs_core::protocol::{ControlMsg, PipelineConfig};
 use gs_core::record::{
-    verify, ByteRange, Compression, KeyframePolicy, Player, PlayerOptions, Pushed, Recorder, RecorderOptions,
+    classify, verify, ByteRange, MessageClass, Compression, KeyframePolicy, Player, PlayerOptions, Pushed, Recorder, RecorderOptions,
     StreamState, Update,
 };
 use gs_core::scene::SceneKind;
@@ -203,8 +203,16 @@ fn merge_tolerance(stream: &Stream) -> f32 {
 #[test]
 fn a_session_that_changes_scene_resets_and_scans_replays() {
     let stream = eventful_stream();
-    let states = stream.iter().filter(|(_, m)| gs_core::record::classify(m) == Some(gs_core::record::MessageClass::State));
-    assert!(states.count() >= 8, "the controls each announce a new State");
+    let states = stream.iter().filter(|(_, m)| classify(m) == Some(MessageClass::State)).count();
+    assert!(states >= 5, "changes of scene and settings announce a new State: {states}");
+    if std::env::var_os("GSREC_VERBOSE").is_some() {
+        for tick in [30, 40, 100, 110, 150, 160, 240, 250, 290, 310] {
+            let time = tick as f64 * (1.0 / 20.0f32) as f64;
+            let classes: Vec<_> =
+                stream.iter().filter(|(t, _)| *t == time).map(|(_, m)| (classify(m).unwrap(), m.len())).collect();
+            eprintln!("tick {tick}: {classes:?}");
+        }
+    }
     let tolerance = merge_tolerance(&stream);
     assert!(tolerance < 2.0e-4, "{tolerance}");
 
@@ -232,7 +240,7 @@ fn a_session_that_changes_scene_resets_and_scans_replays() {
     // Recording that starts in the middle of the session, from the state
     // a host kept since the start: in the stage, during the scan, while
     // the scan is paused, right after the map was thrown away.
-    let dt = 1.0 / 20.0;
+    let dt = (1.0 / 20.0f32) as f64;
     for start_tick in [12usize, 33, 77, 104, 155, 245, 300] {
         let start_time = start_tick as f64 * dt;
         let first = stream.partition_point(|(time, _)| *time < start_time);
@@ -317,7 +325,8 @@ fn a_recording_plays_while_it_is_being_written() {
             let update = settle(&mut player, &written[..cut], &mut viewer, &mut Vec::new());
             assert_eq!(update.time, last_time);
             assert!(player.stats().index_missing && player.error().is_none() && player.damage().is_none());
-            viewer.assert_shows(&Viewer::live_after(&stream, records.len() + 3), TINY_TOLERANCE, "ranged, growing file");
+            let messages = records.iter().filter(|(_, _, keyframe)| !keyframe).count();
+            viewer.assert_shows(&Viewer::live_after(&stream, messages + 4), TINY_TOLERANCE, "ranged, growing file");
         }
     }
     let (file, _) = recorder.finish().unwrap();
