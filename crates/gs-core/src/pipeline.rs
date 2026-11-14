@@ -31,14 +31,14 @@
 //! | [`SLOT_RELIABLE`] (0) | every reliable message |
 //! | [`SLOT_DYNAMIC`] (1) | layer 1 `Replace` |
 //! | [`SLOT_STATS`] (2) | Stats |
-//! | [`SLOT_PREVIEW_BASE`]` + id` (16…) | Preview of camera `id` (the handheld camera is 0) |
+//! | [`SLOT_PREVIEW_BASE`]` + id` (16…) | Preview of camera `id`: a ring camera of the stage, or a sensor of the scan head (the one looking ahead is 0) |
 //!
 //! A client that connects late needs [`Pipeline::snapshot`], taken between
 //! two ticks, followed by everything later ticks emit.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use glam::{Quat, Vec3};
+use glam::{Affine3A, Quat, Vec3};
 #[cfg(feature = "par")]
 use rayon::prelude::*;
 use web_time::Instant;
@@ -46,7 +46,7 @@ use web_time::Instant;
 use crate::capture::{render_rgbd, CaptureOptions};
 use crate::codec::{self, Body, LayerMode, Message};
 use crate::protocol::{
-    CameraInfo, ControlMsg, PipelineConfig, ScanConfig, ScanInfo, ScanState, ScanStats, SessionState, Stats,
+    CameraInfo, ControlMsg, PipelineConfig, ScanConfig, ScanHead, ScanInfo, ScanState, ScanStats, SessionState, Stats,
     ViewerStart, PROTOCOL_VERSION,
 };
 use crate::reconstruct::{foreground_mask, frame_to_splats, BackgroundPlate, VoxelFusion};
@@ -62,6 +62,8 @@ pub const SLOT_DYNAMIC: u8 = 1;
 /// Slot of the Stats message.
 pub const SLOT_STATS: u8 = 2;
 /// Slot of the preview of camera 0; camera `id` uses `SLOT_PREVIEW_BASE + id`.
+/// In the house the ids are those of the sensors of the scan head: 0 is the
+/// one looking ahead.
 pub const SLOT_PREVIEW_BASE: u8 = 16;
 
 /// Wire id of the static layer.
@@ -118,8 +120,7 @@ struct House {
     finishing: bool,
     /// Walking time along the path, seconds.
     time: f64,
-    /// Index of the next frame to capture; frame `i` is taken at walking
-    /// time `i / frames_per_second` (the last one at the end of the path).
+    /// Index of the next frame to capture (see [`scan_frame`]).
     next_frame: u64,
     /// [`VoxelFusion::refined`] when layer 0 was last broadcast as a whole.
     published_refined: u64,
@@ -244,45 +245,97 @@ fn merge_json(target: &mut serde_json::Value, patch: serde_json::Value) {
     }
 }
 
-/// Peak yaw of the handheld camera away from the walking direction, radians
-/// (126 degrees: the operator also looks back over each shoulder).
-pub const SCAN_PAN_AMPLITUDE: f32 = 2.2;
-/// Period of the yaw sweep in seconds of walking time.
-pub const SCAN_PAN_PERIOD: f32 = 7.3;
-/// Peak pitch of the handheld camera above and below the horizon, radians.
-pub const SCAN_TILT_AMPLITUDE: f32 = 1.0;
-/// Period of the pitch sweep in seconds of walking time.
-pub const SCAN_TILT_PERIOD: f32 = 2.3;
-/// Phase of the pitch sweep at the start of the walk, radians.
+/// Peak yaw sway of the scan head around the walking direction, radians
+/// (8 degrees).
+pub const SCAN_PAN_AMPLITUDE: f32 = 0.14;
+/// Period of the yaw sway in seconds of walking time.
+pub const SCAN_PAN_PERIOD: f32 = 11.0;
+/// Peak pitch sway of the scan head around the horizon, radians (3 degrees).
+pub const SCAN_TILT_AMPLITUDE: f32 = 0.052;
+/// Period of the pitch sway in seconds of walking time.
+pub const SCAN_TILT_PERIOD: f32 = 7.0;
+/// Phase of the pitch sway at the start of the walk, radians.
 const SCAN_TILT_PHASE: f32 = 0.6;
 
-/// Pose of the handheld scan camera at walking time `time` (seconds, clamped
-/// to the path).
-///
-/// The camera rides along `path` at eye height and sweeps like someone
-/// painting the rooms with a depth camera: a slow yaw sweep of
-/// [`SCAN_PAN_AMPLITUDE`] around the walking direction combined with a
-/// faster nod of [`SCAN_TILT_AMPLITUDE`] from floor to ceiling. The two
-/// periods are incommensurate, so over a few meters of walking the view
-/// directions cover nearly the whole sphere.
-///
-/// This replaces the gentler sweep of [`ScanPath::camera_at`], which looks
-/// mostly ahead: with it 2.3 % of the surfaces a visitor of the finished
-/// scan can see were never in view (ceilings behind beams, walls beside the
-/// doors one walks through), against 0.5 % with this pattern (measured with
-/// rays from random viewpoints in the house; held-out PSNR +1.2 dB).
+/// When, and by which sensor of the head, a frame of the home scan is taken.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScanFrame {
+    /// Id of the sensor that fires (an index into [`ScanHead::mounts`]).
+    pub sensor: u32,
+    /// Walking time in seconds.
+    pub time: f32,
+}
+
+/// Number of sensor frames of the whole walk along `path`.
+pub fn scan_frame_count(path: &ScanPath, scan: &ScanConfig) -> u64 {
+    last_scan_frame(path.duration() as f64, scan) + 1
+}
+
+/// Frame `index` of the home scan: the sensors fire one at a time in
+/// [`ScanHead::firing_order`], frame `i` at walking time
+/// `i / frames_per_second`, and the last one at the end of the path. The
+/// pipeline fuses exactly the frames `0..`[`scan_frame_count`], each seen
+/// from [`scan_sensor`] at its time.
+pub fn scan_frame(path: &ScanPath, scan: &ScanConfig, index: u64) -> ScanFrame {
+    ScanFrame {
+        sensor: firing_sensor(scan.head, index),
+        time: scan_frame_time(path.duration() as f64, scan, index) as f32,
+    }
+}
+
+/// Index of the last frame of a walk of `duration` seconds.
+fn last_scan_frame(duration: f64, scan: &ScanConfig) -> u64 {
+    (duration * scan.frames_per_second as f64).ceil() as u64
+}
+
+/// Walking time of frame `index` of a walk of `duration` seconds.
+fn scan_frame_time(duration: f64, scan: &ScanConfig, index: u64) -> f64 {
+    (index as f64 / scan.frames_per_second as f64).min(duration)
+}
+
+/// The sensor that takes frame `index`.
+fn firing_sensor(head: ScanHead, index: u64) -> u32 {
+    let order = head.firing_order();
+    order[(index % order.len() as u64) as usize] as u32
+}
+
+/// Pose of the main sensor of the scan head, the one looking ahead, at
+/// walking time `time`: [`scan_sensor`] 0.
 pub fn scan_camera(path: &ScanPath, time: f32, scan: &ScanConfig) -> Camera {
-    use std::f32::consts::TAU;
+    scan_sensor(path, time, scan, 0)
+}
+
+/// Pose of sensor `sensor` of the scan head at walking time `time` (seconds,
+/// clamped to the path; a time that is not a number counts as 0, a sensor
+/// the head does not have as sensor 0).
+///
+/// The head rides along `path` at eye height and faces the walking direction
+/// ([`ScanPath::heading_at`], which the walker never lets swing faster than
+/// about 32 degrees per second), with the slow, small sway of something
+/// carried by hand: [`SCAN_PAN_AMPLITUDE`] of yaw and [`SCAN_TILT_AMPLITUDE`]
+/// of pitch. Every sensor is rigidly mounted on it at its
+/// [`ScanHead::mounts`] angles, so all of them turn at the same, calm rate.
+///
+/// The coverage comes from the number of sensors, not from sweeping one
+/// camera about: [`ScanHead::Surround`] sees floor, ceiling and both side
+/// walls at every step of the walk. A single camera needs a look-around
+/// sweep of up to 170 degrees per second to scan as much, which no one
+/// filming a house would do.
+pub fn scan_sensor(path: &ScanPath, time: f32, scan: &ScanConfig, sensor: u32) -> Camera {
+    use std::f32::consts::{PI, TAU};
     let t = if time.is_finite() { time.clamp(0.0, path.duration()) } else { 0.0 };
     let heading = path.heading_at(t);
     let pan = SCAN_PAN_AMPLITUDE * (TAU * t / SCAN_PAN_PERIOD).sin();
     let tilt = SCAN_TILT_AMPLITUDE * (TAU * t / SCAN_TILT_PERIOD + SCAN_TILT_PHASE).sin();
-    let yaw = heading.x.atan2(heading.z) + pan;
-    // Forward for yaw 0 / tilt 0 is +Z; positive tilt looks up. The tilt
-    // stays well short of the vertical, so the horizon is always level.
-    let forward = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(-tilt) * Vec3::Z;
-    let eye = path.position_at(t);
-    Camera::look_at(eye, eye + forward, Vec3::Y, scan.fov_y_deg.to_radians(), scan.width, scan.height)
+    // A camera looks along its -Z axis; half a turn brings that to +Z, where
+    // `atan2(x, z)` measures the heading from. Positive tilt looks up.
+    let head = Quat::from_rotation_y(heading.x.atan2(heading.z) + pan + PI) * Quat::from_rotation_x(tilt);
+    let mounts = scan.head.mounts();
+    let mount = mounts.get(sensor as usize).unwrap_or(&mounts[0]);
+    let rotation =
+        head * Quat::from_rotation_y(mount.yaw_deg.to_radians()) * Quat::from_rotation_x(mount.pitch_deg.to_radians());
+    let world_from_cam = Affine3A::from_rotation_translation(rotation, path.position_at(t));
+    Camera::from_pose(world_from_cam, scan.fov_y_deg.to_radians(), scan.width, scan.height)
 }
 
 impl Stage {
@@ -378,12 +431,12 @@ impl House {
 
     /// Index of the last frame of the walk.
     fn last_frame(&self, config: &PipelineConfig) -> u64 {
-        (self.duration() * config.scan.frames_per_second as f64).ceil() as u64
+        last_scan_frame(self.duration(), &config.scan)
     }
 
     /// Walking time of frame `index`.
     fn frame_time(&self, index: u64, config: &PipelineConfig) -> f64 {
-        (index as f64 / config.scan.frames_per_second as f64).min(self.duration())
+        scan_frame_time(self.duration(), &config.scan, index)
     }
 
     /// Number of frames that are due at the current walking time.
@@ -395,17 +448,16 @@ impl House {
         }
     }
 
-    /// Walking time up to which the path has been fused.
+    /// Walking time up to which the path has been fused: the walker's own
+    /// time, or the time of the next frame while the fusion lags behind (a
+    /// tick that ran out of budget, `ScanFinish`). It never steps back, so
+    /// the head it places moves steadily even then.
     fn cursor(&self, config: &PipelineConfig) -> f64 {
-        if self.next_frame >= self.frames_due(config) {
-            self.time
-        } else {
-            self.frame_time(self.next_frame.saturating_sub(1), config)
-        }
+        self.time.min(self.frame_time(self.next_frame, config))
     }
 
-    fn camera(&self, time: f64, config: &PipelineConfig) -> Camera {
-        scan_camera(&self.path, time as f32, &config.scan)
+    fn sensor(&self, sensor: u32, time: f64, config: &PipelineConfig) -> Camera {
+        scan_sensor(&self.path, time as f32, &config.scan, sensor)
     }
 
     /// Splats were rewritten in place since layer 0 was last sent whole.
@@ -419,7 +471,13 @@ impl House {
             ScanState::Done => 1.0,
             _ => (cursor / self.duration().max(1e-9)).clamp(0.0, 1.0) as f32,
         };
-        ScanStats { state: self.state, progress, camera: CameraInfo::from_camera(0, &self.camera(cursor, config)) }
+        let info = |sensor: u32| CameraInfo::from_camera(sensor, &self.sensor(sensor, cursor, config));
+        ScanStats {
+            state: self.state,
+            progress,
+            camera: info(0),
+            extra_cameras: (1..config.scan.head.sensor_count()).map(info).collect(),
+        }
     }
 }
 
@@ -607,11 +665,11 @@ impl Pipeline {
     /// Scene time advances by `dt · time_scale` unless paused. Stage: all
     /// ring cameras capture the same instant, the foreground is
     /// reconstructed and layer 1 is replaced; one or more camera previews
-    /// follow in round-robin order. House: the handheld camera walks on, the
-    /// frames that became due are fused (as many as fit into
-    /// [`SCAN_TICK_BUDGET_MS`], at least one) and their new splats are
-    /// appended to layer 0. A Stats message is emitted on every tick, paused
-    /// or not, always last.
+    /// follow in round-robin order. House: the scan head walks on, the
+    /// sensor frames that became due are fused (as many as fit into
+    /// [`SCAN_TICK_BUDGET_MS`], at least one), their new splats are appended
+    /// to layer 0, and every sensor that fired sends a preview. A Stats
+    /// message is emitted on every tick, paused or not, always last.
     ///
     /// A `dt` that is negative or not a number counts as zero; any positive
     /// value is accepted (the dance loops, the scan stops at the end of the
@@ -683,11 +741,14 @@ impl Pipeline {
 
         let first_new = h.fusion.len();
         let due = h.frames_due(&config);
-        let mut last_frame = None;
+        // The latest frame of every sensor that fired during this tick.
+        let mut latest: [Option<RgbdFrame>; ScanHead::MAX_SENSORS] = Default::default();
+        let mut fired = false;
         while h.next_frame < due {
             let frame_start = Instant::now();
             let time = h.frame_time(h.next_frame, &config);
-            let cam = h.camera(time, &config);
+            let sensor = firing_sensor(config.scan.head, h.next_frame);
+            let cam = h.sensor(sensor, time, &config);
             let frame = render_rgbd(&h.snapshot, &cam, &capture_options(&config, h.next_frame as u32));
             let captured = ms_since(frame_start);
             work.capture_ms += captured;
@@ -697,7 +758,10 @@ impl Pipeline {
             work.reconstruct_ms += spent - captured;
             h.frame_ms = if h.frame_ms > 0.0 { 0.7 * h.frame_ms + 0.3 * spent } else { spent };
             h.next_frame += 1;
-            last_frame = Some(frame);
+            fired = true;
+            if let Some(slot) = latest.get_mut(sensor as usize) {
+                *slot = Some(frame);
+            }
             if ms_since(start) + h.frame_ms > SCAN_TICK_BUDGET_MS {
                 break;
             }
@@ -707,7 +771,7 @@ impl Pipeline {
         // it publishes the splats that were rewritten from better views
         // since they were appended, and announces `Done`.
         let walked = h.next_frame > h.last_frame(&config);
-        let finished = walked && last_frame.is_none();
+        let finished = walked && !fired;
         if finished {
             h.state = ScanState::Done;
             h.finishing = false;
@@ -724,8 +788,12 @@ impl Pipeline {
         } else if h.fusion.len() > first_new {
             out.push(self.encode_splats(LAYER_STATIC, LayerMode::Append, &h.fusion.splats()[first_new..]));
         }
-        if let (true, Some(frame)) = (config.preview.enabled, &last_frame) {
-            out.push(self.encode_preview(0, frame));
+        if config.preview.enabled {
+            for (sensor, frame) in latest.iter().enumerate() {
+                if let Some(frame) = frame {
+                    out.push(self.encode_preview(sensor as u8, frame));
+                }
+            }
         }
         work.encode_ms += ms_since(encode);
     }
@@ -751,9 +819,9 @@ impl Pipeline {
     ///
     /// Changing the scene, the rig, the sensor or the reconstruction
     /// parameters of the stage rebuilds the background plates and both
-    /// layers. In the house, changing the voxel size, the walking speed or
-    /// the frame rate restarts the scan; other changes apply to the frames
-    /// still to come. A [`ControlMsg::PatchConfig`] that does not describe a
+    /// layers. In the house, changing the voxel size, the walking speed, the
+    /// frame rate or the sensor head restarts the scan; other changes apply
+    /// to the frames still to come. A [`ControlMsg::PatchConfig`] that does not describe a
     /// configuration is ignored.
     pub fn handle_control(&mut self, msg: ControlMsg) -> Vec<Outgoing> {
         self.try_control(msg).unwrap_or_default()
@@ -886,7 +954,8 @@ impl Pipeline {
                 house.fusion.max_range = new.scan.max_range;
                 let restart = new.scan.voxel_size != old.scan.voxel_size
                     || new.scan.speed != old.scan.speed
-                    || new.scan.frames_per_second != old.scan.frames_per_second;
+                    || new.scan.frames_per_second != old.scan.frames_per_second
+                    || new.scan.head != old.scan.head;
                 if !restart {
                     return vec![self.encode_state()];
                 }
@@ -919,7 +988,7 @@ mod tests {
         }
     }
 
-    /// A small, fast house: about twenty coarse frames for the whole walk.
+    /// A small, fast house: about thirty coarse frames for the whole walk.
     fn small_house() -> PipelineConfig {
         let mut config = PipelineConfig::for_scene(SceneKind::House);
         config.scan.width = 64;
@@ -1230,19 +1299,27 @@ mod tests {
         assert_eq!(kinds(&out), [Kind::Stats]);
         assert_eq!(stats_of(&out).scan.unwrap().state, ScanState::Scanning);
         let mut layer = Vec::new();
+        let mut frames = 0;
         for _ in 0..4 {
             let out = pipeline.tick(0.5);
-            assert_eq!(kinds(&out), [Kind::Layer, Kind::Preview, Kind::Stats]);
-            assert!(out[0].reliable && !out[1].reliable);
-            assert_eq!(out[1].slot, SLOT_PREVIEW_BASE);
+            let stats = stats_of(&out);
+            // One or two frames became due, each from another sensor of the
+            // head, which fire in order.
+            let fired = (stats.pixels / (64 * 48)) as usize;
+            assert!(stats.pixels as usize == fired * 64 * 48 && (1..=2).contains(&fired), "{}", stats.pixels);
+            assert_eq!(kinds(&out)[0], Kind::Layer);
+            assert_eq!(kinds(&out)[1..], [vec![Kind::Preview; fired], vec![Kind::Stats]].concat());
+            assert!(out[0].reliable && out[1..].iter().all(|m| !m.reliable));
+            let order = ScanHead::Surround.firing_order();
+            let mut expected: Vec<u8> = (frames..frames + fired).map(|i| SLOT_PREVIEW_BASE + order[i % order.len()]).collect();
+            expected.sort_unstable();
+            assert_eq!(out[1..=fired].iter().map(|m| m.slot).collect::<Vec<_>>(), expected);
+            frames += fired;
             let chunk = layer_of(&out[0]);
             assert_eq!((chunk.layer_id, chunk.mode), (LAYER_STATIC, LayerMode::Append));
             layer.extend_from_slice(&chunk.splats);
-            let stats = stats_of(&out);
             assert_eq!(stats.splats_static as usize, layer.len());
             assert_eq!(stats.splats_dynamic, 0);
-            // One or two frames became due.
-            assert!(stats.pixels == 64 * 48 || stats.pixels == 2 * 64 * 48, "{}", stats.pixels);
         }
         assert_eq!(layer.len(), pipeline.static_splats().len());
         let progress = stats_of(&pipeline.snapshot()).scan.unwrap().progress;
@@ -1342,6 +1419,18 @@ mod tests {
         assert_eq!(kinds(&out), [Kind::State, Kind::Layer, Kind::Stats]);
         assert!(pipeline.static_splats().is_empty());
         assert_eq!(pipeline.scan_state(), Some(ScanState::Scanning));
+        // So does another sensor head; another image size does not.
+        pipeline.tick(1.0);
+        let out = pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"scan":{"width":48}}}"#).unwrap();
+        assert_eq!(kinds(&out), [Kind::State]);
+        assert!(!pipeline.static_splats().is_empty());
+        let out =
+            pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"scan":{"head":"single"}}}"#).unwrap();
+        assert_eq!(kinds(&out), [Kind::State, Kind::Layer, Kind::Stats]);
+        assert_eq!(state_of(&out[0]).config.scan.head, ScanHead::Single);
+        assert!(pipeline.static_splats().is_empty());
+        assert!(pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"scan":{"head":"fisheye"}}}"#).is_err());
+        assert_eq!(pipeline.config().scan.head, ScanHead::Single);
     }
 
     #[test]
@@ -1373,43 +1462,128 @@ mod tests {
     }
 
     #[test]
-    fn scan_camera_sweeps_floor_ceiling_and_looks_back() {
+    fn scan_head_faces_the_walk_and_its_sensors_look_all_around() {
         let path = ScanPath::house_default();
         let scan = ScanConfig::default();
-        let (mut up, mut down, mut back) = (0.0f32, 0.0f32, 1.0f32);
+        assert_eq!(scan.head, ScanHead::Surround);
+        let mounts = scan.head.mounts();
+        let sway = (SCAN_PAN_AMPLITUDE + SCAN_TILT_AMPLITUDE + 1e-3).cos();
         let steps = 2000;
         for i in 0..=steps {
             let t = path.duration() * i as f32 / steps as f32;
-            let cam = scan_camera(&path, t, &scan);
-            assert!((cam.position() - path.position_at(t)).length() < 1e-4, "the camera rides on the path");
-            assert!(Vec3::from(cam.world_from_cam.matrix3.x_axis).y.abs() < 1e-4, "level horizon at t = {t}");
-            assert_eq!((cam.width, cam.height), (scan.width, scan.height));
-            assert!((cam.fov_y().to_degrees() - scan.fov_y_deg).abs() < 1e-2);
-            let forward = cam.forward();
-            up = up.max(forward.y);
-            down = down.min(forward.y);
+            let main = scan_camera(&path, t, &scan);
+            assert_eq!(main, scan_sensor(&path, t, &scan, 0));
             let heading = path.heading_at(t);
-            back = back.min(forward.x * heading.x + forward.z * heading.z);
+            assert!(main.forward().dot(heading) > sway, "the head looks away from the walk at t = {t}");
+            assert!(Vec3::from(main.world_from_cam.matrix3.x_axis).y.abs() < 1e-4, "level horizon at t = {t}");
+            let (left, right, up, down) = (
+                scan_sensor(&path, t, &scan, 1).forward(),
+                scan_sensor(&path, t, &scan, 2).forward(),
+                scan_sensor(&path, t, &scan, 3).forward(),
+                scan_sensor(&path, t, &scan, 4).forward(),
+            );
+            // `heading x up` points to the walker's right.
+            let to_right = heading.cross(Vec3::Y);
+            assert!(left.dot(-to_right) > sway && right.dot(to_right) > sway, "side sensors at t = {t}");
+            assert!(up.y > 0.8 && down.y < -0.8 && up.dot(heading) > 0.3 && down.dot(heading) > 0.3, "t = {t}");
+            for (id, mount) in mounts.iter().enumerate() {
+                let cam = scan_sensor(&path, t, &scan, id as u32);
+                assert!((cam.position() - path.position_at(t)).length() < 1e-4, "sensor {id} rides on the path");
+                assert_eq!((cam.width, cam.height), (scan.width, scan.height));
+                assert!((cam.fov_y().to_degrees() - scan.fov_y_deg).abs() < 1e-2);
+                // Rigidly mounted: always at the same angle to the main sensor.
+                let angle = cam.forward().angle_between(main.forward()).to_degrees();
+                let expected = (mount.yaw_deg.to_radians().cos() * mount.pitch_deg.to_radians().cos()).acos().to_degrees();
+                assert!((angle - expected).abs() < 0.05, "sensor {id} at {angle} degrees instead of {expected}");
+            }
         }
-        // Up to the ceiling above, down to the floor at its feet, and back
-        // over the shoulder: what leaves no wall or ceiling unseen.
-        assert!(up > 0.8 && down < -0.8, "pitch range {down}..{up}");
-        assert!(back < -0.3, "never looks back ({back})");
-        // Any time is safe.
+        // Any time and any sensor index is safe.
         for t in [f32::NAN, f32::INFINITY, -5.0, 1.0e30] {
-            let cam = scan_camera(&path, t, &scan);
-            assert!(cam.position().is_finite() && cam.forward().is_finite(), "{t}");
+            for sensor in [0, 4, 5, u32::MAX] {
+                let cam = scan_sensor(&path, t, &scan, sensor);
+                assert!(cam.position().is_finite() && cam.forward().is_finite(), "{t} {sensor}");
+            }
         }
         let (odd, start) = (scan_camera(&path, f32::NAN, &scan), scan_camera(&path, 0.0, &scan));
         assert!((odd.forward() - start.forward()).length() < 1e-5 && odd.position() == start.position());
-        // The pipeline reports exactly this camera.
+        assert_eq!(scan_sensor(&path, 3.0, &scan, 99), scan_sensor(&path, 3.0, &scan, 0));
+    }
+
+    #[test]
+    fn scan_frames_follow_the_firing_order() {
+        let scan = ScanConfig::default();
+        let path = ScanPath::house_default().with_speed(scan.speed);
+        let count = scan_frame_count(&path, &scan);
+        assert_eq!(count, (path.duration() * scan.frames_per_second).ceil() as u64 + 1);
+        let order = scan.head.firing_order();
+        let mut per_sensor = [0u32; ScanHead::MAX_SENSORS];
+        for i in 0..count {
+            let frame = scan_frame(&path, &scan, i);
+            assert_eq!(frame.sensor, order[i as usize % order.len()] as u32);
+            let expected = (i as f32 / scan.frames_per_second).min(path.duration());
+            assert!((frame.time - expected).abs() < 1e-4, "frame {i} at {}", frame.time);
+            per_sensor[frame.sensor as usize] += 1;
+        }
+        assert_eq!(scan_frame(&path, &scan, count - 1).time, path.duration());
+        assert_eq!(scan_frame(&path, &scan, u64::MAX).time, path.duration());
+        // The forward sensor takes every other frame, the others share the rest.
+        assert!(per_sensor[0].abs_diff(count as u32 / 2) <= 1, "{per_sensor:?}");
+        assert!(per_sensor[1..].iter().all(|&n| n.abs_diff(count as u32 / 8) <= 1), "{per_sensor:?}");
+        for head in [ScanHead::Single, ScanHead::Surround] {
+            assert_eq!(head.mounts().len(), head.sensor_count() as usize);
+            assert!(head.mounts().len() <= ScanHead::MAX_SENSORS);
+            assert_eq!((head.mounts()[0].yaw_deg, head.mounts()[0].pitch_deg), (0.0, 0.0), "sensor 0 looks ahead");
+            let order = head.firing_order();
+            assert!((0..head.sensor_count() as u8).all(|id| order.contains(&id)), "{head:?}: a sensor never fires");
+            assert!(order.iter().all(|&id| (id as u32) < head.sensor_count()));
+        }
+        let single = ScanConfig { head: ScanHead::Single, ..scan };
+        assert!((0..40).all(|i| scan_frame(&path, &single, i).sensor == 0));
+    }
+
+    #[test]
+    fn every_sensor_of_the_head_is_reported_and_previewed() {
         let mut pipeline = Pipeline::new(small_house());
         pipeline.handle_control(ControlMsg::ScanStart);
-        let stats = stats_of(&pipeline.tick(0.4)).scan.unwrap();
         let config = *pipeline.config();
         let path = ScanPath::house_default().with_speed(config.scan.speed);
-        let expected = CameraInfo::from_camera(0, &scan_camera(&path, pipeline.scene_time(), &config.scan));
-        assert_eq!(stats.camera, expected);
+        let mut previewed = [0u32; ScanHead::MAX_SENSORS];
+        while pipeline.scan_state() == Some(ScanState::Scanning) {
+            let out = pipeline.tick(0.1);
+            for message in out.iter().filter(|m| codec::peek_kind(&m.bytes) == Ok(Kind::Preview)) {
+                let Body::Preview(preview) = codec::decode(&message.bytes).unwrap().body else { panic!() };
+                assert_eq!(message.slot, SLOT_PREVIEW_BASE + preview.camera_id);
+                assert_eq!((preview.width, preview.height), (64, 48));
+                previewed[preview.camera_id as usize] += 1;
+            }
+            // The Stats carry the pose of every sensor at the current
+            // walking time: the main one first, as before.
+            let scan = stats_of(&out).scan.unwrap();
+            let time = pipeline.scene_time();
+            assert_eq!(scan.camera, CameraInfo::from_camera(0, &scan_camera(&path, time, &config.scan)));
+            assert_eq!(scan.extra_cameras.len(), 4);
+            for (k, info) in scan.extra_cameras.iter().enumerate() {
+                let id = k as u32 + 1;
+                assert_eq!(*info, CameraInfo::from_camera(id, &scan_sensor(&path, time, &config.scan, id)));
+            }
+        }
+        let frames = scan_frame_count(&path, &config.scan) as u32;
+        assert!(previewed[0].abs_diff(frames / 2) <= 1 && previewed[1..].iter().all(|&n| n >= frames / 8), "{previewed:?}");
+        assert_eq!(previewed.iter().sum::<u32>(), frames, "one preview per sensor frame at this tick rate");
+
+        // A single sensor: one preview stream, no extra cameras on the wire.
+        let mut config = small_house();
+        config.scan.head = ScanHead::Single;
+        let mut pipeline = Pipeline::new(config);
+        pipeline.handle_control(ControlMsg::ScanStart);
+        for _ in 0..5 {
+            let out = pipeline.tick(0.5);
+            assert_eq!(kinds(&out), [Kind::Layer, Kind::Preview, Kind::Stats]);
+            assert_eq!(out[1].slot, SLOT_PREVIEW_BASE);
+            assert!(stats_of(&out).scan.unwrap().extra_cameras.is_empty());
+            let Body::Stats(json) = codec::decode(&out[2].bytes).unwrap().body else { panic!() };
+            assert!(!json.contains("extra_cameras"), "{json}");
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::path::Path;
 use gs_core::capture::{render_reference, render_rgbd, CaptureOptions};
 use gs_core::codec::{self, Body, LayerMode, PreviewMsg};
 use gs_core::glam::Vec3;
-use gs_core::pipeline::{scan_camera, Outgoing, Pipeline};
+use gs_core::pipeline::{scan_frame, scan_frame_count, scan_sensor, Outgoing, Pipeline, ScanFrame};
 use gs_core::protocol::{ControlMsg, PipelineConfig, ScanState, SessionState, Stats};
 use gs_core::raster::{psnr, rasterize, Image, RasterOptions};
 use gs_core::rig::ScanPath;
@@ -295,17 +295,15 @@ pub struct Exposures {
 }
 
 impl Exposures {
-    /// Re-takes every frame of the home scan described by `config`
-    /// (noise-free): frame `i` at walking time `i / frames_per_second`, the
-    /// last one at the end of the path.
+    /// Re-takes every sensor frame of the home scan described by `config`
+    /// (noise-free), exactly the frames the pipeline fuses.
     pub fn of_scan(snap: &SceneSnapshot, config: &PipelineConfig) -> Self {
         let scan = &config.scan;
         let path = ScanPath::house_default().with_speed(scan.speed);
-        let last = (path.duration() * scan.frames_per_second).ceil() as u32;
-        let frames = (0..=last)
+        let frames = (0..scan_frame_count(&path, scan))
             .map(|i| {
-                let t = (i as f32 / scan.frames_per_second).min(path.duration());
-                let cam = scan_camera(&path, t, scan);
+                let ScanFrame { sensor, time } = scan_frame(&path, scan, i);
+                let cam = scan_sensor(&path, time, scan, sensor);
                 let frame = render_rgbd(snap, &cam, &CaptureOptions { shadows: config.shadows, ..Default::default() });
                 (cam, frame)
             })

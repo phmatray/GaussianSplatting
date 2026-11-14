@@ -33,7 +33,77 @@ fn finite_clamp(value: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// The handheld camera and the fusion of the home scan.
+/// How one sensor is mounted on the scan head.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SensorMount {
+    /// Rotation to the left of the head's forward axis, degrees.
+    pub yaw_deg: f32,
+    /// Tilt above the head's horizon, degrees.
+    pub pitch_deg: f32,
+}
+
+/// The handheld sensor head of the home scan: one or more identical RGB-D
+/// sensors rigidly mounted on a bracket that is carried along the scan path,
+/// looking where the operator walks.
+///
+/// Sensor 0 always looks straight ahead; it is the "main" camera of
+/// [`ScanStats::camera`] and of preview slot 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanHead {
+    /// One sensor looking ahead. A fifth of the surround head's coverage per
+    /// meter walked: side walls, ceilings and floors stay patchy unless the
+    /// path itself faces them.
+    Single,
+    /// Five sensors: ahead, left, right, tilted up and tilted down. Together
+    /// they see everything around the operator except what lies behind, so
+    /// the head can be carried calmly instead of being swept about.
+    #[default]
+    Surround,
+}
+
+impl ScanHead {
+    /// Most sensors any head has.
+    pub const MAX_SENSORS: usize = 5;
+
+    /// The sensors of the head; the index is the sensor id.
+    pub fn mounts(self) -> &'static [SensorMount] {
+        const fn mount(yaw_deg: f32, pitch_deg: f32) -> SensorMount {
+            SensorMount { yaw_deg, pitch_deg }
+        }
+        // Up and down are tilted 60 degrees, not 90: with a vertical field
+        // of view of 80 degrees they overlap the forward sensor and still
+        // reach past the zenith and the operator's feet.
+        const SURROUND: [SensorMount; 5] =
+            [mount(0.0, 0.0), mount(90.0, 0.0), mount(-90.0, 0.0), mount(0.0, 60.0), mount(0.0, -60.0)];
+        match self {
+            Self::Single => &SURROUND[..1],
+            Self::Surround => &SURROUND,
+        }
+    }
+
+    /// Number of sensors.
+    pub fn sensor_count(self) -> u32 {
+        self.mounts().len() as u32
+    }
+
+    /// The sensors fire one at a time, in this repeating order (depth
+    /// sensors that fire together disturb each other, and one frame at a
+    /// time keeps the work per tick small). Frame `i` of the scan is taken
+    /// by sensor `firing_order()[i % len]`.
+    ///
+    /// The forward sensor takes every other frame: what lies ahead comes
+    /// closer with every step and is worth refining, and its picture is the
+    /// one a viewer watches.
+    pub fn firing_order(self) -> &'static [u8] {
+        match self {
+            Self::Single => &[0],
+            Self::Surround => &[0, 1, 0, 2, 0, 3, 0, 4],
+        }
+    }
+}
+
+/// The handheld sensor head and the fusion of the home scan.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanConfig {
@@ -45,24 +115,26 @@ pub struct ScanConfig {
     pub voxel_size: f32,
     /// Cruise walking speed along the scan path in meters per second.
     pub speed: f32,
-    /// Vertical field of view of the handheld camera in degrees. The house
-    /// needs at least 70 degrees to see floors and ceilings from eye height.
-    /// With the sweep of [`crate::pipeline::scan_camera`] the default of 90
-    /// (106 horizontally) leaves about 0.5 % of what a visitor can see
-    /// unscanned; 80 leaves twice as much, 100 adds splats but no quality.
+    /// Vertical field of view of every sensor of the head in degrees. The
+    /// house needs at least 70 degrees to see floors and ceilings from eye
+    /// height. FOV_FACTS
     pub fov_y_deg: f32,
-    /// Image width of the handheld camera in pixels.
+    /// Image width of every sensor in pixels.
     pub width: u32,
-    /// Image height of the handheld camera in pixels.
+    /// Image height of every sensor in pixels.
     pub height: u32,
     /// Depth returns beyond this distance are not fused (meters).
     pub max_range: f32,
-    /// Frames captured per second of walking time. The frames are tied to
-    /// the path, not to the tick rate: frame `i` is always taken at walking
-    /// time `i / frames_per_second`.
+    /// Sensor frames captured per second of walking time, all sensors of the
+    /// head together: they fire one at a time, in
+    /// [`ScanHead::firing_order`]. The frames are tied to the path, not to
+    /// the tick rate: frame `i` is always taken at walking time
+    /// `i / frames_per_second`.
     pub frames_per_second: f32,
     /// Start scanning as soon as the house scene is loaded.
     pub autostart: bool,
+    /// The sensor head that is carried through the house.
+    pub head: ScanHead,
 }
 
 impl Default for ScanConfig {
@@ -70,12 +142,13 @@ impl Default for ScanConfig {
         Self {
             voxel_size: 0.032,
             speed: ScanPath::DEFAULT_SPEED,
-            fov_y_deg: 90.0,
+            fov_y_deg: 80.0,
             width: 192,
             height: 144,
             max_range: 6.0,
             frames_per_second: 6.0,
             autostart: true,
+            head: ScanHead::default(),
         }
     }
 }
@@ -97,6 +170,7 @@ impl ScanConfig {
             max_range: finite_clamp(self.max_range, d.max_range, 0.5, 20.0),
             frames_per_second: finite_clamp(self.frames_per_second, d.frames_per_second, 0.5, 60.0),
             autostart: self.autostart,
+            head: self.head,
         }
     }
 }
@@ -277,11 +351,15 @@ pub struct CameraInfo {
 
 impl Default for CameraInfo {
     fn default() -> Self {
-        Self { id: 0, world_from_cam: glam::Mat4::IDENTITY.to_cols_array(), fov_y: 1.0, width: 0, height: 0 }
+        Self::IDENTITY
     }
 }
 
 impl CameraInfo {
+    /// The default: camera 0 at the origin, without an image.
+    const IDENTITY: Self =
+        Self { id: 0, world_from_cam: glam::Mat4::IDENTITY.to_cols_array(), fov_y: 1.0, width: 0, height: 0 };
+
     pub fn from_camera(id: u32, cam: &Camera) -> Self {
         Self {
             id,
@@ -328,8 +406,9 @@ pub struct SessionState {
     pub config: PipelineConfig,
     /// Scene identifier: `"stage"` or `"house"`.
     pub scene: String,
-    /// The ring cameras (stage). Empty for the house, whose single moving
-    /// camera is reported in [`ScanStats::camera`].
+    /// The ring cameras (stage). Empty for the house, whose moving sensor
+    /// head is reported in [`ScanStats::camera`] and
+    /// [`ScanStats::extra_cameras`].
     pub cameras: Vec<CameraInfo>,
     /// Box containing the scene at every instant.
     pub bounds: Aabb,
@@ -375,6 +454,101 @@ pub enum ScanState {
     Done,
 }
 
+/// A short list of cameras stored inline, so that [`Stats`] stays `Copy`.
+/// It reads like a slice and travels as a plain JSON array.
+#[derive(Clone, Copy, Debug)]
+pub struct CameraList {
+    len: u8,
+    items: [CameraInfo; Self::CAPACITY],
+}
+
+impl CameraList {
+    /// Most cameras the list holds.
+    pub const CAPACITY: usize = 5;
+
+    /// The empty list.
+    pub fn new() -> Self {
+        Self { len: 0, items: [CameraInfo::IDENTITY; Self::CAPACITY] }
+    }
+
+    /// Appends a camera. Returns `false`, and drops the camera, when the
+    /// list is full.
+    pub fn push(&mut self, camera: CameraInfo) -> bool {
+        let Some(slot) = self.items.get_mut(self.len as usize) else { return false };
+        *slot = camera;
+        self.len += 1;
+        true
+    }
+
+    pub fn as_slice(&self) -> &[CameraInfo] {
+        &self.items[..self.len as usize]
+    }
+}
+
+impl Default for CameraList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for CameraList {
+    type Target = [CameraInfo];
+
+    fn deref(&self) -> &[CameraInfo] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for CameraList {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl FromIterator<CameraInfo> for CameraList {
+    /// Keeps the first [`CameraList::CAPACITY`] cameras.
+    fn from_iter<I: IntoIterator<Item = CameraInfo>>(cameras: I) -> Self {
+        let mut list = Self::new();
+        for camera in cameras.into_iter().take(Self::CAPACITY) {
+            list.push(camera);
+        }
+        list
+    }
+}
+
+impl Serialize for CameraList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.as_slice())
+    }
+}
+
+impl<'de> Deserialize<'de> for CameraList {
+    /// Reads an array of any length and keeps its first
+    /// [`CameraList::CAPACITY`] cameras.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CameraList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of cameras")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<CameraList, A::Error> {
+                let mut list = CameraList::new();
+                while let Some(camera) = seq.next_element::<CameraInfo>()? {
+                    // Past the capacity the cameras are parsed and dropped.
+                    list.push(camera);
+                }
+                Ok(list)
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
 /// Scan section of [`Stats`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -382,8 +556,14 @@ pub struct ScanStats {
     pub state: ScanState,
     /// Fraction of the path that has been fused, `0..=1`.
     pub progress: f32,
-    /// Current pose of the handheld camera.
+    /// Current pose of the main sensor of the head, the one looking ahead
+    /// (sensor 0; its previews carry camera id 0).
     pub camera: CameraInfo,
+    /// Current poses of the other sensors of the head, with their sensor
+    /// ids (1 and up; their previews carry the same ids). Empty for
+    /// [`ScanHead::Single`].
+    #[serde(skip_serializing_if = "<[CameraInfo]>::is_empty")]
+    pub extra_cameras: CameraList,
 }
 
 /// The "Stats" message, sent every tick.
@@ -605,7 +785,12 @@ mod tests {
 
         let stats = Stats {
             tick: 7,
-            scan: Some(ScanStats { state: ScanState::Scanning, progress: 0.25, camera: state.cameras[0] }),
+            scan: Some(ScanStats {
+                state: ScanState::Scanning,
+                progress: 0.25,
+                camera: state.cameras[0],
+                ..ScanStats::default()
+            }),
             ..Stats::default()
         };
         let json = serde_json::to_string(&stats).unwrap();
