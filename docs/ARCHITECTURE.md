@@ -70,8 +70,12 @@ feed-forward depth network) would deliver.
 | `scene::stage` | Round stage, articulated dancer (forward kinematics, procedural dance loop), juggled balls |
 | `scene::house` | Furnished single-storey interior with several rooms |
 | `rig` | Ring rig generation, handheld scan path (spline through the rooms, walking speed limited so the heading turns slowly) |
-| `capture` | `render_rgbd(snapshot, camera, opts) -> RgbdFrame`, sensor noise model |
+| `capture` | `render_rgbd(snapshot, camera, opts) -> RgbdFrame`, sensor noise model. `StaticRender` / `PartialCapture`: an exact partial capture that only recasts the pixels a moving part can change (bit-identical to a full render; about 6 % of the stage's pixels per tick) |
 | `reconstruct` | Depth map → oriented surfel Gaussians, background subtraction, voxel-hash fusion |
+| `multiview` | Multi-view fusion of the ring cameras: every surface point keeps the splat of the camera that sees it best |
+| `ingest` | Real capture: frames from the phone companion, `.gscap` files, capture sessions |
+| `record` | 4D recording and replay: the `.gsrec` format, writer, reader, player |
+| `experimental` | Measurement lab: metrics (PSNR by region, SSIM), `wblend` (CPU reference of the blending modes), prototypes |
 | `splat` | Covariance math, EWA projection helpers |
 | `sort` | Back-to-front counting/radix sort of splat indices |
 | `raster` | CPU reference splat rasterizer (tests, golden images, PSNR) |
@@ -91,10 +95,23 @@ feed-forward depth network) would deliver.
 5. Drop grazing observations and pixels on depth edges (flying pixels).
 6. Color is the pixel color, opacity is a config constant.
 
+Live mode, multi-view fusion (`gs_core::multiview`, `PipelineConfig.fusion`,
+on by default): where several ring cameras see the same surface point, only
+the splat of the camera that sees it best is kept (closest and most frontal,
+with a margin so that near-ties keep both). Two splats are the same surface
+when one lies on the other's tangent plane within a tolerance and their
+normals agree; the rim pixels of a camera's silhouette never replace
+anything, and a splat that only a near-rim pixel beats is kept with a quarter
+of its opacity (a low blending weight) so that thin limbs stay closed. The
+fused cloud has about half the splats of the stacked one, which pays for
+finer sensors: the default ring is 8 cameras of 240x180
+(`PipelineConfig::RIG_RESOLUTIONS` lists 160x120, 240x180, 320x240).
+
 Live mode: a pixel is foreground when it is closer than the background plate
 (or its color differs from the plate, which keeps contact shadows).
 Scan mode: positions are hashed into voxels; the first good observation of a
-voxel produces a round disc splat (radius `0.6 ×` the voxel size) and closer
+voxel produces a round disc splat (standard deviation `scan.kernel`, 0.45,
+times the voxel size; cells are 2.4 cm by default) and closer
 views refine it in place. New cells are streamed as `Append` chunks; because
 refinement rewrites earlier splats, layer 0 gets one full `Replace` when the
 scan ends or is paused. The pose of every sensor comes from
@@ -208,14 +225,27 @@ source in this order: Tauri command (then uses `http_url` as base), else
 
 ## Viewer
 
-- Splat data lives in a GPU data texture; the sorted order lives in a second
-  (`R32UI`) texture and quads are indexed triangles that derive splat and
-  corner from `gl_VertexID`. The vertex shader projects the 3D covariance to a screen-space ellipse
-  (EWA), the fragment shader evaluates the Gaussian, blending is back-to-front
-  premultiplied alpha.
-- Sorting is a 16-bit counting sort on view depth, throttled to camera motion.
+- Splat data lives in a GPU data texture; quads are indexed triangles that
+  derive splat and corner from `gl_VertexID`. The vertex shader projects the
+  3D covariance to a screen-space ellipse (EWA), the fragment shader
+  evaluates the Gaussian.
+- Sorted mode: the sorted order lives in a second (`R32UI`) texture; blending
+  is back-to-front premultiplied alpha. Sorting is a 16-bit counting sort on
+  view depth, throttled to camera motion.
+- Normalised mode (see "Blending modes"): no sort. Each layer is drawn in
+  storage order in three (hard) or four (soft) passes into off-screen
+  targets: one or two depth textures, half-float accumulation targets and a
+  two-channel coverage target, then a resolve to the canvas or to each eye.
+  Depth is written logarithmically on the splat's plane. Gizmo lines are
+  hidden where they lie behind the resolved surface.
+- `RenderParams`: `blend` (`Auto`, `Sorted`, `Normalized`), `quality`
+  (`Hard`, `Soft`), `cull_backfaces`, `layer_weights`, `sorted_surfel_scale`.
+  `Auto` draws pipeline layers (`LayerContent::Surfels`) normalised and
+  imported files (`LayerContent::Imported`) sorted; `Viewer::blend_status()`
+  reports the active mode and, when it fell back, why.
 - Desktop: orbit + zoom (stage), fly WASD + mouse look (house).
-- WebXR `immersive-vr`, `local-floor`: one sort per frame, one draw per eye.
+- WebXR `immersive-vr`, `local-floor`: at most one sort per frame, one draw
+  per eye.
   Left stick moves, right stick snap-turns, a button toggles a 1:1 /
   miniature ("dollhouse") world scale.
 
@@ -442,9 +472,13 @@ recording in two ways: a link (and QR code) on the local network,
 
 ## Verification
 
-- `cargo test -p gs-core`: unit tests plus a novel-view quality test. The
-  reconstructed cloud is rendered by the CPU rasterizer from a camera that is
-  *not* part of the rig and compared (PSNR) with the ground-truth ray cast.
+- `cargo test -p gs-core`: unit tests plus novel-view quality tests
+  (`tests/novel_view.rs`). The reconstructed cloud is rendered at 640x480 by
+  the CPU reference in both blending modes from cameras that are *not* part
+  of the rig and compared with the ground-truth ray cast (PSNR by region,
+  SSIM, coverage, a temporal flicker measure, holes opened by the fusion).
+- `cargo run --release -p gs-core --example quality_report`: dumps clouds,
+  scores them at 1280x960 and renders before / after sheets.
 - `e2e/`: Playwright drives the real web build in headless Chromium: desktop
   render is non-blank and animated, WebSocket mode against `gs-server`, and a
   VR session through the IWER WebXR emulator.
