@@ -1,0 +1,30 @@
+[package]
+name = "gs-core"
+description = "Scenes, simulated RGB-D sensors, Gaussian reconstruction, wire codec and reference rasterizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Multi-threaded capture/reconstruction (native only; do not enable on wasm32).
+par = ["dep:rayon"]
+
+[dependencies]
+glam.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+web-time.workspace = true
+miniz_oxide.workspace = true
+# Colour images of capture frames (`ingest`). Pure Rust, builds for wasm32;
+# its own thread pool stays off, the decode is a few milliseconds.
+jpeg-decoder = { version = "0.3.2", default-features = false }
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+png.workspace = true
+# The capture simulator (`examples/gscap_write.rs`) and the ingest tests
+# write JPEGs; the fixtures of the capture format are checked by hash.
+jpeg-encoder = "0.7"
+sha2 = "0.10"

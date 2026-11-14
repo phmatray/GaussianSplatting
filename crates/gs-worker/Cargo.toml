@@ -1,0 +1,33 @@
+[package]
+name = "gs-worker"
+description = "Web Worker that runs the capture and reconstruction pipeline in the browser when no native server is available"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Built by Trunk from crates/gs-app/index.html (`data-type="worker"`), which
+# emits `splat-worker.js` and `splat-worker_bg.wasm` next to the app.
+[[bin]]
+name = "splat-worker"
+path = "src/main.rs"
+
+[dependencies]
+gs-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# The worker only exists in the browser; on other targets the binary is a
+# stub so that `cargo build` at the workspace root keeps working, and the
+# library (protocol and driver) is unit-tested natively.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+console_error_panic_hook.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+workspace = true
+features = ["DedicatedWorkerGlobalScope", "WorkerGlobalScope", "MessageEvent", "Performance", "WebSocket", "BinaryType"]

@@ -1,0 +1,29 @@
+[package]
+name = "splat-live"
+description = "Splat Live desktop application: Tauri 2 shell around gs-server and the gs-app frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+gs-server = { path = "../crates/gs-server" }
+tauri = { version = "2.12.5", features = [] }
+log = "0.4"
+# Tauri's async runtime is Tokio; only the signal handling is used directly.
+tokio = { version = "1.54", features = ["signal", "time"] }
+
+[features]
+# Release mode: the window loads the bundled frontend (`tauri://localhost`)
+# instead of the development server, and the embedded HTTP server carries
+# its own copy of the web build for headsets on the LAN. `tauri build`
+# enables this feature by itself; with plain cargo pass
+# `--features custom-protocol`. Both need `crates/gs-app/dist` to exist.
+custom-protocol = ["tauri/custom-protocol", "gs-server/embed-dist"]
+# End-to-end checks only (`e2e/server/tauri-real.sh`): once a second the
+# shell asks the window what it shows and logs the answer. Never part of a
+# normal build.
+probe = []

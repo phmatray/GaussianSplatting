@@ -1,0 +1,6 @@
+{
+ "error": "bad_deflate",
+ "length": 512,
+ "note": "depth is fine, the confidence stream inflates to 11 bytes instead of 12",
+ "valid": false
+}

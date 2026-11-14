@@ -1,0 +1,71 @@
+# XcodeGen specification of the SplatCapture project.
+#
+#   brew install xcodegen
+#   cd ios/SplatCapture && xcodegen generate && open SplatCapture.xcodeproj
+#
+# The generated SplatCapture.xcodeproj is not committed: run `xcodegen
+# generate` again whenever a file is added or this specification changes.
+name: SplatCapture
+
+options:
+  bundleIdPrefix: be.splatlive
+  deploymentTarget:
+    iOS: "17.0"
+  developmentLanguage: fr
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    # Your Apple developer team identifier (10 characters), for example
+    # "A1B2C3D4E5". Left empty on purpose: either choose the team in Xcode
+    # (target SplatCapture > Signing & Capabilities > Team) after each
+    # `xcodegen generate`, or write it here once. See README.md.
+    DEVELOPMENT_TEAM: ""
+
+packages:
+  SplatCaptureKit:
+    path: Packages/SplatCaptureKit
+
+targets:
+  SplatCapture:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    dependencies:
+      - package: SplatCaptureKit
+    settings:
+      base:
+        # Change this identifier if Xcode says it is not available.
+        PRODUCT_BUNDLE_IDENTIFIER: be.splatlive.capture
+        PRODUCT_NAME: SplatCapture
+        INFOPLIST_FILE: Support/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+schemes:
+  # Run: the app. Test (Cmd-U): the unit tests of the local package
+  # SplatCaptureKit, on a simulator or on the iPhone (the fixtures travel in
+  # the test bundle). `swift test` in Packages/SplatCaptureKit runs the same
+  # tests on the Mac without Xcode.
+  SplatCapture:
+    build:
+      targets:
+        SplatCapture: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - package: SplatCaptureKit/SplatCaptureKitTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

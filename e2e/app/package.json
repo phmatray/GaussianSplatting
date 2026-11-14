@@ -1,0 +1,8 @@
+{
+  "name": "gs-app-e2e",
+  "private": true,
+  "description": "Playwright checks of the Splat Live application. Playwright itself must be resolvable (it is not installed from here); the IWER WebXR emulator comes from ../render (npm install there, or GS_NPM_TOOLS).",
+  "scripts": {
+    "test": "node run.cjs"
+  }
+}

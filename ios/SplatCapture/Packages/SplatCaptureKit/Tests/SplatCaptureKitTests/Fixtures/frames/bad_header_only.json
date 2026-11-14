@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 128,
+ "note": "128 bytes: a valid header whose payload is missing",
+ "valid": false
+}

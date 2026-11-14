@@ -1,0 +1,41 @@
+[package]
+name = "gs-render"
+description = "WebGL2 Gaussian splat viewer: renderer, gizmos, orbit/fly navigation and the WebXR session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gs-core.workspace = true
+glam.workspace = true
+
+# Everything that talks to the browser is only compiled for wasm32. On other
+# targets the crate still builds (and unit-tests) its pure math: navigation,
+# XR rig locomotion, gizmo geometry and the GPU splat packing.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+workspace = true
+features = [
+  # DOM and input
+  "Window", "Document", "Element", "HtmlElement", "HtmlCanvasElement", "CssStyleDeclaration",
+  "Navigator", "Performance", "console",
+  "Event", "EventTarget", "AddEventListenerOptions",
+  "MouseEvent", "PointerEvent", "WheelEvent", "KeyboardEvent",
+  # WebGL2
+  "WebGl2RenderingContext", "WebGlContextAttributes", "WebGlPowerPreference",
+  "WebGlProgram", "WebGlShader", "WebGlBuffer", "WebGlVertexArrayObject",
+  "WebGlUniformLocation", "WebGlFramebuffer", "WebGlTexture",
+  # XRInputSource.gamepad
+  "Gamepad", "GamepadButton",
+  # WebXR (all gated behind --cfg=web_sys_unstable_apis, see .cargo/config.toml)
+  "XrSystem", "XrSession", "XrSessionMode", "XrSessionInit",
+  "XrRenderState", "XrRenderStateInit", "XrWebGlLayer", "XrWebGlLayerInit", "XrLayer",
+  "XrReferenceSpace", "XrReferenceSpaceType", "XrSpace", "XrRigidTransform",
+  "XrFrame", "XrViewerPose", "XrPose", "XrView", "XrViewport", "XrEye",
+  "XrInputSource", "XrInputSourceArray", "XrHandedness",
+  "DomPointReadOnly",
+]

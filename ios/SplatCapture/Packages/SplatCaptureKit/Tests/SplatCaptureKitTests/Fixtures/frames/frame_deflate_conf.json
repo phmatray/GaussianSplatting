@@ -1,0 +1,113 @@
+{
+ "color": {
+  "height": 12,
+  "length": 351,
+  "sha256": "9206f9100c1226f7bf5a7bd06b8dd0e7bff78b2ce230e3813d91352685cf7cab",
+  "width": 16
+ },
+ "compressed": true,
+ "confidence": {
+  "height": 3,
+  "sha256": "0708b44f250e4efd1347ce8195e54f90971df8c04a64c142eafc2ff6eda26d45",
+  "values": [
+   0,
+   1,
+   2,
+   2,
+   1,
+   2,
+   2,
+   0,
+   2,
+   1,
+   0,
+   2
+  ],
+  "width": 4
+ },
+ "depth": {
+  "height": 3,
+  "sha256": "bc89d1fa1b0a444469bcb76e4c9bdc2549cfd83b3e82da214a1bd93a78530a07",
+  "values": [
+   0,
+   500,
+   1000,
+   1500,
+   2000,
+   2500,
+   3000,
+   3500,
+   4000,
+   4999,
+   5000,
+   65535
+  ],
+  "width": 4
+ },
+ "flags": 3,
+ "index": 13,
+ "intrinsics": [
+  12.5,
+  12.25,
+  8.0,
+  6.0
+ ],
+ "intrinsics_bits": [
+  "41480000",
+  "41440000",
+  "41000000",
+  "40c00000"
+ ],
+ "length": 518,
+ "mask": null,
+ "note": "flag combination 3",
+ "orientation": 3,
+ "reencode_identical": false,
+ "reserved": 0,
+ "stored_lengths": {
+  "color_length": 351,
+  "confidence_length": 12,
+  "depth_length": 27,
+  "mask_length": 0
+ },
+ "timestamp": 1000.875,
+ "timestamp_bits": "408f470000000000",
+ "tracking": 0,
+ "valid": true,
+ "world_from_cam": [
+  0.9553365111351013,
+  0.0,
+  -0.29552021622657776,
+  0.0,
+  0.0,
+  1.0,
+  0.0,
+  0.0,
+  0.29552021622657776,
+  0.0,
+  0.9553365111351013,
+  0.0,
+  0.75,
+  1.5,
+  -2.0,
+  1.0
+ ],
+ "world_from_cam_bits": [
+  "3f7490ef",
+  "00000000",
+  "be974e6d",
+  "00000000",
+  "00000000",
+  "3f800000",
+  "00000000",
+  "00000000",
+  "3e974e6d",
+  "00000000",
+  "3f7490ef",
+  "00000000",
+  "3f400000",
+  "3fc00000",
+  "c0000000",
+  "3f800000"
+ ]
+}

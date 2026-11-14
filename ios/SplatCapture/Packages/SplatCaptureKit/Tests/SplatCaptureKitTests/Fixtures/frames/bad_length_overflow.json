@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 504,
+ "note": "colour length 2^32-1 in a frame of 504 bytes",
+ "valid": false
+}

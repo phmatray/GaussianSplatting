@@ -1,0 +1,8 @@
+# WebXR (and a few other browser APIs) are still "unstable" in web-sys: every
+# `Xr*` type, `Navigator::xr()` and `WebGl2RenderingContext::make_xr_compatible()`
+# only exist with this cfg. It applies to the whole wasm dependency graph and
+# also changes some signatures (`MouseEvent::client_x()` returns `f64`).
+#
+# Note: an exported `RUSTFLAGS` environment variable REPLACES these flags.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]
