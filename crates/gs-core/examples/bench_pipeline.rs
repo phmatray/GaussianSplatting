@@ -7,15 +7,16 @@
 //!
 //! Prints one line per scenario and a `RESULT` summary. The stage numbers are
 //! taken over two loops of the dance at the configured tick rate; the house
-//! is scanned twice, once in real-time steps (per-tick cost) and once with
-//! `ScanFinish` (time to fuse the whole path).
+//! is scanned twice, once in real-time steps (per-tick cost, sensor frames
+//! per tick, previews) and once with `ScanFinish` (time to fuse the whole
+//! path).
 
 use std::time::Instant;
 
 use gs_core::capture::NoiseModel;
 use gs_core::codec::{self, Kind};
 use gs_core::pipeline::{Outgoing, Pipeline, SLOT_DYNAMIC};
-use gs_core::protocol::{ControlMsg, PipelineConfig, ScanState, Stats};
+use gs_core::protocol::{ControlMsg, PipelineConfig, ScanHead, ScanState, Stats};
 use gs_core::scene::SceneKind;
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -106,26 +107,32 @@ fn house(label: &str, mut config: PipelineConfig) {
     let mut pipeline = Pipeline::new(config);
     let dt = 1.0 / pipeline.config().target_hz;
     let (mut total, mut busy, mut capture, mut fuse) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut bytes = 0usize;
+    let (mut bytes, mut frames, mut most_frames, mut previews) = (0usize, 0u64, 0u64, 0usize);
     let mut hash = FNV_OFFSET;
+    let c = *pipeline.config();
+    let frame_pixels = (c.scan.width * c.scan.height) as u64;
     while pipeline.scan_state() == Some(ScanState::Scanning) {
         let start = Instant::now();
         let out = pipeline.tick(dt);
         let ms = start.elapsed().as_secs_f64() * 1e3;
         fingerprint(&mut hash, &out);
         total.push(ms);
-        // Ticks between two frames of the handheld camera only emit Stats.
+        // Ticks between two sensor frames only emit Stats.
         if let Some(stats) = stats_of(&out).filter(|s| s.pixels > 0) {
             busy.push(ms);
             capture.push(stats.capture_ms as f64);
             fuse.push(stats.reconstruct_ms as f64);
+            let fired = stats.pixels as u64 / frame_pixels;
+            frames += fired;
+            most_frames = most_frames.max(fired);
         }
+        previews += out.iter().filter(|m| codec::peek_kind(&m.bytes) == Ok(Kind::Preview)).count();
         bytes += out.iter().map(|m| m.bytes.len()).sum::<usize>();
     }
     let mut sorted = busy.clone();
     sorted.sort_by(f64::total_cmp);
     let splats = pipeline.static_splats().len();
-    let c = *pipeline.config();
+    let walk_s = pipeline.scene_time();
 
     pipeline.handle_control(ControlMsg::ScanStart);
     pipeline.handle_control(ControlMsg::ScanFinish);
@@ -139,9 +146,12 @@ fn house(label: &str, mut config: PipelineConfig) {
     }
     let finish_s = start.elapsed().as_secs_f64();
     println!(
-        "RESULT {label}: {}x{} fov {:.0}, voxel {:.0} mm: capturing tick mean {:.2} ms, p95 {:.2}, max {:.2} \
-         (capture {:.2}, fuse {:.2}; {} of {} ticks capture); \
+        "RESULT {label}: {} x {}x{} fov {:.0}, voxel {:.0} mm, {walk_s:.1} s walk: \
+         capturing tick mean {:.2} ms, p95 {:.2}, max {:.2} \
+         (capture {:.2}, fuse {:.2}; {} of {} ticks capture {frames} frames, at most {most_frames} per tick; \
+         {previews} previews); \
          {} splats, {:.1} MB on the wire; ScanFinish {:.2} s in {} ticks (worst {:.1} ms); fingerprint {hash:016x}",
+        c.scan.head.sensor_count(),
         c.scan.width,
         c.scan.height,
         c.scan.fov_y_deg,
@@ -175,6 +185,9 @@ fn main() {
     stage("stage light", PipelineConfig::light(SceneKind::Stage));
     house("house default", PipelineConfig::for_scene(SceneKind::House));
     house("house light", PipelineConfig::light(SceneKind::House));
+    let mut single = PipelineConfig::for_scene(SceneKind::House);
+    single.scan.head = ScanHead::Single;
+    house("house default, single sensor", single);
 }
 
 #[cfg(feature = "par")]

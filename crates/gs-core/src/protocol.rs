@@ -51,13 +51,14 @@ pub struct SensorMount {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanHead {
-    /// One sensor looking ahead. A fifth of the surround head's coverage per
-    /// meter walked: side walls, ceilings and floors stay patchy unless the
-    /// path itself faces them.
+    /// One sensor looking ahead, taking every frame. Walls beside the path,
+    /// ceilings and floors stay patchy: about 5 % of what a visitor of the
+    /// house can see is never scanned, against 0.4 % with the surround head.
     Single,
-    /// Five sensors: ahead, left, right, tilted up and tilted down. Together
-    /// they see everything around the operator except what lies behind, so
-    /// the head can be carried calmly instead of being swept about.
+    /// Five sensors: ahead, back over the left and the right shoulder (120
+    /// degrees to either side), tilted up and tilted down (60 degrees).
+    /// Together they see nearly everything around the operator, so the head
+    /// can be carried calmly instead of being swept about.
     #[default]
     Surround,
 }
@@ -71,11 +72,13 @@ impl ScanHead {
         const fn mount(yaw_deg: f32, pitch_deg: f32) -> SensorMount {
             SensorMount { yaw_deg, pitch_deg }
         }
-        // Up and down are tilted 60 degrees, not 90: with a vertical field
-        // of view of 80 degrees they overlap the forward sensor and still
-        // reach past the zenith and the operator's feet.
+        // Three sensors 120 degrees apart around the vertical axis, so the
+        // side ones also look back over the operator's shoulders: at 90
+        // degrees they leave a fifth more of the visible surface unscanned. Up and down are tilted 60 degrees, not 90: with a
+        // vertical field of view of 80 degrees they overlap the forward
+        // sensor and still reach past the zenith and the operator's feet.
         const SURROUND: [SensorMount; 5] =
-            [mount(0.0, 0.0), mount(90.0, 0.0), mount(-90.0, 0.0), mount(0.0, 60.0), mount(0.0, -60.0)];
+            [mount(0.0, 0.0), mount(120.0, 0.0), mount(-120.0, 0.0), mount(0.0, 60.0), mount(0.0, -60.0)];
         match self {
             Self::Single => &SURROUND[..1],
             Self::Surround => &SURROUND,
@@ -108,8 +111,8 @@ impl ScanHead {
 #[serde(default)]
 pub struct ScanConfig {
     /// Edge length of a fusion cell in meters (one splat per cell). The
-    /// splat count grows with its inverse square: about 275 000 for the
-    /// whole house at 4 cm, 415 000 at 3.2 cm, 475 000 at 3 cm, 680 000 at
+    /// splat count grows with its inverse square: about 277 000 for the
+    /// whole house at 4 cm, 424 000 at 3.2 cm, 484 000 at 3 cm, 695 000 at
     /// 2.5 cm, for a gain of roughly 0.1 dB of held-out PSNR per 50 000
     /// splats.
     pub voxel_size: f32,
@@ -117,7 +120,10 @@ pub struct ScanConfig {
     pub speed: f32,
     /// Vertical field of view of every sensor of the head in degrees. The
     /// house needs at least 70 degrees to see floors and ceilings from eye
-    /// height. FOV_FACTS
+    /// height. With [`ScanHead::Surround`] the default of 80 (96
+    /// horizontally) leaves about 0.4 % of what a visitor can see unscanned.
+    /// Wider sensors see hardly more and spread their pixels thinner: 90
+    /// degrees costs 4 % more splats, 100 degrees 9 % more and 0.2 dB.
     pub fov_y_deg: f32,
     /// Image width of every sensor in pixels.
     pub width: u32,
@@ -255,9 +261,9 @@ impl PipelineConfig {
     pub const MAX_RIG_PIXELS: u64 = 1_250_000;
 
     /// The default configuration for a scene: eight 160x120 cameras for the
-    /// stage; a 192x144 handheld camera with a 90 degree vertical field of
-    /// view and 3.2 cm cells for the house (about 410 000 splats for the
-    /// whole scan).
+    /// stage; a handheld head of five 192x144 sensors with an 80 degree
+    /// vertical field of view and 3.2 cm cells for the house (about 424 000
+    /// splats for the whole scan, a walk of 67 s).
     pub fn for_scene(scene: SceneKind) -> Self {
         Self {
             scene,
@@ -275,8 +281,9 @@ impl PipelineConfig {
     }
 
     /// A lighter configuration for single-threaded WebAssembly on a laptop or
-    /// a standalone headset: six 120x90 ring cameras at 20 Hz, and a 144x108
-    /// handheld camera with 4 cm cells.
+    /// a standalone headset: six 120x90 ring cameras at 20 Hz, and a scan
+    /// head of 144x108 sensors taking 5 frames per second into 4 cm cells
+    /// (about 280 000 splats).
     pub fn light(scene: SceneKind) -> Self {
         Self {
             rig: RingRig { count: 6, width: 120, height: 90, ..RingRig::default() },
@@ -657,6 +664,57 @@ mod tests {
     }
 
     #[test]
+    fn scan_head_travels_as_a_snake_case_name_and_defaults_to_surround() {
+        assert_eq!(ScanConfig::default().head, ScanHead::Surround);
+        assert_eq!(PipelineConfig::light(SceneKind::House).scan.head, ScanHead::Surround);
+        let json = serde_json::to_string(&ScanConfig::default()).unwrap();
+        assert!(json.contains(r#""head":"surround""#), "{json}");
+        // A client written before the head existed does not send it.
+        let old: ScanConfig = serde_json::from_str(r#"{"voxel_size":0.05,"frames_per_second":4}"#).unwrap();
+        assert_eq!((old.head, old.voxel_size), (ScanHead::Surround, 0.05));
+        let single: ScanConfig = serde_json::from_str(r#"{"head":"single"}"#).unwrap();
+        assert_eq!(single.head, ScanHead::Single);
+        assert_eq!(single.sanitized().head, ScanHead::Single);
+        assert!(serde_json::from_str::<ScanConfig>(r#"{"head":"fisheye"}"#).is_err());
+        assert!(serde_json::from_str::<ScanConfig>(r#"{"head":7}"#).is_err());
+
+        assert_eq!((ScanHead::Single.sensor_count(), ScanHead::Surround.sensor_count()), (1, 5));
+        // Stats hold the main camera plus the extra ones inline.
+        const _: () = assert!(ScanHead::MAX_SENSORS - 1 <= CameraList::CAPACITY);
+    }
+
+    #[test]
+    fn camera_list_is_a_bounded_inline_array() {
+        let cam = |id: u32| CameraInfo { id, width: 64, height: 48, ..CameraInfo::default() };
+        let mut list = CameraList::new();
+        assert!(list.is_empty() && list == CameraList::default());
+        assert_eq!(serde_json::to_string(&list).unwrap(), "[]");
+        for id in 0..CameraList::CAPACITY as u32 {
+            assert!(list.push(cam(id + 1)));
+        }
+        assert!(!list.push(cam(99)), "a full list drops further cameras");
+        assert_eq!(list.len(), CameraList::CAPACITY);
+        assert_eq!(list.iter().map(|c| c.id).collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
+        assert_eq!(list[1], cam(2));
+
+        // Plain JSON array, both ways; equality ignores unused slots.
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.starts_with(r#"[{"id":1,"#), "{json}");
+        assert_eq!(serde_json::from_str::<CameraList>(&json).unwrap(), list);
+        let two: CameraList = [cam(1), cam(2)].into_iter().collect();
+        let mut other = list;
+        other.len = 2;
+        assert_eq!(other, two);
+        assert_ne!(two, list);
+        // Too many cameras are cut, not rejected; anything else is an error.
+        let many = serde_json::to_string(&(1..=9).map(cam).collect::<Vec<_>>()).unwrap();
+        assert_eq!(serde_json::from_str::<CameraList>(&many).unwrap(), list);
+        assert_eq!((1..=9).map(cam).collect::<CameraList>(), list);
+        assert!(serde_json::from_str::<CameraList>(r#"{"id":1}"#).is_err());
+        assert!(serde_json::from_str::<CameraList>(r#"[{"id":"x"}]"#).is_err());
+    }
+
+    #[test]
     fn light_preset_is_lighter() {
         let (full, light) = (PipelineConfig::for_scene(SceneKind::Stage), PipelineConfig::light(SceneKind::Stage));
         let pixels = |c: &PipelineConfig| c.rig.count * c.rig.width * c.rig.height;
@@ -797,5 +855,20 @@ mod tests {
         assert!(json.contains("\"state\":\"scanning\""));
         assert_eq!(serde_json::from_str::<Stats>(&json).unwrap(), stats);
         assert_eq!(serde_json::from_str::<Stats>("{}").unwrap(), Stats::default());
+        // Without extra sensors the message is what it was before they
+        // existed, and such a message still parses.
+        assert!(!json.contains("extra_cameras"), "{json}");
+
+        let mut with_extras = stats;
+        let scan = with_extras.scan.as_mut().unwrap();
+        scan.extra_cameras = (1..=4).map(|id| CameraInfo { id, ..state.cameras[0] }).collect();
+        let json = serde_json::to_string(&with_extras).unwrap();
+        assert!(json.contains("\"extra_cameras\":[{\"id\":1,"), "{json}");
+        let back: Stats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_extras);
+        assert_eq!(back.scan.unwrap().extra_cameras.iter().map(|c| c.id).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        // Stats stay `Copy`: hosts keep the latest one by value.
+        let copy = with_extras;
+        assert_eq!(copy, with_extras);
     }
 }

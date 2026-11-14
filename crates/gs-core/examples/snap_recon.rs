@@ -14,7 +14,13 @@
 //!   --light                      start from PipelineConfig::light
 //!   --no-png                     numbers only
 //!   --half-res                   held-out views at 160x120 instead of 320x240
+//!   --previews-from <seconds>    where on the walk the preview strip starts (default 24)
 //! ```
+//!
+//! For the house it also writes `house_previews.png`: the previews of every
+//! sensor of the scan head as a viewer receives them while the scan runs in
+//! real time, consecutive frames side by side (one row pair for the forward
+//! sensor, one row for each of the others).
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -27,9 +33,11 @@ use common::{
     Exposures,
 };
 use gs_core::capture::NoiseModel;
-use gs_core::pipeline::Pipeline;
-use gs_core::protocol::{ControlMsg, PipelineConfig};
+use gs_core::codec::{self, Body};
 use gs_core::glam::Vec3;
+use gs_core::pipeline::Pipeline;
+use gs_core::protocol::{ControlMsg, PipelineConfig, ScanState};
+use gs_core::raster::Image;
 use gs_core::scene::house::{HouseOptions, HouseScene};
 use gs_core::scene::{make_scene, Scene, SceneKind};
 
@@ -42,6 +50,8 @@ struct Options {
     png: bool,
     /// Divides the resolution of the held-out views.
     view_divisor: u32,
+    /// Walking time at which the preview strip starts, seconds.
+    previews_from: f32,
 }
 
 fn parse_args() -> Options {
@@ -53,6 +63,7 @@ fn parse_args() -> Options {
         light: false,
         png: true,
         view_divisor: 1,
+        previews_from: 24.0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -72,6 +83,10 @@ fn parse_args() -> Options {
             "--light" => options.light = true,
             "--no-png" => options.png = false,
             "--half-res" => options.view_divisor = 2,
+            "--previews-from" => {
+                options.previews_from =
+                    args.next().and_then(|v| v.parse().ok()).expect("--previews-from needs a time in seconds");
+            }
             other => options.out = PathBuf::from(other),
         }
     }
@@ -216,12 +231,76 @@ fn house(options: &Options) {
     pipeline.handle_control(ControlMsg::ScanPause);
 }
 
+/// Frames per row of the preview strip.
+const STRIP_COLUMNS: usize = 8;
+
+/// Images of equal height side by side, padded with black to `columns`.
+fn row_of(images: &[Image], columns: usize) -> Image {
+    let (w, h) = images.first().map_or((0, 0), |i| (i.width as usize, i.height as usize));
+    let mut out = Image::new((w * columns) as u32, h as u32, [0, 0, 0]);
+    for (k, image) in images.iter().take(columns).enumerate() {
+        for y in 0..h {
+            let dst = (y * w * columns + k * w) * 3;
+            out.rgb[dst..dst + w * 3].copy_from_slice(&image.rgb[y * w * 3..(y + 1) * w * 3]);
+        }
+    }
+    out
+}
+
+/// Walks the scan in real time, like a host does, and collects the previews
+/// each sensor sends from `previews_from` on.
+fn house_previews(options: &Options) {
+    let mut pipeline = build(SceneKind::House, options);
+    let mut client = Client::default();
+    client.apply(&pipeline.snapshot());
+    client.apply(&pipeline.handle_control(ControlMsg::ScanStart));
+    let dt = 1.0 / pipeline.config().target_hz;
+    let sensors = pipeline.config().scan.head.sensor_count() as usize;
+    // Two rows for the forward sensor, which the viewer shows large.
+    let wanted = |sensor: usize| if sensor == 0 { 2 * STRIP_COLUMNS } else { STRIP_COLUMNS };
+    let mut strips: Vec<Vec<Image>> = vec![Vec::new(); sensors];
+    let mut spans = vec![(f32::NAN, f32::NAN); sensors];
+    while pipeline.scan_state() == Some(ScanState::Scanning) && (0..sensors).any(|k| strips[k].len() < wanted(k)) {
+        let out = pipeline.tick(dt);
+        let time = pipeline.scene_time();
+        for message in &out {
+            let Ok(codec::Message { body: Body::Preview(preview), .. }) = codec::decode(&message.bytes) else { continue };
+            let k = preview.camera_id as usize;
+            if time < options.previews_from || k >= sensors || strips[k].len() >= wanted(k) {
+                continue;
+            }
+            if strips[k].is_empty() {
+                spans[k].0 = time;
+            }
+            spans[k].1 = time;
+            strips[k].push(Image { width: preview.width as u32, height: preview.height as u32, rgb: preview.rgb });
+        }
+        client.apply(&out);
+    }
+    let mut rows = Vec::new();
+    for (k, strip) in strips.iter().enumerate() {
+        println!(
+            "  previews of sensor {k}: {} consecutive frames, walking time {:.2} s to {:.2} s",
+            strip.len(),
+            spans[k].0,
+            spans[k].1
+        );
+        rows.extend(strip.chunks(STRIP_COLUMNS).map(|chunk| row_of(chunk, STRIP_COLUMNS)));
+    }
+    save_png(&options.out.join("house_previews.png"), &stack(&rows));
+}
+
 fn main() {
     let options = parse_args();
     for kind in options.scenes.clone() {
         match kind {
             SceneKind::Stage => stage(&options),
-            SceneKind::House => house(&options),
+            SceneKind::House => {
+                house(&options);
+                if options.png {
+                    house_previews(&options);
+                }
+            }
         }
     }
     if options.png {

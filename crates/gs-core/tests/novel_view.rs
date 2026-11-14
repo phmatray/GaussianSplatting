@@ -20,12 +20,13 @@ use common::{
     HALL_VIEW_CLEARANCE, HOUSE_VIEW_CLEARANCE, HOUSE_VIEW_PATH_DISTANCE,
 };
 use gs_core::capture::{render_reference, NoiseModel};
-use gs_core::glam::Vec3;
-use gs_core::pipeline::Pipeline;
-use gs_core::protocol::{ControlMsg, PipelineConfig, ScanState};
+use gs_core::glam::{Mat4, Quat, Vec3};
+use gs_core::pipeline::{scan_frame, scan_frame_count, scan_sensor, Pipeline};
+use gs_core::protocol::{CameraInfo, ControlMsg, PipelineConfig, ScanHead, ScanState};
 use gs_core::raster::{psnr, rasterize, Image, RasterOptions};
+use gs_core::rig::ScanPath;
 use gs_core::scene::{house, make_scene, SceneKind, SceneSnapshot};
-use gs_core::Splat;
+use gs_core::{Camera, Splat};
 
 fn min(values: &[f32]) -> f32 {
     values.iter().copied().fold(f32::INFINITY, f32::min)
@@ -263,6 +264,136 @@ fn a_frozen_scene_does_not_flicker_under_sensor_noise() {
     assert!(worst_shadow < 5.0, "the shadow flickers by {worst_shadow:.2} levels");
 }
 
+/// Angle of the rotation that takes one orientation to the other, in
+/// degrees (accurate for small angles too).
+fn rotation_between(a: Quat, b: Quat) -> f32 {
+    let delta = b * a.conjugate();
+    (2.0 * delta.xyz().length().atan2(delta.w.abs())).to_degrees()
+}
+
+fn orientation(cam: &Camera) -> Quat {
+    Quat::from_mat3a(&cam.world_from_cam.matrix3)
+}
+
+/// Position and orientation of a camera as the Stats message reports it.
+fn pose_of(info: &CameraInfo) -> (Vec3, Quat) {
+    let (_, rotation, position) = Mat4::from_cols_array(&info.world_from_cam).to_scale_rotation_translation();
+    (position, rotation)
+}
+
+#[test]
+fn the_scan_head_is_carried_calmly() {
+    let config = PipelineConfig::for_scene(SceneKind::House);
+    let scan = &config.scan;
+    let path = ScanPath::house_default().with_speed(scan.speed);
+    let sensors = scan.head.sensor_count();
+    assert_eq!((scan.head, sensors), (ScanHead::Surround, 5));
+    // Measured: 67.4 s of walking at the default speed.
+    assert!((45.0..=75.0).contains(&path.duration()), "the scan takes {} s", path.duration());
+
+    // The motion itself, sampled at the tick rate (this is what the camera
+    // gizmo of a viewer shows): the angular speed of every sensor, and how
+    // much it changes from one tick to the next.
+    let dt = 1.0 / 30.0;
+    let steps = (path.duration() / dt).ceil() as usize;
+    let (mut peak, mut sum, mut peak_change, mut fastest) = (0.0f32, 0.0f64, 0.0f32, 0.0f32);
+    for sensor in 0..sensors {
+        let mut prev = scan_sensor(&path, 0.0, scan, sensor);
+        let mut prev_rate: Option<f32> = None;
+        for i in 1..=steps {
+            let cam = scan_sensor(&path, i as f32 * dt, scan, sensor);
+            let rate = rotation_between(orientation(&prev), orientation(&cam)) / dt;
+            peak = peak.max(rate);
+            sum += rate as f64;
+            if let Some(before) = prev_rate {
+                peak_change = peak_change.max((rate - before).abs());
+            }
+            fastest = fastest.max((cam.position() - prev.position()).length() / dt);
+            (prev, prev_rate) = (cam, Some(rate));
+        }
+    }
+    let mean_rate = sum / (steps as f64 * sensors as f64);
+    println!(
+        "scan head: {:.1} s, turns at {mean_rate:.1} deg/s on average, {peak:.1} deg/s at most, \
+         changing by at most {peak_change:.2} deg/s per tick; walks at up to {fastest:.2} m/s",
+        path.duration()
+    );
+    // Measured: mean 20.3 deg/s, peak 37.4 deg/s (the look-around sweep of
+    // one camera that this head replaces averaged 133 deg/s and peaked at
+    // 215). From one tick to the next the angular speed changes by at most
+    // 7.6 deg/s, at the one moment near the end of the walk where the head
+    // stops turning, and by less than 2 deg/s otherwise.
+    assert!(peak <= 40.0, "a sensor turns at {peak} deg/s");
+    assert!(mean_rate <= 22.0, "the sensors turn at {mean_rate} deg/s on average");
+    assert!(peak_change <= 9.0, "the angular speed jumps by {peak_change} deg/s between two ticks");
+    assert!(fastest <= scan.speed * 1.02, "the head moves at {fastest} m/s");
+
+    // The frames each sensor takes (this is what its preview shows): the
+    // rotation and the way between two consecutive frames of one sensor.
+    let mut last: Vec<Option<Camera>> = vec![None; sensors as usize];
+    let mut turn = vec![0.0f32; sensors as usize];
+    let mut way = vec![0.0f32; sensors as usize];
+    for i in 0..scan_frame_count(&path, scan) {
+        let frame = scan_frame(&path, scan, i);
+        let cam = scan_sensor(&path, frame.time, scan, frame.sensor);
+        let k = frame.sensor as usize;
+        if let Some(before) = &last[k] {
+            turn[k] = turn[k].max(rotation_between(orientation(before), orientation(&cam)));
+            way[k] = way[k].max((cam.position() - before.position()).length());
+        }
+        last[k] = Some(cam);
+    }
+    println!("scan head: at most {turn:.1?} degrees and {way:.2?} m between consecutive frames of each sensor");
+    // Measured: 12.4 degrees and 0.27 m for the forward sensor, which takes
+    // every other frame; 46.7 to 48.1 degrees and 1.07 m for the others, in
+    // the 1.33 s between their frames, always turning the way the walk
+    // turns. The sweep threw its one camera up to 29 degrees between any
+    // two frames, back and forth.
+    assert!(turn[0] <= 13.5 && way[0] <= 0.3, "forward sensor: {} degrees, {} m", turn[0], way[0]);
+    assert!(turn[1..].iter().all(|&a| a <= 50.0) && way[1..].iter().all(|&d| d <= 1.2), "{turn:?} {way:?}");
+}
+
+#[test]
+fn the_reported_scan_camera_moves_steadily_tick_after_tick() {
+    // A cheap scan walked in real time at 30 Hz: the poses in the Stats
+    // messages are what a viewer animates its camera gizmos with.
+    let mut config = PipelineConfig::for_scene(SceneKind::House);
+    config.scan.width = 64;
+    config.scan.height = 48;
+    config.scan.voxel_size = 0.1;
+    let mut pipeline = Pipeline::new(config);
+    let mut client = Client::default();
+    client.apply(&pipeline.snapshot());
+    let sensors = config.scan.head.sensor_count() as usize;
+    let mut prev: Option<Vec<(Vec3, Quat)>> = None;
+    let (mut peak_turn, mut peak_step, mut progress, mut ticks) = (0.0f32, 0.0f32, 0.0f32, 0);
+    while client.scan_state() != Some(ScanState::Done) {
+        client.apply(&pipeline.tick(1.0 / 30.0));
+        let scan = client.stats().scan.expect("the house reports its scan");
+        assert!(scan.progress >= progress, "progress stepped back from {progress} to {}", scan.progress);
+        progress = scan.progress;
+        assert_eq!(scan.camera.id, 0);
+        let ids: Vec<u32> = scan.extra_cameras.iter().map(|c| c.id).collect();
+        assert_eq!(ids, (1..sensors as u32).collect::<Vec<_>>());
+        let poses: Vec<(Vec3, Quat)> = std::iter::once(&scan.camera).chain(scan.extra_cameras.iter()).map(pose_of).collect();
+        if let Some(prev) = &prev {
+            for (before, now) in prev.iter().zip(&poses) {
+                peak_turn = peak_turn.max(rotation_between(before.1, now.1));
+                peak_step = peak_step.max((now.0 - before.0).length());
+            }
+        }
+        prev = Some(poses);
+        ticks += 1;
+        assert!(ticks < 10_000, "the scan never finishes");
+    }
+    println!("reported scan cameras: at most {peak_turn:.2} degrees and {:.1} mm per tick, {ticks} ticks", 1e3 * peak_step);
+    // Measured: 1.25 degrees and 26.7 mm per tick (37.4 deg/s, 0.8 m/s).
+    assert!(peak_turn <= 40.0 / 30.0, "a reported camera turns {peak_turn} degrees in one tick");
+    assert!(peak_step <= 0.03, "a reported camera jumps {peak_step} m in one tick");
+    // Every sensor delivered previews under its own id.
+    assert_eq!(client.previews.keys().copied().collect::<Vec<u8>>(), (0..sensors as u8).collect::<Vec<_>>());
+}
+
 /// The finished default home scan, shared by the house tests.
 struct Scan {
     config: PipelineConfig,
@@ -323,23 +454,27 @@ fn house_full_scan() {
         100.0 * mean(&coverages_observed),
         100.0 * min(&coverages_observed),
     );
-    // Measured: 416 522 splats; PSNR mean 21.46 dB (worst 19.16); coverage
-    // mean 99.69 % (worst 97.68 %). On the pixels whose surface point some
-    // scan frame has seen: PSNR mean 21.89 dB (worst 19.30), coverage mean
-    // 99.92 % (worst 99.41 %). What keeps the PSNR below 22 dB is the cell
+    // Measured: 423 762 splats; PSNR mean 21.79 dB (worst 19.37); coverage
+    // mean 99.87 % (worst 97.96 %). On the pixels whose surface point some
+    // scan frame has seen: PSNR mean 21.98 dB (worst 19.42), coverage mean
+    // 99.98 % (worst 99.85 %). What keeps the PSNR below 22 dB is the cell
     // size: 3.2 cm cells are 2 to 3 pixels wide in these views, which blurs
-    // every color edge of the patterned rugs, tiles and pictures. The 0.7 %
+    // every color edge of the patterned rugs, tiles and pictures. The 0.4 %
     // of the pixels that the scan never saw (floor behind furniture, the
-    // niche beside the wardrobe) cost another 0.4 dB.
-    assert!(scan.cloud.len() <= 450_000, "{} splats", scan.cloud.len());
-    assert!(scan.cloud.len() >= 340_000, "{} splats", scan.cloud.len());
-    assert!(mean(&psnrs) >= 21.0, "mean PSNR {:.2} dB", mean(&psnrs));
-    assert!(min(&psnrs) >= 18.6, "worst PSNR {:.2} dB", min(&psnrs));
-    assert!(mean(&coverages) >= 0.993, "mean coverage {:.4}", mean(&coverages));
-    assert!(min(&coverages) >= 0.97, "worst coverage {:.4}", min(&coverages));
-    assert!(mean(&psnrs_observed) >= 21.4, "mean observed PSNR {:.2} dB", mean(&psnrs_observed));
-    assert!(mean(&coverages_observed) >= 0.997, "mean observed coverage {:.4}", mean(&coverages_observed));
-    assert!(min(&coverages_observed) >= 0.988, "worst observed coverage {:.4}", min(&coverages_observed));
+    // niche beside the wardrobe) cost another 0.2 dB.
+    //
+    // The look-around sweep of a single camera that the five-sensor head
+    // replaces scored 21.46 dB (worst 19.16) and 99.69 % (worst 97.68 %)
+    // with 416 522 splats, while turning seven times as fast.
+    assert!(scan.cloud.len() <= 440_000, "{} splats", scan.cloud.len());
+    assert!(scan.cloud.len() >= 380_000, "{} splats", scan.cloud.len());
+    assert!(mean(&psnrs) >= 21.4, "mean PSNR {:.2} dB", mean(&psnrs));
+    assert!(min(&psnrs) >= 18.9, "worst PSNR {:.2} dB", min(&psnrs));
+    assert!(mean(&coverages) >= 0.996, "mean coverage {:.4}", mean(&coverages));
+    assert!(min(&coverages) >= 0.973, "worst coverage {:.4}", min(&coverages));
+    assert!(mean(&psnrs_observed) >= 21.6, "mean observed PSNR {:.2} dB", mean(&psnrs_observed));
+    assert!(mean(&coverages_observed) >= 0.998, "mean observed coverage {:.4}", mean(&coverages_observed));
+    assert!(min(&coverages_observed) >= 0.993, "worst observed coverage {:.4}", min(&coverages_observed));
 }
 
 #[test]
@@ -353,17 +488,17 @@ fn house_ceilings_corners_and_floors_are_scanned() {
         assert!(clearance(&snap, view.cam.position()) > 0.3, "{} is not in free space", view.name);
         let score = evaluate(&snap, &scan.cloud, &view.cam, scan.config.shadows, None);
         println!("look around, {:16} {:.2} dB, coverage {:.2} %", view.name, score.psnr, 100.0 * score.coverage);
-        assert!(score.coverage >= 0.99, "{}: coverage {:.4}", view.name, score.coverage);
+        assert!(score.coverage >= 0.995, "{}: coverage {:.4}", view.name, score.coverage);
         psnrs.push(score.psnr);
         scores.push(score);
     }
     save_sheet("house_look_around.png", &scores);
     println!("look around: mean {:.2} dB, worst {:.2} dB", mean(&psnrs), min(&psnrs));
-    // Measured: every view fully covered; mean 25.63 dB, worst 20.56 dB (the
-    // kitchen ceiling with its beams and lamp cords). With the forward-looking
-    // sweep of `ScanPath::camera_at` three of these views had holes over 5 to
-    // 8 % of the picture and scored 14.6 to 16 dB.
-    assert!(mean(&psnrs) >= 25.0 && min(&psnrs) >= 19.9, "{psnrs:?}");
+    // Measured: every view fully covered; mean 25.78 dB, worst 21.04 dB (the
+    // kitchen ceiling with its beams and lamp cords). A single sensor that
+    // only looks ahead leaves holes over 5 to 8 % of three of these views,
+    // which then score 14.6 to 16 dB.
+    assert!(mean(&psnrs) >= 25.2 && min(&psnrs) >= 20.4, "{psnrs:?}");
 }
 
 #[test]
@@ -406,7 +541,7 @@ fn house_surfaces_are_single_layered_and_walls_do_not_bleed() {
         let score = evaluate(&snap, &scan.cloud, &cam, scan.config.shadows, None);
         println!("wall, {name}: {:.2} dB, coverage {:.3}", score.psnr, score.coverage);
         assert!(score.coverage > 0.99, "{name}: holes in the wall ({:.3})", score.coverage);
-        // Measured: 27.6 dB from the hall, 21.7 dB from the bathroom (tiles).
+        // Measured: 27.2 dB from the hall, 21.8 dB from the bathroom (tiles).
         assert!(score.psnr > 20.8, "{name}: {:.2} dB, the far face bleeds through", score.psnr);
         save_sheet(&format!("wall_{}.png", name.replace(' ', "_")), &[score]);
     }

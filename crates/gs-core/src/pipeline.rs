@@ -246,8 +246,8 @@ fn merge_json(target: &mut serde_json::Value, patch: serde_json::Value) {
 }
 
 /// Peak yaw sway of the scan head around the walking direction, radians
-/// (8 degrees).
-pub const SCAN_PAN_AMPLITUDE: f32 = 0.14;
+/// (10 degrees).
+pub const SCAN_PAN_AMPLITUDE: f32 = 0.175;
 /// Period of the yaw sway in seconds of walking time.
 pub const SCAN_PAN_PERIOD: f32 = 11.0;
 /// Peak pitch sway of the scan head around the horizon, radians (3 degrees).
@@ -319,7 +319,7 @@ pub fn scan_camera(path: &ScanPath, time: f32, scan: &ScanConfig) -> Camera {
 /// The coverage comes from the number of sensors, not from sweeping one
 /// camera about: [`ScanHead::Surround`] sees floor, ceiling and both side
 /// walls at every step of the walk. A single camera needs a look-around
-/// sweep of up to 170 degrees per second to scan as much, which no one
+/// sweep of some 200 degrees per second to scan as much, which no one
 /// filming a house would do.
 pub fn scan_sensor(path: &ScanPath, time: f32, scan: &ScanConfig, sensor: u32) -> Camera {
     use std::f32::consts::{PI, TAU};
@@ -1395,6 +1395,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_progress_never_steps_back() {
+        // Coarse ticks, each with several frames due, then `ScanFinish`:
+        // whether a tick fuses all its frames or runs out of budget, the
+        // reported progress and the path position of the head only advance.
+        let mut pipeline = Pipeline::new(small_house());
+        pipeline.handle_control(ControlMsg::ScanStart);
+        let path = ScanPath::house_default().with_speed(pipeline.config().scan.speed);
+        let (mut progress, mut walked) = (0.0f32, 0.0f32);
+        let mut check = |stats: Stats| {
+            let scan = stats.scan.unwrap();
+            assert!(scan.progress >= progress, "{} after {progress}", scan.progress);
+            progress = scan.progress;
+            // The head stands on the path at the reported progress.
+            let at = path.duration() * scan.progress;
+            let eye = Vec3::from_slice(&scan.camera.world_from_cam[12..15]);
+            assert!((eye - path.position_at(at)).length() < 2e-3, "progress {progress}");
+            assert!(path.distance_at(at) >= walked);
+            walked = path.distance_at(at);
+        };
+        for _ in 0..3 {
+            check(stats_of(&pipeline.tick(1.3)));
+        }
+        check(stats_of(&pipeline.handle_control(ControlMsg::ScanFinish)));
+        while pipeline.scan_state() == Some(ScanState::Scanning) {
+            check(stats_of(&pipeline.tick(1.0 / 30.0)));
+        }
+        assert_eq!(progress, 1.0);
+    }
+
+    #[test]
     fn autostart_and_restart() {
         let mut config = small_house();
         config.scan.autostart = true;
@@ -1482,9 +1512,11 @@ mod tests {
                 scan_sensor(&path, t, &scan, 3).forward(),
                 scan_sensor(&path, t, &scan, 4).forward(),
             );
-            // `heading x up` points to the walker's right.
+            // `heading x up` points to the walker's right. The side sensors
+            // look 30 degrees back from straight sideways.
             let to_right = heading.cross(Vec3::Y);
-            assert!(left.dot(-to_right) > sway && right.dot(to_right) > sway, "side sensors at t = {t}");
+            let (back_left, back_right) = (-0.866 * to_right - 0.5 * heading, 0.866 * to_right - 0.5 * heading);
+            assert!(left.dot(back_left) > sway && right.dot(back_right) > sway, "side sensors at t = {t}");
             assert!(up.y > 0.8 && down.y < -0.8 && up.dot(heading) > 0.3 && down.dot(heading) > 0.3, "t = {t}");
             for (id, mount) in mounts.iter().enumerate() {
                 let cam = scan_sensor(&path, t, &scan, id as u32);
