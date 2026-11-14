@@ -66,7 +66,9 @@ impl Default for StageRecipe {
 
 impl StageRecipe {
     pub fn rig(&self) -> RingRig {
-        let rig = RingRig::default();
+        // The ring the lab calls "today": the product's default before the
+        // quality round (it is 240x180 since).
+        let rig = RingRig { width: 160, height: 120, ..RingRig::default() };
         let (width, height) = self.size.unwrap_or((rig.width * self.scale, rig.height * self.scale));
         RingRig { width, height, ..rig }
     }

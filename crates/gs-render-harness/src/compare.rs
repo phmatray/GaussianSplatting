@@ -539,7 +539,7 @@ async fn run_cases(viewer: &Viewer, canvas: &HtmlCanvasElement, results: &js_sys
 
     // ---- the product's clouds as surfel content
     if group("stage") {
-        scenes::stage(2.4).upload(viewer)?;
+        scenes::stage(2.4)?.upload(viewer)?;
         run_surfel_views(viewer, results, &stage_views(), &wanted).await?;
         for (suffix, params) in renderings(base_params()) {
             let name = format!("canvas_stage_{suffix}");

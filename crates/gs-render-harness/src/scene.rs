@@ -8,18 +8,20 @@
 //!
 //! Query parameters: `scene`, `time=<s>` (instant of the dance, default
 //! 2.4), `blend`, `quality`, `mask_float=1`, `light=1` (the light pipeline
-//! preset), `gizmos=1`.
+//! preset), `patch=<JSON>` (merged into the pipeline configuration),
+//! `gizmos=1`.
 //!
 //! For scripts, `window.__scene`:
 //!
 //! * `state()`: splat counts, blending status, statistics, the session.
 //! * `cmd(name, arg)`: `view [ex, ey, ez, tx, ty, tz]`, `blend`, `quality`,
-//!   `clipY`, `fov`, `points`, `gizmos`, `splatScale`, `cullBackfaces`,
+//!   `clipY`, `fov`, `points`, `gizmos`, `splatScale`, `sortedScale`,
+//!   `cullBackfaces`, `showDynamic`, `liveWeight`, `content`, `nav`,
 //!   `enterXr`, `exitXr`, `miniature`, `pause`.
 //! * `timing(frames)`: draws `frames` frames of a slow orbit synchronously
 //!   (each one read back, so the GPU work is included) at the canvas size
-//!   and returns milliseconds per frame, split into the viewer's own CPU
-//!   time (sort and draw calls) and the rest.
+//!   and returns milliseconds per frame (mean, fastest, median) and the
+//!   part of it spent sorting.
 //! * `popping(steps, degrees)`: renders `steps` views of an orbit that turns
 //!   `degrees` per step and returns how much consecutive pictures differ.
 //! * `fragments()`: fragments per pixel of the current view and mode,
@@ -33,7 +35,9 @@ use gs_core::experimental::wblend::{self, WblendOptions};
 use gs_core::pipeline::Pipeline;
 use gs_core::raster::Image;
 use gs_core::{Aabb, Camera, Splat};
-use gs_render::{ActiveBlend, GizmoScene, GridGizmo, NavMode, RenderParams, SceneHints, Viewer, ViewerOptions, LAYER_STATIC};
+use gs_render::{
+    ActiveBlend, GizmoScene, GridGizmo, LayerContent, NavMode, RenderParams, SceneHints, Viewer, ViewerOptions, LAYER_DYNAMIC, LAYER_STATIC,
+};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
@@ -101,6 +105,15 @@ impl Page {
                 let weight = arg.as_f64().unwrap_or(f64::NAN) as f32;
                 viewer.set_params(RenderParams { layer_weights: [params.layer_weights[0], weight], ..params });
             }
+            // What both layers are taken to hold: "imported" draws them as
+            // the viewer drew everything before the blending modes existed
+            // (sorted, plain dilation), "surfels" is what the wire delivers.
+            "content" => {
+                let content = if arg.as_string().as_deref() == Some("imported") { LayerContent::Imported } else { LayerContent::Surfels };
+                for layer in [LAYER_STATIC, LAYER_DYNAMIC] {
+                    let _ = viewer.set_layer_content(layer, content);
+                }
+            }
             "pause" => self.paused.set(flag),
             "miniature" => viewer.set_xr_miniature(flag),
             "enterXr" => viewer.enter_xr(),
@@ -149,7 +162,7 @@ impl Page {
         // part of a frame.
         let _ = self.viewer.snapshot(&self.camera());
         let sorts = self.viewer.stats().sorts;
-        let mut total = 0.0;
+        let mut times = Vec::with_capacity(frames as usize);
         let mut sort_ms = 0.0;
         for i in 0..frames {
             // Two degrees per frame: every sorted frame needs a new order.
@@ -158,18 +171,24 @@ impl Page {
             if let Err(error) = self.viewer.snapshot(&cam) {
                 web_sys::console::error_2(&"[scene] snapshot failed:".into(), &error);
             }
-            total += dom::now() - start;
+            times.push(dom::now() - start);
             let stats = self.viewer.stats();
             if stats.blend.active == ActiveBlend::Sorted {
                 sort_ms += stats.sort_ms as f64;
             }
         }
+        let total: f64 = times.iter().sum();
+        // On a shared machine the fastest and the median frame say more
+        // than the mean.
+        times.sort_by(f64::total_cmp);
         let out = js_sys::Object::new();
         dom::set(&out, "frames", frames);
         dom::set(&out, "blend", self.viewer.blend_status().active.as_str());
         dom::set(&out, "width", self.canvas.width());
         dom::set(&out, "height", self.canvas.height());
         dom::set(&out, "frameMs", total / frames as f64);
+        dom::set(&out, "minMs", times[0]);
+        dom::set(&out, "medianMs", times[times.len() / 2]);
         dom::set(&out, "sortMs", sort_ms / frames as f64);
         dom::set(&out, "sorts", (self.viewer.stats().sorts - sorts) as f64);
         out.into()
@@ -287,7 +306,7 @@ async fn run(canvas: HtmlCanvasElement) -> Result<(), String> {
     dom::set_status("scene: building the cloud");
     dom::sleep(0).await;
     let start = dom::now();
-    let cloud = if house { scenes::house().await? } else { scenes::stage(time) };
+    let cloud = if house { scenes::house().await? } else { scenes::stage(time)? };
     let build_ms = dom::now() - start;
 
     if dom::query("mask_float").is_some() {
@@ -318,11 +337,13 @@ async fn run(canvas: HtmlCanvasElement) -> Result<(), String> {
     cloud.upload(&viewer)?;
 
     let animate = !house && dom::query("animate").is_some();
-    let pipeline = animate.then(|| {
-        let mut pipeline = scenes::stage_pipeline();
+    let pipeline = if animate {
+        let mut pipeline = scenes::stage_pipeline()?;
         pipeline.tick(time);
-        pipeline
-    });
+        Some(pipeline)
+    } else {
+        None
+    };
     let page =
         Rc::new(Page { viewer, canvas, cloud, pipeline: RefCell::new(pipeline), paused: Cell::new(false), ticks: Cell::new(0) });
     export(&page);

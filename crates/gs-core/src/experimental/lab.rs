@@ -302,11 +302,13 @@ mod tests {
 
     #[test]
     fn the_lab_stage_is_the_pipelines_stage() {
-        // A small rig keeps the test fast; the code path is the default one.
+        // A small rig keeps the test fast; the code path is the default one,
+        // with the multi-view fusion switched off: the lab stacks.
         let mut config = PipelineConfig::for_scene(SceneKind::Stage);
         config.rig.width = 64;
         config.rig.height = 48;
         config.rig.count = 4;
+        config.fusion.enabled = false;
         let pipeline = Pipeline::new(config);
         let scene = make_scene(SceneKind::Stage);
         let cameras = config.rig.cameras();
@@ -333,6 +335,18 @@ mod tests {
         assert!(fused.fixed.len() < cloud.fixed.len() && fused.live.len() < cloud.live.len());
         assert_eq!(fused.fixed_stats.kept, fused.fixed.len());
         assert_eq!(fused.live_stats.input, cloud.live.len());
+        // The product's fusion (`crate::multiview`) follows the prototype's
+        // greedy rule with the same margin. It skips cameras behind a
+        // splat's surface, which the prototype asks all the same: the two
+        // agree on all but a few splats.
+        let product = Pipeline::new(PipelineConfig { fusion: Default::default(), ..config });
+        let margin = product.config().fusion.margin;
+        let prototype = FusionParams { margin, carve: false, ..FusionParams::default() };
+        let fused = stage_cloud(&capture, &candidates, Some(&prototype), None);
+        for (ours, theirs) in [(product.static_splats(), &fused.fixed), (product.dynamic_splats(), &fused.live)] {
+            let (a, b) = (ours.len() as f32, theirs.len() as f32);
+            assert!(a < 0.9 * cloud.fixed.len() as f32 && (a - b).abs() <= 0.02 * b, "{a} against {b}");
+        }
         // A subset of the ring.
         let two = stage_cloud(&capture, &candidates, None, Some(&[0, 2]));
         assert_eq!(two.fixed.len(), candidates.fixed[0].len() + candidates.fixed[2].len());

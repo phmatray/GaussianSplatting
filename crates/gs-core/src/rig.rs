@@ -456,7 +456,7 @@ mod tests {
         let cams = rig.cameras();
         assert_eq!(cams.len(), 8);
         for (i, cam) in cams.iter().enumerate() {
-            assert_eq!((cam.width, cam.height), (160, 120));
+            assert_eq!((cam.width, cam.height), (240, 180));
             assert!((cam.fov_y().to_degrees() - 50.0).abs() < 1e-3);
             let p = cam.position();
             assert!((Vec3::new(p.x, 0.0, p.z).length() - 3.2).abs() < 1e-4);
@@ -464,7 +464,7 @@ mod tests {
             assert!((p.y - expected_y).abs() < 1e-5);
             // The target projects to the image center.
             let (px, py, depth) = cam.project(rig.target).unwrap();
-            assert!((px - 80.0).abs() < 1e-2 && (py - 60.0).abs() < 1e-2);
+            assert!((px - 120.0).abs() < 1e-2 && (py - 90.0).abs() < 1e-2);
             assert!(depth > 3.0);
             // Upright: world up maps to image up.
             let (_, py_up, _) = cam.project(rig.target + Vec3::Y * 0.5).unwrap();

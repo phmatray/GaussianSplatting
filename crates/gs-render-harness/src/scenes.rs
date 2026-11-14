@@ -42,7 +42,7 @@ fn layer_messages(messages: Vec<Outgoing>) -> Vec<Vec<u8>> {
 
 /// The pipeline configuration of a scene; `?light=1` selects the light
 /// preset (fewer and coarser sensors: faster to build in a browser).
-pub fn config(scene: SceneKind) -> PipelineConfig {
+fn config(scene: SceneKind) -> PipelineConfig {
     if dom::query("light").is_some() {
         PipelineConfig::light(scene)
     } else {
@@ -50,17 +50,29 @@ pub fn config(scene: SceneKind) -> PipelineConfig {
     }
 }
 
+/// A pipeline for `scene`. `?patch=<JSON object>` is merged into its
+/// configuration like a `patch_config` control message, for example
+/// `{"fusion":{"enabled":false}}`: what a picture of an older or a heavier
+/// configuration needs, without this page knowing the fields.
+fn pipeline(scene: SceneKind) -> Result<Pipeline, String> {
+    let mut pipeline = Pipeline::new(config(scene));
+    if let Some(patch) = dom::query("patch") {
+        pipeline.handle_control_json(&format!(r#"{{"type":"patch_config","patch":{patch}}}"#))?;
+    }
+    Ok(pipeline)
+}
+
 /// The live stage `time` seconds into the dance: the background plate in
 /// layer 0, the dancer in layer 1.
-pub fn stage(time: f32) -> SceneCloud {
-    let mut pipeline = Pipeline::new(config(SceneKind::Stage));
+pub fn stage(time: f32) -> Result<SceneCloud, String> {
+    let mut pipeline = stage_pipeline()?;
     pipeline.tick(time);
-    SceneCloud::new(&pipeline)
+    Ok(SceneCloud::new(&pipeline))
 }
 
 /// A stage pipeline to tick by hand (animated checks).
-pub fn stage_pipeline() -> Pipeline {
-    Pipeline::new(config(SceneKind::Stage))
+pub fn stage_pipeline() -> Result<Pipeline, String> {
+    pipeline(SceneKind::Stage)
 }
 
 /// The layer messages of one tick of `pipeline`.
@@ -70,7 +82,7 @@ pub fn tick_layers(pipeline: &mut Pipeline, dt: f32) -> Vec<Vec<u8>> {
 
 /// The house after a complete scan. Yields to the browser while scanning.
 pub async fn house() -> Result<SceneCloud, String> {
-    let mut pipeline = Pipeline::new(config(SceneKind::House));
+    let mut pipeline = pipeline(SceneKind::House)?;
     pipeline.handle_control(ControlMsg::ScanFinish);
     let start = dom::now();
     let mut ticks = 0u32;
