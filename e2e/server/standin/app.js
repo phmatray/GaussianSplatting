@@ -92,12 +92,52 @@ async function main() {
     show('wasm', `ERREUR ${e}`, false);
   }
 
+  // 6. Recording and export, inside the shell only (in a browser this
+  //    page must not leave files in the user's data folder): the record
+  //    button, a recording read by byte ranges across origins, the pairing
+  //    code, and the two exports a web view cannot download by itself.
+  if (window.__TAURI__) {
+    try {
+      const post = (body) => fetch(`${base}/api/record`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      }).then((response) => response.json());
+      const started = await post({ action: 'start', name: 'Essai du shell' });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const stopped = await post({ action: 'stop' });
+      const saved = stopped.saved;
+      result.record = !!(started.recording && saved && saved.duration_s > 1 && saved.size > 1000);
+      const ranged = await fetch(`${base}/${saved.url}`, { headers: { range: 'bytes=0-7' } });
+      const head = new TextDecoder().decode(await ranged.arrayBuffer());
+      result.range = ranged.status === 206 && head.startsWith('GSREC1') && /^bytes 0-7\/\d+$/.test(ranged.headers.get('content-range') || '');
+      const listed = await (await fetch(`${base}/api/recordings`)).json();
+      result.listed = listed.recordings.some((entry) => entry.name === saved.name);
+      const copy = await window.__TAURI__.core.invoke('export_recording', { name: saved.name, kind: 'recording' });
+      const archive = await window.__TAURI__.core.invoke('export_recording', { name: saved.name, kind: 'share' });
+      result.exports = copy.endsWith('.gsrec') && archive.endsWith('.zip');
+      // Names that are not recordings are refused with a sentence.
+      result.export_refused = await window.__TAURI__.core.invoke('export_recording', { name: '../x', kind: 'share' }).then(() => false, (e) => typeof e === 'string');
+      result.reveal_refused = await window.__TAURI__.core.invoke('reveal', { target: '/etc/passwd' }).then(() => false, (e) => typeof e === 'string');
+      const pair = new Image();
+      pair.onload = () => { result.pair = `${pair.naturalWidth}x${pair.naturalHeight}`; };
+      pair.onerror = () => { result.pair = 'error'; };
+      pair.src = `${base}/api/pair.svg`;
+      show('record', `${saved.file}, ${saved.duration_s.toFixed(1)} s, exports : ${copy} et ${archive}`, result.record && result.range && result.exports);
+    } catch (e) {
+      result.record_error = String(e);
+      show('record', `ERREUR ${e}`, false);
+    }
+  } else {
+    $('record').textContent = 'hors de Tauri : non essayé';
+  }
+
   // Report to the host log through a request the server logs in verbose mode.
   setInterval(() => {
     fetch(`${base}/api/info?report=${encodeURIComponent(JSON.stringify({
       origin: result.origin, command: !!result.command, fetch: result.fetch_matches, ws: result.ws, frames: result.frames,
       bytes: result.bytes, kinds: result.kinds, magic: result.magic, lan: result.lan && result.lan.enabled, qr: result.qr,
-      wasm: result.wasm, errors: [result.command_error, result.fetch_error, result.ws_error, result.lan_error, result.wasm_error].filter(Boolean),
+      wasm: result.wasm, record: result.record, range: result.range, listed: result.listed, exports: result.exports,
+      export_refused: result.export_refused, reveal_refused: result.reveal_refused, pair: result.pair,
+      errors: [result.command_error, result.fetch_error, result.ws_error, result.lan_error, result.wasm_error, result.record_error].filter(Boolean),
     }))}`).catch(() => {});
   }, 1000);
 }

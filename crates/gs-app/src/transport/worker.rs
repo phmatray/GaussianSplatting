@@ -13,7 +13,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{ErrorEvent, MessageEvent, Worker, WorkerOptions, WorkerType};
 
-use super::Sink;
+use super::{parse_recording, Sink};
 use crate::logic::source::Link;
 
 /// Loader of the worker, next to the page (relative: the application may be
@@ -99,6 +99,22 @@ impl WorkerTransport {
     pub fn received(&self) -> u64 {
         self.inner.received.get()
     }
+
+    /// Sends a worker request, with its file if it has one. `false` while
+    /// the worker is not ready.
+    pub fn request(&self, request: &WorkerRequest, file: Option<&web_sys::Blob>) -> bool {
+        self.inner.ready.get() && post_request(&self.inner.worker, request, file)
+    }
+}
+
+/// Posts a request to a worker: a string, or `[string, Blob]` when it
+/// carries a file.
+pub(super) fn post_request(worker: &Worker, request: &WorkerRequest, file: Option<&web_sys::Blob>) -> bool {
+    let text = JsValue::from_str(&request.to_json());
+    match file {
+        Some(file) => worker.post_message(&js_sys::Array::of2(&text, file)).is_ok(),
+        None => worker.post_message(&text).is_ok(),
+    }
 }
 
 impl Drop for WorkerTransport {
@@ -144,14 +160,20 @@ impl Inner {
                 Ok(WorkerEvent::Error { message }) if !self.ready.get() => {
                     self.fail(format!("Le calcul local n'a pas pu démarrer ({message})."));
                 }
-                Ok(WorkerEvent::Error { message }) => self.sink.on_error.as_ref()(format!("Commande refusée\u{a0}: {message}")),
-                // Link events belong to the relay mode.
-                Ok(WorkerEvent::Link { .. }) | Err(_) => {}
+                Ok(WorkerEvent::Error { message }) => self.sink.on_error.as_ref()(crate::logic::replay::worker_refusal_text(&message)),
+                Ok(event @ (WorkerEvent::Record(_) | WorkerEvent::Capture(_))) => self.sink.on_event.as_ref()(event),
+                // Link events belong to the relay mode, replay events to
+                // the replay worker.
+                Ok(WorkerEvent::Link { .. } | WorkerEvent::Replay(_) | WorkerEvent::ReplayReset) | Err(_) => {}
             }
             return;
         }
-        // A batch: [id, buffer, buffer, ...].
+        // A batch: [id, buffer, buffer, ...], or a finished recording.
         let Ok(batch) = data.dyn_into::<js_sys::Array>() else { return };
+        if let Some((meta, parts)) = parse_recording(&batch) {
+            self.sink.on_recording.as_ref()(meta, parts);
+            return;
+        }
         let Some(id) = batch.get(0).as_f64() else { return };
         self.received.set(self.received.get() + 1);
         if !self.streaming.replace(true) {

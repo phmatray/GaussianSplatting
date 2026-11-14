@@ -30,6 +30,8 @@ function check(name, ok, detail = '') {
   if (!ok) failed += 1;
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// How long the page is watched for new layers and rendered frames.
+const WINDOW_MS = 4000;
 
 async function startServer(dist, certs) {
   const args = ['--port', String(PORT), '--lan', '--lan-port', String(PORT + 1), '--dist', dist, '--cert-dir', certs, '--verbose'];
@@ -87,7 +89,7 @@ async function openApp(browser, url, shot) {
     return s && s.connected && s.layers.static > 0 && s.layers.dynamic > 0 && s.viewer.framesRendered > 5 && s.counts.layers > 20;
   }, null, { timeout: 60000 }).then(() => true, () => false);
   const first = await page.evaluate(() => window.__splatLive && window.__splatLive.state());
-  await sleep(2000);
+  await sleep(WINDOW_MS);
   const second = await page.evaluate(() => window.__splatLive && window.__splatLive.state());
   const badge = await page.locator('#source-badge').innerText().catch(() => '');
   const picture = await pictureStats(page, path.join(OUT, shot));
@@ -104,11 +106,13 @@ function judge(label, r, expectScheme) {
   check(`${label}: source "Serveur natif" over the WebSocket`, s.source === 'server' && s.connected && /Serveur natif/.test(r.badge) && s.server && s.server.ws_path === '/ws', `${r.badge.replace(/\s+/g, ' ')}`);
   check(`${label}: State and both layers arrived`, s.scene === 'stage' && s.layers.static > 1000 && s.layers.dynamic > 100, JSON.stringify(s.layers));
   // Modest thresholds: headless Chromium draws with a software rasterizer,
-  // so the page applies far fewer layers than the 30 per second sent.
+  // so the page applies far fewer layers than the 30 per second sent, and
+  // the normalised blending of the default stage (about 100 000 splats)
+  // takes it close to a second per frame on a loaded machine.
   const dMessages = s.counts.messages - r.first.counts.messages;
   const dLayers = s.counts.layers - r.first.counts.layers;
   const dFrames = s.viewer.framesRendered - r.first.viewer.framesRendered;
-  check(`${label}: the stream keeps coming and is drawn`, dMessages >= 10 && dLayers >= 3 && dFrames >= 3 && s.viewer.splatsDrawn > 1000, `${dMessages} messages, ${dLayers} layers and ${dFrames} rendered frames in 2 s, ${s.viewer.splatsDrawn} splats drawn`);
+  check(`${label}: the stream keeps coming and is drawn`, dMessages >= 10 && dLayers >= 3 && dFrames >= 2 && s.viewer.splatsDrawn > 1000, `${dMessages} messages, ${dLayers} layers and ${dFrames} rendered frames in ${WINDOW_MS / 1000} s, ${s.viewer.splatsDrawn} splats drawn`);
   check(`${label}: thumbnails and Stats arrive`, s.counts.previews > 0 && s.counts.stats > 0 && s.stats && s.stats.tick > 0, `${s.counts.previews} previews, ${s.counts.stats} stats`);
   check(`${label}: the picture is not blank`, r.picture.colors > 60 && r.picture.varied > 0.05, `${r.picture.colors} colours, ${(r.picture.varied * 100).toFixed(1)} % off the dominant one`);
   const wasm = r.responses.filter((x) => x.url.endsWith('.wasm'));

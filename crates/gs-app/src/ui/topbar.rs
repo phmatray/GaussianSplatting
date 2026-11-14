@@ -4,6 +4,7 @@ use gs_core::scene::SceneKind;
 use leptos::prelude::*;
 
 use super::icons::Icon;
+use super::takes::RecordButton;
 use crate::core::with_core;
 use crate::logic::source::Link;
 use crate::state::use_ui;
@@ -11,8 +12,13 @@ use crate::state::use_ui;
 #[component]
 fn ModeButton(id: &'static str, scene: SceneKind, label: &'static str, short: &'static str, icon: &'static str) -> impl IntoView {
     let ui = use_ui();
-    // The mode the user asked for wins until the pipeline confirms it.
-    let active = move || ui.pending_scene.get().or_else(|| ui.scene.get()) == Some(scene);
+    // The mode the user asked for wins until the pipeline confirms it. A
+    // recording or a capture of the phone is neither mode.
+    let other = move || ui.replay.with(Option::is_some) || ui.capture.with(Option::is_some);
+    let active = move || match ui.pending_scene.get() {
+        Some(pending) => pending == scene,
+        None => !other() && ui.scene.get() == Some(scene),
+    };
     view! {
         <button
             type="button"
@@ -35,14 +41,30 @@ fn ModeButton(id: &'static str, scene: SceneKind, label: &'static str, short: &'
 #[component]
 fn SourceBadge() -> impl IntoView {
     let ui = use_ui();
-    let name = move || ui.source.get().map_or("Recherche de la source…", |s| s.label());
-    let state = move || ui.link.get().label();
+    let replay = move || ui.replay.with(|view| view.as_ref().map(|v| (v.status.ready, v.status.error.is_some())));
+    let name = move || match (replay(), ui.source.get()) {
+        (Some(_), _) => "Enregistrement",
+        (None, Some(source)) => source.label(),
+        (None, None) => "Recherche de la source…",
+    };
+    let state = move || match replay() {
+        Some((_, true)) => "Illisible",
+        Some((false, _)) => "Chargement…",
+        Some((true, _)) => "",
+        None => ui.link.get().label(),
+    };
+    let link_id = move || match replay() {
+        Some((_, true)) => "failed",
+        Some((false, _)) => "connecting",
+        Some((true, _)) => "connected",
+        None => ui.link.get().id(),
+    };
     view! {
         <div
             id="source-badge"
             class="badge"
-            data-link=move || ui.link.get().id()
-            data-source=move || ui.source.get().map_or("", |s| s.id())
+            data-link=link_id
+            data-source=move || if replay().is_some() { "replay" } else { ui.source.get().map_or("", |s| s.id()) }
             title=move || {
                 let state = state();
                 if state.is_empty() { format!("Source\u{a0}: {}", name()) } else { format!("Source\u{a0}: {} ({state})", name()) }
@@ -60,8 +82,16 @@ fn SourceBadge() -> impl IntoView {
 #[component]
 pub fn TopBar() -> impl IntoView {
     let ui = use_ui();
-    let paused = move || ui.config.get().is_some_and(|c| c.paused);
-    let can_pause = move || ui.config.get().is_some() && ui.file.get().is_none() && ui.link.get() == Link::Connected;
+    // In a replay the button is the play head's, like the P key.
+    let replay = move || ui.replay.with(|view| view.as_ref().map(|v| (v.status.playing, v.status.ready)));
+    let paused = move || match replay() {
+        Some((playing, _)) => !playing,
+        None => ui.config.get().is_some_and(|c| c.paused),
+    };
+    let can_pause = move || match replay() {
+        Some((_, ready)) => ready,
+        None => ui.config.get().is_some() && ui.file.get().is_none() && ui.link.get() == Link::Connected,
+    };
     let vr_ready = move || ui.xr_supported.get() == Some(true);
     view! {
         <header class="topbar">
@@ -75,6 +105,7 @@ pub fn TopBar() -> impl IntoView {
             </nav>
             <div class="actions">
                 <SourceBadge />
+                <RecordButton />
                 <button
                     type="button"
                     id="btn-pause"

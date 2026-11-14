@@ -20,8 +20,21 @@
 //! | `{"type":"start","scene":"stage"}` | Build the pipeline from `PipelineConfig::light(scene)` and start ticking. Answered with a batch holding `Pipeline::snapshot()`. A second `start` rebuilds the pipeline. |
 //! | `{"type":"connect","url":"ws://...","link":N}` | Relay mode (see below): open a WebSocket to a native server, replacing the previous one, and forward its frames. |
 //! | `{"type":"ack","batch":N}` | The page has applied every batch up to id `N`. |
-//! | `{"type":"snapshot"}` | Ask for a fresh `Pipeline::snapshot()` (full resynchronisation). Local pipeline only. |
+//! | `{"type":"snapshot"}` | Ask for a fresh snapshot (full resynchronisation): `Pipeline::snapshot()`, or the capture session's. Not in relay mode. |
+//! | `{"type":"hold","on":true}` | Suspend (or resume) the local pipeline without touching its configuration: the page shows something else for a while. |
+//! | `{"type":"record_start","name":"…"}`, `{"type":"record_stop"}` | Record the stream in memory (see [`tape`]), in pipeline, capture and relay mode alike. |
+//! | `{"type":"record_still","name":"…"}` | A recording of the present moment alone (a finished scan saved as a file). |
+//! | `{"type":"replay_open","url":"…"}` | Replay mode (see [`replay`]): play the `.gsrec` at `url`, streamed while it downloads, or through `Range` requests when it is large and the server supports them. |
+//! | `{"type":"replay_play"}`, `replay_pause`, `{"type":"replay_seek","t":12.5,"id":7}`, `{"type":"replay_speed","speed":2}`, `{"type":"replay_loop","on":true}`, `replay_close` | Transport of the replay. |
+//! | `{"type":"capture_cancel"}` | Stop the import of a capture file. |
 //! | anything else | A `gs_core::protocol::ControlMsg`, exactly as it would be sent over the WebSocket. With a local pipeline the reply messages, if any, come back as a batch; in relay mode the text is sent to the server as it is. |
+//!
+//! Two requests carry a file and are therefore an **array** `[string, Blob]`
+//! instead of a string: `{"type":"replay_file","name":"…"}` plays the
+//! recording in the `Blob`, and `{"type":"capture_file","name":"…"}`
+//! ingests the `.gscap` in it (see [`capture`]). A `Blob` (a `File` is
+//! one) is cloned by reference, so nothing is copied until the worker
+//! reads it, piece by piece.
 //!
 //! Worker to page: either a **string** holding a JSON [`WorkerEvent`]
 //! (`{"type":"ready"}` once the WebAssembly module is initialised and
@@ -33,6 +46,14 @@
 //! `buffer` is an `ArrayBuffer` holding one `gs_core::codec` message. The
 //! buffers are transferred, not copied. One tick of the pipeline is one
 //! batch, so the messages of a tick always arrive together and in order.
+//!
+//! Further events: `{"type":"replay", ...}` ([`ReplayStatus`]) and
+//! `{"type":"replay_reset"}` (posted right before a batch that starts from
+//! a keyframe: the page forgets the statistics and thumbnails it shows);
+//! `{"type":"record", ...}` ([`RecordStatus`]); `{"type":"capture", ...}`
+//! ([`CaptureProgress`]). A finished recording arrives as the array
+//! `["recording", json, buffer, buffer, ...]`: `json` is a
+//! [`RecordingMeta`] and the buffers, in order, are the `.gsrec` file.
 //!
 //! # Flow control
 //!
@@ -53,14 +74,20 @@
 //! ignores batches until the `link` event that opens it: they belong to the
 //! connection that was replaced.
 
+pub mod capture;
 pub mod relay;
+pub mod replay;
+pub mod tape;
 
 use gs_core::pipeline::{Outgoing, Pipeline};
 use gs_core::protocol::PipelineConfig;
 use gs_core::scene::SceneKind;
 use serde::{Deserialize, Serialize};
 
+pub use capture::{CaptureProgress, LocalCapture};
 pub use relay::{Delivery, Relay, RelayOverflow, MAX_RELAY_BYTES};
+pub use replay::{Replay, ReplayPoll, ReplayStatus};
+pub use tape::{RecordStatus, Recording, RecordingMeta, Tape};
 
 /// A tick is skipped while this many batches are waiting for their
 /// acknowledgement.
@@ -76,7 +103,7 @@ const STALL_POLL_MS: f64 = 50.0;
 
 /// Requests of the page that are addressed to the worker itself rather than
 /// to the pipeline.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerRequest {
     /// Build the pipeline for `scene` and start ticking.
@@ -89,6 +116,31 @@ pub enum WorkerRequest {
     Ack { batch: u32 },
     /// Send a full snapshot again.
     Snapshot,
+    /// Suspend or resume the local pipeline.
+    Hold { on: bool },
+    /// Start recording the stream in memory.
+    RecordStart { name: String },
+    /// End the recording; it comes back as a `recording` message.
+    RecordStop,
+    /// Record the present moment alone.
+    RecordStill { name: String },
+    /// Replay the recording at `url`.
+    ReplayOpen { url: String },
+    /// Replay the recording in the `Blob` that accompanies this request.
+    ReplayFile { name: String },
+    ReplayPlay,
+    ReplayPause,
+    /// Move the play head to `t` seconds; `id` comes back in
+    /// [`ReplayStatus::seek`].
+    ReplaySeek { t: f64, id: u32 },
+    ReplaySpeed { speed: f64 },
+    ReplayLoop { on: bool },
+    /// Leave replay mode and free the recording.
+    ReplayClose,
+    /// Ingest the `.gscap` in the `Blob` that accompanies this request.
+    CaptureFile { name: String },
+    /// Stop the import of a capture file; what was fused stays.
+    CaptureCancel,
 }
 
 impl WorkerRequest {
@@ -98,7 +150,7 @@ impl WorkerRequest {
 }
 
 /// String messages from the worker to the page.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerEvent {
     /// The worker is initialised and listening.
@@ -108,6 +160,14 @@ pub enum WorkerEvent {
     /// The relayed WebSocket of `connect` number `link` opened (`open`) or
     /// closed.
     Link { open: bool, link: u32 },
+    /// State of the replay.
+    Replay(ReplayStatus),
+    /// The next batch starts from a keyframe.
+    ReplayReset,
+    /// Progress of the in-memory recording.
+    Record(RecordStatus),
+    /// Progress of the import of a capture file.
+    Capture(CaptureProgress),
 }
 
 impl WorkerEvent {
@@ -182,6 +242,8 @@ pub struct Driver {
     next_due_ms: f64,
     /// Ticks that were due but not run because the page was behind.
     skipped: u64,
+    /// The page shows something else: no tick runs.
+    held: bool,
 }
 
 impl Driver {
@@ -203,6 +265,28 @@ impl Driver {
         self.skipped
     }
 
+    /// True while [`WorkerRequest::Hold`] suspends the pipeline.
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Wraps messages that did not come from the pipeline (a capture
+    /// session) into the next batch of the same numbering.
+    pub fn wrap(&mut self, messages: Vec<Vec<u8>>) -> Option<Batch> {
+        if messages.is_empty() {
+            return None;
+        }
+        Some(Batch { id: self.flow.next_id(), messages })
+    }
+
+    /// Drops the pipeline (another source takes over); batch numbering and
+    /// acknowledgements go on.
+    pub fn stop(&mut self) {
+        self.pipeline = None;
+        self.last_tick_ms = None;
+        self.held = false;
+    }
+
     fn batch(&mut self, messages: Vec<Outgoing>) -> Option<Batch> {
         if messages.is_empty() {
             return None;
@@ -222,7 +306,17 @@ impl Driver {
                     self.pipeline = Some(pipeline);
                     self.last_tick_ms = None;
                     self.next_due_ms = now_ms;
+                    self.held = false;
                     Ok(self.batch(snapshot))
+                }
+                WorkerRequest::Hold { on } => {
+                    if self.held && !on {
+                        // The time spent on hold is not played back.
+                        self.last_tick_ms = None;
+                        self.next_due_ms = now_ms;
+                    }
+                    self.held = on;
+                    Ok(None)
                 }
                 WorkerRequest::Ack { batch } => {
                     self.flow.ack(batch);
@@ -232,8 +326,9 @@ impl Driver {
                     let snapshot = self.pipeline.as_ref().ok_or("the pipeline is not started")?.snapshot();
                     Ok(self.batch(snapshot))
                 }
-                // The relay is the business of the glue, which owns the socket.
-                WorkerRequest::Connect { .. } => Err("this worker runs a local pipeline".to_string()),
+                // The relay, the replay, recordings and capture files are
+                // the business of the glue, which owns sockets and files.
+                _ => Err("not a request for the pipeline".to_string()),
             };
         }
         let pipeline = self.pipeline.as_mut().ok_or("the pipeline is not started")?;
@@ -244,6 +339,9 @@ impl Driver {
     /// Runs a tick if one is due and the page has kept up.
     pub fn poll(&mut self, now_ms: f64) -> Poll {
         let Some(pipeline) = self.pipeline.as_mut() else { return Poll { batch: None, wait_ms: None } };
+        if self.held {
+            return Poll { batch: None, wait_ms: None };
+        }
         let period_ms = 1000.0 / f64::from(pipeline.config().target_hz.max(1.0));
         if now_ms < self.next_due_ms {
             return Poll { batch: None, wait_ms: Some(self.next_due_ms - now_ms) };
@@ -270,7 +368,7 @@ impl Driver {
     /// (`0` when it is overdue), `None` while no pipeline is running. Use it
     /// after a tick, whose own duration `poll` cannot know.
     pub fn wait_ms(&self, now_ms: f64) -> Option<f64> {
-        self.pipeline.as_ref().map(|_| (self.next_due_ms - now_ms).max(0.0))
+        self.pipeline.as_ref().filter(|_| !self.held).map(|_| (self.next_due_ms - now_ms).max(0.0))
     }
 }
 
@@ -312,6 +410,20 @@ mod tests {
             serde_json::from_str::<WorkerEvent>(r#"{"type":"error","message":"x"}"#).unwrap(),
             WorkerEvent::Error { message: "x".into() }
         );
+        assert_eq!(WorkerRequest::Hold { on: true }.to_json(), r#"{"type":"hold","on":true}"#);
+        assert_eq!(WorkerRequest::RecordStart { name: "a".into() }.to_json(), r#"{"type":"record_start","name":"a"}"#);
+        assert_eq!(WorkerRequest::RecordStop.to_json(), r#"{"type":"record_stop"}"#);
+        assert_eq!(WorkerRequest::ReplaySeek { t: 1.5, id: 4 }.to_json(), r#"{"type":"replay_seek","t":1.5,"id":4}"#);
+        assert_eq!(WorkerRequest::ReplayOpen { url: "a.gsrec".into() }.to_json(), r#"{"type":"replay_open","url":"a.gsrec"}"#);
+        assert_eq!(WorkerEvent::ReplayReset.to_json(), r#"{"type":"replay_reset"}"#);
+        let status = ReplayStatus { time: 2.0, duration: Some(5.0), playing: true, speed: 1.0, ..ReplayStatus::default() };
+        let json = WorkerEvent::Replay(status.clone()).to_json();
+        assert!(json.starts_with(r#"{"type":"replay","time":2.0,"duration":5.0,"playing":true"#), "{json}");
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), WorkerEvent::Replay(status));
+        let json = WorkerEvent::Record(RecordStatus { active: true, bytes: 9, ..RecordStatus::default() }).to_json();
+        assert!(json.starts_with(r#"{"type":"record","active":true"#), "{json}");
+        let json = WorkerEvent::Capture(CaptureProgress { frames: 3, ..CaptureProgress::default() }).to_json();
+        assert!(json.starts_with(r#"{"type":"capture","name":"""#), "{json}");
         // Control messages must not parse as worker requests.
         let control = serde_json::to_string(&ControlMsg::SetPaused { paused: true }).unwrap();
         assert!(serde_json::from_str::<WorkerRequest>(&control).is_err());
@@ -417,6 +529,32 @@ mod tests {
         assert!(driver.handle_text("not json", 0.0).is_err());
         assert!(driver.handle_text(r#"{"type":"format_disk"}"#, 0.0).is_err());
         assert_eq!(*driver.pipeline().unwrap().config(), before);
+    }
+
+    #[test]
+    fn a_held_pipeline_does_not_tick_and_resumes_where_it_stopped() {
+        let mut driver = started();
+        let first = driver.poll(0.0).batch.unwrap();
+        driver.handle_text(&WorkerRequest::Ack { batch: first.id }.to_json(), 1.0).unwrap();
+        let time = driver.pipeline().unwrap().scene_time();
+        driver.handle_text(r#"{"type":"hold","on":true}"#, 10.0).unwrap();
+        assert!(driver.is_held());
+        for now in [100.0, 5000.0, 60000.0] {
+            assert_eq!(driver.poll(now), Poll { batch: None, wait_ms: None });
+            assert!(driver.wait_ms(now).is_none());
+        }
+        assert_eq!(driver.pipeline().unwrap().scene_time(), time);
+        // Control messages are still answered (a snapshot for the return).
+        assert!(driver.handle_text(r#"{"type":"snapshot"}"#, 60000.0).unwrap().is_some());
+        driver.handle_text(r#"{"type":"hold","on":false}"#, 60000.0).unwrap();
+        let batch = driver.poll(60000.0).batch.expect("ticks again");
+        driver.handle_text(&WorkerRequest::Ack { batch: batch.id }.to_json(), 60000.0).unwrap();
+        // The minute on hold is not played back: one period, not a leap.
+        let advanced = driver.pipeline().unwrap().scene_time() - time;
+        assert!(advanced > 0.0 && advanced < 0.2, "{advanced}");
+        // Requests of the other modes are not for the driver.
+        assert!(driver.handle_text(r#"{"type":"replay_play"}"#, 0.0).is_err());
+        assert!(driver.handle_text(r#"{"type":"record_stop"}"#, 0.0).is_err());
     }
 
     #[test]

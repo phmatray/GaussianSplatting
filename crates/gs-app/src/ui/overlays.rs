@@ -8,13 +8,15 @@ use leptos::prelude::*;
 
 use super::icons::Icon;
 use crate::core::with_core;
+use crate::logic::capture::{self, CaptureState};
 use crate::logic::{config, format};
 use crate::state::use_ui;
 
 #[component]
 pub fn Overlays() -> impl IntoView {
     let ui = use_ui();
-    let house = move || ui.scene.get() == Some(SceneKind::House) && ui.file.get().is_none();
+    let capture = move || ui.capture.get();
+    let house = move || ui.scene.get() == Some(SceneKind::House) && ui.file.get().is_none() && ui.capture.with(Option::is_none);
     let scan = move || ui.scan.get();
     let splats = move || {
         let stats = ui.viewer_stats.get();
@@ -39,11 +41,27 @@ pub fn Overlays() -> impl IntoView {
                 </button>
             </div>
         </Show>
+        // A capture of the phone (or of a capture file) has no percentage:
+        // its state and the frames that went in.
+        <Show when=move || capture().is_some() && ui.file.get().is_none()>
+            <div class="pill" id="capture-pill" data-state=move || capture().map(|c| match CaptureState::of(c.stats.as_ref()) {
+                CaptureState::Running => "scanning",
+                CaptureState::Paused => "paused",
+                CaptureState::Finished => "done",
+                CaptureState::Waiting => "idle",
+            })>
+                <span class="pill-dot" aria-hidden="true"></span>
+                <span>{move || capture().map(|c| format!("{} · {}", capture::mode_label(c.info.mode), CaptureState::of(c.stats.as_ref()).label(c.info.imported)))}</span>
+                <strong>{move || capture().and_then(|c| c.stats).map(|s| format!("{} images", format::count(u64::from(s.frames_used))))}</strong>
+            </div>
+        </Show>
         <Show when=move || ui.file.get().is_some()>
             <div class="pill" id="file-pill">
                 <Icon name="file" />
                 <span>{move || ui.file.get().map(|f| f.name)}</span>
-                <button type="button" class="pill-action" on:click=move |_| with_core(|core| core.return_to_live())>"Revenir au direct"</button>
+                <Show when=move || !ui.embed.get()>
+                    <button type="button" class="pill-action" on:click=move |_| with_core(|core| core.return_to_live())>"Revenir au direct"</button>
+                </Show>
             </div>
         </Show>
 
@@ -74,7 +92,7 @@ pub fn Overlays() -> impl IntoView {
             <div class="drop" id="drop-overlay">
                 <div class="drop-card">
                     <Icon name="upload" />
-                    <p>"Déposez un fichier .ply ou .splat pour l'afficher"</p>
+                    <p>"Déposez une scène (.ply, .splat), un enregistrement (.gsrec) ou une capture (.gscap)"</p>
                 </div>
             </div>
         </Show>

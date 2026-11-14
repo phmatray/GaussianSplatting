@@ -29,6 +29,11 @@ use percent_encoding::percent_decode_str;
 static EMBEDDED: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/embedded_dist.rs"));
 
 const INDEX: &str = "index.html";
+/// First path segments that never name a file or a route of the web build.
+const RESERVED: [&str; 3] = ["api", "recordings", "captures"];
+/// The file a share archive carries next to `index.html`. The viewer asks
+/// for it at every start to learn whether it is such an archive.
+const SHARE_MANIFEST: &str = "share.json";
 const NO_CACHE: &str = "no-cache";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
@@ -103,6 +108,9 @@ enum FoundBody {
 enum Lookup {
     Found(Found),
     Placeholder,
+    /// The viewer asked whether it was unpacked from a share archive, and
+    /// it was not.
+    NoManifest,
     NotFound,
     BadPath,
 }
@@ -198,6 +206,54 @@ impl Assets {
         }
     }
 
+    /// Every file of the web build with its contents, by its path relative
+    /// to the root (`/` between directories), sorted: what a static host
+    /// needs to serve the application. Hidden files and symbolic links are
+    /// left out. Fails when there is no `index.html` or when the files
+    /// weigh more than `max_bytes` together. Reads a directory from the
+    /// disk: call it off the async threads.
+    pub fn collect(&self, max_bytes: u64) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+        use std::io::{Error, ErrorKind};
+        /// A web build has a dozen files; this is a directory of something
+        /// else.
+        const MAX_FILES: usize = 4096;
+        fn walk(dir: &Path, prefix: &str, budget: &mut u64, out: &mut Vec<(String, Vec<u8>)>) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let Ok(name) = entry.file_name().into_string() else { continue };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let key = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+                // Not followed: a link may lead anywhere.
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    walk(&entry.path(), &key, budget, out)?;
+                } else if kind.is_file() {
+                    let size = entry.metadata()?.len();
+                    if size > *budget || out.len() >= MAX_FILES {
+                        return Err(Error::new(ErrorKind::InvalidData, "the web build is too large to share"));
+                    }
+                    *budget -= size;
+                    out.push((key, std::fs::read(entry.path())?));
+                }
+            }
+            Ok(())
+        }
+        let mut files = Vec::new();
+        match self {
+            Self::Dir(root) => walk(root, "", &mut { max_bytes }, &mut files)?,
+            Self::Embedded(embedded) => {
+                files.extend(embedded.iter().map(|(path, file)| (path.to_string(), file.bytes.to_vec())));
+            }
+        }
+        if !files.iter().any(|(name, _)| name == INDEX) {
+            return Err(Error::new(ErrorKind::NotFound, "no web build"));
+        }
+        files.sort();
+        Ok(files)
+    }
+
     async fn find_in_dir(root: &Path, segments: &[String]) -> Option<Found> {
         // Resolved on every request: the build tool may replace the whole
         // directory while the server runs.
@@ -237,15 +293,22 @@ impl Assets {
         if segments.iter().any(|s| s.starts_with('.')) {
             return Lookup::NotFound;
         }
-        // The API lives next to the files; an unknown endpoint is an error,
-        // not a page.
-        if segments.first().is_some_and(|s| s == "api") {
+        // The API and the stored files live next to the web build; an
+        // unknown endpoint or a file that is not there is an error, not a
+        // page of the application.
+        if segments.first().is_some_and(|s| RESERVED.contains(&s.as_str())) {
             return Lookup::NotFound;
         }
         if !segments.is_empty() {
             if let Some(found) = self.find(&segments).await {
                 return Lookup::Found(found);
             }
+        }
+        // Served here, the viewer is not a share archive. That is an
+        // answer, not an error: a 404 would put a failed request in the
+        // console of every page load.
+        if segments.len() == 1 && segments[0] == SHARE_MANIFEST {
+            return Lookup::NoManifest;
         }
         // Asking for the index by name is the one "file" that falls
         // through to the placeholder below.
@@ -274,6 +337,12 @@ impl Assets {
                     None,
                     Bytes::from_static(PLACEHOLDER.as_bytes()),
                 )
+            }
+            Lookup::NoManifest => {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::NO_CONTENT;
+                response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                return response;
             }
             Lookup::NotFound => return plain(StatusCode::NOT_FOUND, "not found", &[]),
             Lookup::BadPath => return plain(StatusCode::BAD_REQUEST, "bad path", &[]),

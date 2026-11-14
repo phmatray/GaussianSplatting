@@ -4,10 +4,15 @@
 mod icons;
 mod overlays;
 mod panel;
+mod phone;
 mod sections;
+mod takes;
+mod timeline;
 mod topbar;
 mod widgets;
 
 pub use overlays::Overlays;
 pub use panel::Panel;
+pub use takes::ShareDialog;
+pub use timeline::Timeline;
 pub use topbar::TopBar;

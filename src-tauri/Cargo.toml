@@ -13,6 +13,7 @@ tauri-build = { version = "2.7.4", features = [] }
 gs-server = { path = "../crates/gs-server" }
 tauri = { version = "2.12.5", features = [] }
 log = "0.4"
+serde = { workspace = true }
 # Tauri's async runtime is Tokio; only the signal handling is used directly.
 tokio = { version = "1.54", features = ["signal", "time"] }
 

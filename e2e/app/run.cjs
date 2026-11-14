@@ -6,8 +6,10 @@
 //   SKIP_BUILD=1        use the existing crates/gs-app/dist
 //   GS_APP_OUT=dir      where screenshots and reports go (default: out/app-e2e)
 //   GS_APP_PORT=8110    first port tried by the static server (8100-8199)
-//   ONLY=stage,vr       run a subset (stage, house, files, vr, narrow, layout, subpath,
-//                       server, shared, lanvr, webkit, soak, perf)
+//   ONLY=stage,vr       run a subset (stage, house, files, render, replay, embed, capture,
+//                       vr, narrow, layout, subpath, server, studio, shared, lanvr, webkit,
+//                       soak, perf)
+//   LONG_REPLAY=0       skip the minute-long stage recording of the replay suite (120 MB)
 //   SOAK_S=180          length of the memory soak in seconds (default 40)
 //   GS_SERVER_BIN=path  gs-server binary for the server, shared, lanvr and soak suites
 //                       (default: target/release/gs-server; skipped when missing)
@@ -18,10 +20,12 @@ const fs = require('fs');
 const path = require('path');
 const lib = require('./lib.cjs');
 
-const SUITES = ['stage', 'house', 'files', 'vr', 'narrow', 'layout', 'subpath', 'server', 'shared', 'lanvr', 'webkit', 'soak', 'perf'];
+const SUITES = ['stage', 'house', 'files', 'render', 'replay', 'embed', 'capture', 'vr', 'narrow', 'layout', 'subpath', 'server', 'studio', 'shared', 'lanvr', 'webkit', 'soak', 'perf', 'shots'];
+// Pictures for a person to look at: only on request (ONLY=shots).
+const ON_REQUEST = ['shots'];
 
 (async () => {
-  const only = process.env.ONLY ? process.env.ONLY.split(',') : SUITES;
+  const only = process.env.ONLY ? process.env.ONLY.split(',') : SUITES.filter((s) => !ON_REQUEST.includes(s));
   if (process.env.SKIP_BUILD !== '1') lib.build();
   fs.mkdirSync(lib.OUT, { recursive: true });
   const { srv, url } = await lib.serve();

@@ -5,14 +5,45 @@ Ce dossier contient la coquille de bureau. Elle fait trois choses :
 1. elle démarre le serveur `gs-server` dans le même processus (pipeline de
    capture, HTTP local sur `127.0.0.1:7878`, HTTPS réseau à la demande) ;
 2. elle ouvre la fenêtre « Splat Live » sur l'interface `gs-app` embarquée ;
-3. elle expose une commande Tauri, `server_info`, qui renvoie le même JSON
-   que `GET /api/info`.
+3. elle expose trois commandes Tauri (voir plus bas), pour ce qu'une vue web
+   ne sait pas faire seule.
 
 L'interface parle ensuite au serveur comme le ferait un navigateur :
 `http://127.0.0.1:<port>` pour l'API, `ws://127.0.0.1:<port>/ws` pour le flux.
-Le certificat auto-signé de l'accès réseau est conservé dans le dossier de
-données de l'application (`~/.local/share/dev.splatlive.desktop` sous Linux),
-pour que le casque continue de lui faire confiance d'un lancement à l'autre.
+
+## Où sont les fichiers
+
+Tout est conservé dans le dossier de données de l'application
+(`~/Library/Application Support/dev.splatlive.desktop` sous macOS,
+`~/.local/share/dev.splatlive.desktop` sous Linux) :
+
+| Sous-dossier | Contenu |
+|---|---|
+| (racine) | le certificat auto-signé de l'accès réseau, pour que le casque et l'iPhone continuent de lui faire confiance d'un lancement à l'autre |
+| `recordings/` | les enregistrements 4D (`.gsrec`) : ceux du bouton d'enregistrement et chaque capture terminée |
+| `captures/` | le flux brut de chaque capture d'iPhone (`.gscap`), pour pouvoir la retraiter plus tard |
+| `exports/` | les fichiers exportés, seulement si le système n'a pas de dossier Téléchargements |
+
+## Commandes Tauri
+
+| Commande | Arguments | Résultat |
+|---|---|---|
+| `server_info` | aucun | le même JSON que `GET /api/info` |
+| `export_recording` | `name` (le `name` de `GET /api/recordings`), `kind` : `"recording"` ou `"share"` | écrit le fichier `.gsrec`, ou l'archive de partage `.zip`, dans le dossier Téléchargements de l'utilisateur sans jamais écraser un fichier existant ; renvoie le chemin du fichier écrit, ou une phrase d'erreur en français |
+| `reveal` | `target` : `"recordings"`, `"captures"`, `"exports"`, ou un chemin renvoyé par `export_recording` | ouvre le gestionnaire de fichiers sur ce dossier ou ce fichier ; tout autre chemin est refusé |
+
+Pourquoi `export_recording` : une vue web (WKWebView, WebKitGTK, WebView2)
+n'a pas de gestionnaire de téléchargements, un lien `download` vers
+`/recordings/<nom>.gsrec` ou `/api/share/<nom>.zip` n'y enregistre donc rien.
+Dans un navigateur ordinaire, ces deux adresses suffisent.
+
+Depuis l'interface :
+
+```js
+const { invoke } = window.__TAURI__.core;
+const chemin = await invoke('export_recording', { name: 'danse', kind: 'share' });
+await invoke('reveal', { target: chemin });
+```
 
 ## Prérequis
 
@@ -100,7 +131,8 @@ l'interface a besoin :
 - `connect-src` avec `http://127.0.0.1:*` et `ws://127.0.0.1:*` (et
   `localhost`) : l'API et le flux du serveur embarqué, plus `ipc:` pour les
   commandes Tauri ;
-- `img-src` avec `http://127.0.0.1:*` : le QR code servi par `/api/qr.svg`.
+- `img-src` avec `http://127.0.0.1:*` : les QR codes servis par
+  `/api/qr.svg` et `/api/pair.svg`.
 
 En mode développement, Tauri n'applique aucune CSP : une erreur de politique
 ne se voit que dans un binaire construit avec `custom-protocol`.
@@ -110,8 +142,9 @@ ne se voit que dans un binaire construit avec `custom-protocol`.
 `e2e/server/tauri-smoke.sh` compile la coquille avec une page de test
 (`e2e/server/standin`) à la place de l'interface, la lance sous Xvfb et
 vérifie dans le journal et sur une capture d'écran que la fenêtre affiche la
-page, que la commande `server_info` répond et que les trames WebSocket
-arrivent :
+page, que la commande `server_info` répond, que les trames WebSocket
+arrivent, qu'un enregistrement se lance, se relit par plages d'octets et
+s'exporte avec `export_recording` (fichier `.gsrec` et archive de partage) :
 
 ```bash
 e2e/server/tauri-smoke.sh            # binaire de débogage

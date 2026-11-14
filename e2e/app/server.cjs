@@ -8,7 +8,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { check, REPO, DIST, PORT, MIME, newPage, consoleErrors, glWarnings, state, waitState, open, shot, viewShot, diff, content, setSlider, sleep, startServer, SERVER_BIN: BIN } = require('./lib.cjs');
+const { check, REPO, DIST, PORT, MIME, newPage, pinBlend, consoleErrors, glWarnings, state, waitState, open, shot, viewShot, diff, content, setSlider, sleep, startServer, SERVER_BIN: BIN } = require('./lib.cjs');
 
 async function run({ browser }) {
   if (!fs.existsSync(BIN)) {
@@ -91,6 +91,7 @@ async function run({ browser }) {
       const proxy = process.env.HTTPS_PROXY ? { proxy: { server: process.env.HTTPS_PROXY, bypass: `127.0.0.1,localhost,${lanHost}` } } : {};
       const lanBrowser = await chromium.launch(proxy);
       const headset = await lanBrowser.newContext({ viewport: { width: 900, height: 600 }, ignoreHTTPSErrors: true });
+      await pinBlend(headset);
       const hp = await headset.newPage();
       try {
         const hs = await open(hp, `${lan.urls[0]}/`);

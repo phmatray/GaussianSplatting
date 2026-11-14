@@ -30,14 +30,14 @@ pub fn default_nav(scene: SceneKind) -> NavMode {
     }
 }
 
-/// Splat size a scene starts with (the "Taille des splats" slider). The
-/// fused house is one round splat per voxel, sized for the best score
-/// against ground truth; seen from one meter in a walk-through, slightly
-/// larger discs close the gaps between neighbours on the walls.
-pub fn default_splat_scale(scene: SceneKind) -> f32 {
-    match scene {
-        SceneKind::Stage => 1.0,
-        SceneKind::House => 1.2,
+/// Navigation a session starts with. A capture of the phone is looked at
+/// from outside, in orbit around what was filmed, whatever its mode: it
+/// grows while one watches, and it has no walk-through start.
+pub fn session_nav(state: &SessionState) -> NavMode {
+    if state.capture.is_some() {
+        NavMode::Orbit
+    } else {
+        default_nav(state.config.scene)
     }
 }
 
@@ -316,8 +316,6 @@ mod tests {
         scan.state = ScanState::Done;
         assert_eq!(gizmos(&state, Some(&scan), true), GizmoScene::default());
         assert_eq!(default_nav(SceneKind::House), NavMode::Fly);
-        assert!(default_splat_scale(SceneKind::House) > default_splat_scale(SceneKind::Stage));
-        assert_eq!(default_splat_scale(SceneKind::Stage), 1.0);
     }
 
     /// Statistics of a house whose scan has just started.

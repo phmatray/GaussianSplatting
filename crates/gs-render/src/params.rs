@@ -322,6 +322,33 @@ impl Default for XrOptions {
     }
 }
 
+/// The time line of a replay as the headset shows it: a small bar above
+/// the left controller (in front of the user when no controller is
+/// tracked). While one is set, the left Y button and the left grip belong
+/// to it: see [`XrTransport`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrTimeline {
+    /// Play head, `0..=1` of the recording.
+    pub progress: f32,
+    /// Part of the recording that is loaded, `0..=1`.
+    pub buffered: f32,
+    pub playing: bool,
+}
+
+/// What the controllers ask of the time line set with
+/// `Viewer::set_xr_timeline`. The viewer only reports; whoever owns the
+/// player acts and sets the new [`XrTimeline`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum XrTransport {
+    /// Left Y was pressed: play or pause.
+    TogglePlay,
+    /// The left stick was pushed sideways while the left grip was held:
+    /// move the play head. The value is the deflection (`-1..=1`, right is
+    /// forward in time) times the frame time in seconds, so that summing
+    /// the events of one second of full deflection gives 1.
+    Scrub(f32),
+}
+
 /// Construction options of the viewer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewerOptions {

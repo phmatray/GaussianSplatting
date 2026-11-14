@@ -136,10 +136,12 @@ pub struct PadState {
     pub primary: bool,
     /// B (right) or Y (left).
     pub secondary: bool,
+    /// Analog grip ("squeeze") in `0..=1`.
+    pub squeeze: f32,
 }
 
 /// What the controller buttons asked for in one frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LocomotionEvents {
     /// Left X was pressed: toggle the gizmos.
     pub toggle_gizmos: bool,
@@ -147,6 +149,12 @@ pub struct LocomotionEvents {
     pub miniature_changed: bool,
     /// Right B was pressed: the rig was reset.
     pub reset: bool,
+    /// Left Y was pressed while a time line is shown: play or pause.
+    pub toggle_play: bool,
+    /// Left grip held with the left stick pushed sideways while a time
+    /// line is shown: deflection times frame time (see
+    /// [`crate::XrTransport::Scrub`]).
+    pub scrub: f32,
 }
 
 /// Per-frame context of [`Locomotion::update`].
@@ -156,7 +164,13 @@ pub struct LocomotionContext {
     pub hints: SceneHints,
     /// Height of the real floor in rig space (see [`Rig::standing`]).
     pub floor_rig_y: f32,
+    /// A replay's time line is shown: left Y and the left grip are its
+    /// controls.
+    pub timeline: bool,
 }
+
+/// The grip counts as held above this analog value.
+const GRIP_HELD: f32 = 0.5;
 
 /// Rescales a stick axis so that it starts at 0 right outside the dead zone.
 fn dead_zone(v: f32) -> f32 {
@@ -181,11 +195,12 @@ pub struct Locomotion {
     prev_gizmos: bool,
     prev_miniature: bool,
     prev_reset: bool,
+    prev_play: bool,
 }
 
 impl Locomotion {
     pub fn new(home: Rig) -> Self {
-        Self { rig: home, home, life_size: None, snap_armed: true, prev_gizmos: false, prev_miniature: false, prev_reset: false }
+        Self { rig: home, home, life_size: None, snap_armed: true, prev_gizmos: false, prev_miniature: false, prev_reset: false, prev_play: false }
     }
 
     pub fn rig(&self) -> Rig {
@@ -246,6 +261,9 @@ impl Locomotion {
             self.reset(rig_from_head, ctx);
             events.reset = true;
         }
+        // The edge is tracked even without a time line, so that a button
+        // held while one appears does not fire.
+        events.toggle_play = pressed(left.secondary, &mut self.prev_play) && ctx.timeline;
 
         // Snap turn with a latch: one turn per flick, however long it is held.
         let turn = right.stick[0];
@@ -258,10 +276,15 @@ impl Locomotion {
         }
 
         let dt = if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+        // With the grip held the left stick belongs to the time line.
+        let scrubbing = ctx.timeline && left.squeeze > GRIP_HELD;
+        if scrubbing {
+            events.scrub = dead_zone(left.stick[0]) * dt;
+        }
         let boost = 1.0 + (TRIGGER_BOOST - 1.0) * left.trigger.max(right.trigger).clamp(0.0, 1.0);
         let speed = if self.is_miniature() { MINIATURE_SPEED } else { ctx.options.move_speed };
         let meters = speed * boost * dt;
-        let (strafe, forward) = (dead_zone(left.stick[0]), -dead_zone(left.stick[1]));
+        let (strafe, forward) = if scrubbing { (0.0, 0.0) } else { (dead_zone(left.stick[0]), -dead_zone(left.stick[1])) };
         // The right stick turns or lifts, whichever axis dominates, so that a
         // sloppy sideways flick does not also change the height.
         let lifting = right.stick[1].abs() > right.stick[0].abs();
@@ -281,7 +304,7 @@ mod tests {
     use super::*;
 
     fn ctx() -> LocomotionContext {
-        LocomotionContext { options: XrOptions::default(), hints: SceneHints::default(), floor_rig_y: 0.0 }
+        LocomotionContext { options: XrOptions::default(), hints: SceneHints::default(), floor_rig_y: 0.0, timeline: false }
     }
 
     fn head(pos: Vec3, yaw: f32) -> Mat4 {
@@ -466,5 +489,44 @@ mod tests {
         }
         // 0.4 real m/s for 1 s = 6 world meters at 1:15.
         assert_vec(loco.rig().pos - start, Vec3::new(0.0, 0.0, -6.0), 1e-2);
+    }
+
+    #[test]
+    fn the_time_line_takes_left_y_and_the_gripped_left_stick() {
+        let home = Rig { pos: Vec3::ZERO, yaw: 0.0, scale: 1.0 };
+        let rig_from_head = head(Vec3::new(0.0, 1.6, 0.0), 0.0);
+        let with_timeline = LocomotionContext { timeline: true, ..ctx() };
+
+        // Without a time line: Y does nothing, a gripped stick still moves.
+        let mut loco = Locomotion::new(home);
+        let pad = PadState { stick: [1.0, 0.0], secondary: true, squeeze: 1.0, ..Default::default() };
+        let events = loco.update(&pad, &PadState::default(), &rig_from_head, 0.1, &ctx());
+        assert!(!events.toggle_play && events.scrub == 0.0);
+        assert!(loco.rig().pos.x > 0.1);
+        // The button was already down when the time line appeared: no edge.
+        let events = loco.update(&pad, &PadState::default(), &rig_from_head, 0.1, &with_timeline);
+        assert!(!events.toggle_play);
+
+        // With one: Y toggles once per press, the gripped stick scrubs and
+        // the user stays where they are.
+        let mut loco = Locomotion::new(home);
+        let press = PadState { secondary: true, ..Default::default() };
+        assert!(loco.update(&press, &PadState::default(), &rig_from_head, 0.01, &with_timeline).toggle_play);
+        assert!(!loco.update(&press, &PadState::default(), &rig_from_head, 0.01, &with_timeline).toggle_play);
+        assert!(!loco.update(&PadState::default(), &PadState::default(), &rig_from_head, 0.01, &with_timeline).toggle_play);
+        let mut total = 0.0;
+        for _ in 0..100 {
+            let scrub = PadState { stick: [-1.0, 0.4], squeeze: 0.9, ..Default::default() };
+            total += loco.update(&scrub, &PadState::default(), &rig_from_head, 0.01, &with_timeline).scrub;
+        }
+        assert!((total + 1.0).abs() < 1e-4, "{total}");
+        assert_eq!(loco.rig().pos, Vec3::ZERO);
+        // Grip released: the stick moves the user again and scrubs nothing.
+        let walk = PadState { stick: [1.0, 0.0], squeeze: 0.2, ..Default::default() };
+        let events = loco.update(&walk, &PadState::default(), &rig_from_head, 0.1, &with_timeline);
+        assert!(events.scrub == 0.0 && loco.rig().pos.x > 0.1);
+        // Inside the dead zone nothing moves.
+        let idle = PadState { stick: [0.05, 0.0], squeeze: 1.0, ..Default::default() };
+        assert_eq!(loco.update(&idle, &PadState::default(), &rig_from_head, 0.1, &with_timeline).scrub, 0.0);
     }
 }

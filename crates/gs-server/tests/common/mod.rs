@@ -234,7 +234,7 @@ impl Viewer {
 }
 
 impl Viewer {
-    fn apply(&mut self, bytes: &[u8]) -> Received {
+    pub fn apply(&mut self, bytes: &[u8]) -> Received {
         let message = codec::decode(bytes).expect("the server sent an undecodable frame");
         let event = match message.body {
             Body::State(json) => {

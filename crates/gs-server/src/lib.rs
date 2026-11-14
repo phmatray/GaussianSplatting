@@ -14,6 +14,29 @@
 //! `/ws` WebSocket that carries the binary frames of `gs_core::codec` one
 //! way and JSON control messages the other way.
 //!
+//! # Real capture, recording, sharing
+//!
+//! The sections "Real capture" and "4D recording and sharing" of the
+//! architecture document are served here as well:
+//!
+//! * **Pairing**: `GET /api/pair` and `/api/pair.svg` (loopback only) give
+//!   the `splatlive://pair` URI a phone needs: LAN address, certificate
+//!   fingerprint and the token of this run ([`ServerHandle::pairing_uri`]).
+//! * **Capture**: the phone streams its frames to `GET /ingest` (LAN
+//!   listener, WebSocket) or uploads a `.gscap` to `POST /api/captures`.
+//!   While a capture is shown it replaces the simulation for every viewer;
+//!   a viewer returns to the simulation with a `set_scene` control message,
+//!   which is ignored while the phone is still capturing. One phone
+//!   captures at a time.
+//! * **Recording**: `POST /api/record` records what viewers receive into
+//!   [`ServerConfig::recordings_dir`]; `GET /api/recordings` lists the
+//!   files, `GET /recordings/<name>.gsrec` serves them with `Range`. A
+//!   capture that finishes is saved there too, and its raw stream is kept
+//!   as a `.gscap` in [`ServerConfig::captures_dir`].
+//! * **Sharing**: `GET /api/share/<name>.zip` is the web build with the
+//!   recording inside ([`ServerHandle::export_share`] writes the same
+//!   archive to a file).
+//!
 //! ```no_run
 //! # async fn demo() -> Result<(), gs_server::Error> {
 //! let server = gs_server::start(gs_server::ServerConfig::default()).await?;
@@ -49,14 +72,21 @@
 //! a new DHCP lease) within a few seconds; the port and the connected
 //! viewers stay.
 
+mod api;
 mod assets;
+mod capture;
+mod files;
 mod http;
 mod hub;
+mod ingest;
 mod logging;
 mod net;
 mod outbox;
+mod recording;
+mod store;
 mod tls;
 mod ws;
+mod zip;
 
 use std::fmt;
 use std::io;
@@ -67,19 +97,23 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use gs_core::ingest::IngestParams;
 use gs_core::protocol::{PipelineConfig, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{watch, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 pub use logging::log_to_stderr;
 pub use net::{lan_ipv4, qr_svg, qr_terminal};
 pub use outbox::QueueLimits;
+pub use recording::{EndReason, RecordState, RecordingStatus, Saved};
+pub use store::{CaptureEntry, RecordingEntry};
 pub use tls::fingerprint;
 
 use assets::Assets;
 use http::Listener;
-use hub::Hub;
+use hub::{Hub, HubSetup};
+use store::{Kind, Store};
 
 /// Default port of the loopback HTTP listener.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -87,6 +121,16 @@ pub const DEFAULT_PORT: u16 = 7878;
 pub const DEFAULT_LAN_PORT: u16 = 7879;
 /// Path of the WebSocket endpoint.
 pub const WS_PATH: &str = "/ws";
+/// Path of the WebSocket a capturing phone talks to (LAN listener only).
+pub const INGEST_PATH: &str = "/ingest";
+/// Default of [`ServerConfig::max_recording_bytes`]: about twenty minutes
+/// of the default stage.
+pub const DEFAULT_MAX_RECORDING_BYTES: u64 = 8 << 30;
+/// Default of [`ServerConfig::max_upload_bytes`]: more than an hour of
+/// frames from a phone.
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 16 << 30;
+/// Default of [`ServerConfig::max_lan_connections`].
+pub const DEFAULT_MAX_LAN_CONNECTIONS: usize = 128;
 /// The `name` field of [`ServerInfo`].
 pub const SERVER_NAME: &str = "splat-live";
 /// Origins of the Tauri webview (Linux and macOS, then Windows). Requests
@@ -99,6 +143,13 @@ pub const TAURI_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localho
 pub fn has_embedded_frontend() -> bool {
     assets::has_embedded_index()
 }
+
+/// Connections to `/ingest` that may be waiting for their hello at a time.
+/// Until its hello carries the pairing token a connection is a stranger,
+/// and a stranger may send one message of up to 8 MiB (the size of a
+/// frame) before it is turned away: this bounds what strangers can make
+/// the server hold together. A phone needs one.
+const MAX_PENDING_HELLOS: usize = 8;
 
 /// How long in-flight requests and closing handshakes may take when a
 /// listener stops.
@@ -159,13 +210,37 @@ pub struct ServerConfig {
     /// are upgraded.
     pub request_timeout: Duration,
     /// A viewer whose socket does not accept one message within this time
-    /// is disconnected.
+    /// is disconnected, and so is a phone. The download of a recording, of
+    /// a capture or of a share archive is abandoned when its client takes
+    /// nothing for this long.
     pub send_timeout: Duration,
     /// Interval of the WebSocket keepalive pings.
     pub ping_interval: Duration,
     /// A viewer that leaves a ping unanswered for this long is considered
     /// gone.
     pub idle_timeout: Duration,
+    /// Where recordings (`.gsrec`) are written and served from. `None`:
+    /// nothing is recorded; `POST /api/record` answers 503 and finished
+    /// captures are not saved.
+    pub recordings_dir: Option<PathBuf>,
+    /// Where the raw stream of a phone and uploaded captures (`.gscap`)
+    /// are kept. `None`: a directory `captures` next to
+    /// [`ServerConfig::recordings_dir`].
+    pub captures_dir: Option<PathBuf>,
+    /// Keep raw captures on disk, so that they can be processed again
+    /// later. A phone sends up to 9 MB per second.
+    pub keep_captures: bool,
+    /// Largest recording the server writes, in bytes; a recording that
+    /// reaches it ends by itself, complete.
+    pub max_recording_bytes: u64,
+    /// Largest body `POST /api/captures` accepts, in bytes.
+    pub max_upload_bytes: u64,
+    /// Most connections the LAN listener holds at a time; one that arrives
+    /// beyond that is closed at once. A browser opens up to six, a phone
+    /// one or two.
+    pub max_lan_connections: usize,
+    /// Reconstruction parameters for the captures of a phone.
+    pub ingest: IngestParams,
 }
 
 impl Default for ServerConfig {
@@ -184,6 +259,13 @@ impl Default for ServerConfig {
             send_timeout: Duration::from_secs(30),
             ping_interval: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
+            recordings_dir: None,
+            captures_dir: None,
+            keep_captures: true,
+            max_recording_bytes: DEFAULT_MAX_RECORDING_BYTES,
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_lan_connections: DEFAULT_MAX_LAN_CONNECTIONS,
+            ingest: IngestParams::default(),
         }
     }
 }
@@ -239,6 +321,15 @@ pub struct Metrics {
     /// up holds at most the messages of one tick here; so does one that
     /// reads nothing, because newer messages replace the unsent ones.
     pub queued_bytes: u64,
+    /// Phones connected to `/ingest` (refused ones included, until their
+    /// connection is closed).
+    pub phones: usize,
+    /// Capture frames of phones handled since the start.
+    pub capture_frames: u64,
+    /// Viewers are shown a capture instead of the simulation.
+    pub capture_shown: bool,
+    /// A phone is connected and its capture is not finished.
+    pub capturing: bool,
 }
 
 /// Why the server could not start or open the LAN listener.
@@ -283,18 +374,26 @@ impl From<io::Error> for Error {
 /// Connected WebSocket sessions.
 #[derive(Default)]
 pub(crate) struct Sessions {
+    /// Viewers on `/ws`.
     count: AtomicUsize,
+    /// Phones on `/ingest`.
+    phones: AtomicUsize,
     next_id: AtomicU64,
     changed: Notify,
 }
 
 /// Keeps a session counted until it is dropped.
-pub(crate) struct SessionGuard(Arc<Core>);
+pub(crate) struct SessionGuard {
+    core: Arc<Core>,
+    phone: bool,
+}
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.0.sessions.count.fetch_sub(1, Ordering::AcqRel);
-        self.0.sessions.changed.notify_waiters();
+        let sessions = &self.core.sessions;
+        let counter = if self.phone { &sessions.phones } else { &sessions.count };
+        counter.fetch_sub(1, Ordering::AcqRel);
+        sessions.changed.notify_waiters();
     }
 }
 
@@ -307,6 +406,10 @@ pub(crate) struct Settings {
     pub send_timeout: Duration,
     pub ping_interval: Duration,
     pub idle_timeout: Duration,
+    pub keep_captures: bool,
+    pub max_recording_bytes: u64,
+    pub max_upload_bytes: u64,
+    pub ingest: IngestParams,
 }
 
 /// The open LAN listener.
@@ -344,9 +447,27 @@ fn bound_idle_connections<A: axum_server::Address, Acc>(
 pub(crate) struct Core {
     pub settings: Settings,
     pub hub: Hub,
-    pub assets: Assets,
+    pub assets: Arc<Assets>,
     pub sessions: Sessions,
     pub rejected_controls: AtomicU64,
+    /// Recordings and raw captures on disk.
+    pub store: Arc<Store>,
+    /// State of the record button, written by the pipeline thread.
+    pub record: recording::SharedRecordState,
+    /// One capture is imported at a time.
+    pub imports: Arc<Semaphore>,
+    /// Share archives being laid out.
+    pub zips: Arc<Semaphore>,
+    /// Checksums of shared recordings, by file name, with the length and
+    /// modification time (nanoseconds) of the file they were computed for.
+    pub share_sums: Mutex<std::collections::HashMap<String, (u64, u128, u32)>>,
+    /// Connections to `/ingest` that have not said a valid hello yet.
+    pub pending_hellos: Arc<Semaphore>,
+    /// The pairing token of this run: 32 lowercase hex digits. Whoever
+    /// holds it may send captures; it is never logged.
+    token: String,
+    /// Connection slots of the LAN listener.
+    lan_slots: Arc<Semaphore>,
     http_addr: SocketAddr,
     http_control: axum_server::Control,
     http_task: Mutex<Option<JoinHandle<io::Result<()>>>>,
@@ -370,11 +491,38 @@ impl Core {
     pub fn enter_session(self: &Arc<Self>) -> (u64, SessionGuard) {
         self.sessions.count.fetch_add(1, Ordering::AcqRel);
         let id = self.sessions.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        (id, SessionGuard(self.clone()))
+        (id, SessionGuard { core: self.clone(), phone: false })
     }
 
-    fn tuning(&self) -> http::TcpTuning {
-        http::TcpTuning { send_buffer: self.settings.send_buffer }
+    /// Registers the connection of a phone and returns its id (ids are
+    /// shared with the viewers', so one never names both).
+    pub fn enter_phone(self: &Arc<Self>) -> (u64, SessionGuard) {
+        self.sessions.phones.fetch_add(1, Ordering::AcqRel);
+        let id = self.sessions.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        (id, SessionGuard { core: self.clone(), phone: true })
+    }
+
+    pub fn pairing_token(&self) -> &str {
+        &self.token
+    }
+
+    /// One pairing URI per LAN address, the most plausible address first;
+    /// empty while LAN is off.
+    pub fn pairing_uris(&self) -> Vec<String> {
+        let lan = self.lan_view.read().unwrap_or_else(|p| p.into_inner()).0.clone();
+        lan.urls
+            .iter()
+            .filter_map(|url| {
+                let (host, port) = url.strip_prefix("https://")?.rsplit_once(':')?;
+                gs_core::ingest::pairing_uri(host, port.parse().ok()?, &lan.fingerprint, &self.token).ok()
+            })
+            .collect()
+    }
+
+    /// Socket options of the loopback listener (`lan: false`) or of the
+    /// LAN listener, which also bounds its connections.
+    fn tuning(&self, lan: bool) -> http::TcpTuning {
+        http::TcpTuning { send_buffer: self.settings.send_buffer, slots: lan.then(|| self.lan_slots.clone()) }
     }
 
     pub fn info(&self) -> ServerInfo {
@@ -454,7 +602,7 @@ impl Core {
         let tls = RustlsConfig::from_config(config);
         // The TLS handshake gets the same time as a request head.
         let acceptor =
-            RustlsAcceptor::new(tls.clone()).handshake_timeout(self.settings.request_timeout).acceptor(self.tuning());
+            RustlsAcceptor::new(tls.clone()).handshake_timeout(self.settings.request_timeout).acceptor(self.tuning(true));
         let server = axum_server::from_tcp(listener)?
             .acceptor(acceptor)
             .handle(axum_server::Handle::with_control(control.clone()));
@@ -547,14 +695,12 @@ impl Core {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         loop {
             let changed = self.sessions.changed.notified();
-            if self.sessions.count.load(Ordering::Acquire) == 0 {
+            let open = || self.sessions.count.load(Ordering::Acquire) + self.sessions.phones.load(Ordering::Acquire);
+            if open() == 0 {
                 break;
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                log::warn!(
-                    "arrêt : {} connexion(s) ne se sont pas fermées à temps",
-                    self.sessions.count.load(Ordering::Acquire)
-                );
+                log::warn!("arrêt : {} connexion(s) ne se sont pas fermées à temps", open());
                 break;
             }
         }
@@ -642,7 +788,74 @@ impl ServerHandle {
             rejected_controls: self.core.rejected_controls.load(Ordering::Relaxed),
             resyncs: hub.resyncs.load(Ordering::Relaxed),
             queued_bytes: hub.queued_bytes.load(Ordering::Relaxed),
+            phones: self.core.sessions.phones.load(Ordering::Acquire),
+            capture_frames: hub.capture_frames.load(Ordering::Relaxed),
+            capture_shown: hub.capture_shown.load(Ordering::Relaxed),
+            capturing: hub.capturing.load(Ordering::Relaxed),
         }
+    }
+
+    /// The `splatlive://pair` URI a phone scans to reach this server: LAN
+    /// address, port, certificate fingerprint and the token of this run
+    /// (`GET /api/pair`). `None` while LAN is off or the machine has no
+    /// network address. Treat it as a password for the capture routes.
+    pub fn pairing_uri(&self) -> Option<String> {
+        self.core.pairing_uris().into_iter().next()
+    }
+
+    /// The pairing token of this run (32 lowercase hex digits): what a
+    /// phone must present in its `hello` and with `POST /api/captures`.
+    /// Never log it.
+    pub fn pairing_token(&self) -> String {
+        self.core.pairing_token().to_string()
+    }
+
+    /// The directory recordings are written to, if there is one.
+    pub fn recordings_dir(&self) -> Option<PathBuf> {
+        self.core.store.dir(Kind::Recording).map(PathBuf::from)
+    }
+
+    /// The directory raw captures are kept in, if there is one.
+    pub fn captures_dir(&self) -> Option<PathBuf> {
+        self.core.store.dir(Kind::Capture).map(PathBuf::from)
+    }
+
+    /// State of the record button (`GET /api/record`).
+    pub fn record_state(&self) -> RecordState {
+        self.core.record.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The recordings of the recordings directory, newest first
+    /// (`GET /api/recordings`). Reads the directory: not for an async
+    /// thread.
+    pub fn recordings(&self) -> Vec<RecordingEntry> {
+        self.core.store.list_recordings()
+    }
+
+    /// Copies the recording `name` (a `name` of [`ServerHandle::recordings`],
+    /// without `.gsrec`) to `destination`, for a desktop shell whose web
+    /// view cannot download. Returns the bytes written; fails with
+    /// `ResourceBusy` while the recording is being written. Blocks on the
+    /// disk.
+    pub fn export_recording(&self, name: &str, destination: &std::path::Path) -> io::Result<u64> {
+        let file = format!("{name}{}", store::RECORDING_EXT);
+        let source = self
+            .core
+            .store
+            .existing(Kind::Recording, &file)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such recording"))?;
+        // Half a file would be exported, without its index.
+        if self.core.store.is_busy(Kind::Recording, &file) {
+            return Err(io::Error::new(io::ErrorKind::ResourceBusy, "the recording is still being written"));
+        }
+        std::fs::copy(source, destination)
+    }
+
+    /// Writes the share archive of the recording `name` to `destination`:
+    /// the bytes of `GET /api/share/<name>.zip`. Returns the bytes written.
+    /// Blocks on the disk.
+    pub fn export_share(&self, name: &str, destination: &std::path::Path) -> io::Result<u64> {
+        api::export_share(&self.core, name, destination)
     }
 
     /// Stops the server: viewers receive a WebSocket close (1001), both
@@ -667,14 +880,28 @@ async fn start_with(config: ServerConfig, addresses: AddressSource) -> Result<Se
     let listener = net::bind_near(wanted.ip(), wanted.port()).map_err(|source| Error::Bind { addr: wanted, source })?;
     let http_addr = listener.local_addr()?;
 
-    let assets = match &config.dist {
+    let assets = Arc::new(match &config.dist {
         Some(dir) => Assets::Dir(dir.clone()),
         None => Assets::embedded(),
-    };
+    });
     log::info!("serving the frontend from: {}", assets.describe());
     if !assets.has_index() {
         log::warn!("aucune interface web trouvée : une page d'explication est servie à la place");
     }
+
+    let store = Arc::new(Store::new(config.recordings_dir, config.captures_dir));
+    for kind in [Kind::Recording, Kind::Capture] {
+        if let Some(dir) = store.dir(kind) {
+            log::info!("{kind:?} files are kept in {}", dir.display());
+        }
+    }
+    // What a run that was killed left half received.
+    store.sweep_parts();
+    let record = recording::SharedRecordState::default();
+    let mut token = [0u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut token)
+        .map_err(|_| Error::Io(io::Error::other("no random numbers for the pairing token")))?;
+    let token: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
 
     let (stop, stop_rx) = watch::channel(false);
     let http_control = axum_server::Control::new();
@@ -687,11 +914,30 @@ async fn start_with(config: ServerConfig, addresses: AddressSource) -> Result<Se
             send_timeout: config.send_timeout,
             ping_interval: config.ping_interval,
             idle_timeout: config.idle_timeout,
+            keep_captures: config.keep_captures,
+            max_recording_bytes: config.max_recording_bytes,
+            max_upload_bytes: config.max_upload_bytes,
+            ingest: config.ingest,
         },
-        hub: Hub::start(config.pipeline)?,
+        hub: Hub::start_with(HubSetup {
+            pipeline: config.pipeline,
+            store: store.clone(),
+            record: record.clone(),
+            ingest: config.ingest,
+            max_recording_bytes: config.max_recording_bytes,
+            keep_captures: config.keep_captures,
+        })?,
         assets,
         sessions: Sessions::default(),
         rejected_controls: AtomicU64::new(0),
+        store,
+        record,
+        imports: Arc::new(Semaphore::new(1)),
+        zips: Arc::new(Semaphore::new(2)),
+        share_sums: Mutex::new(std::collections::HashMap::new()),
+        pending_hellos: Arc::new(Semaphore::new(MAX_PENDING_HELLOS)),
+        token,
+        lan_slots: Arc::new(Semaphore::new(config.max_lan_connections.max(1))),
         http_addr,
         http_control: http_control.clone(),
         http_task: Mutex::new(None),
@@ -714,7 +960,7 @@ async fn start_with(config: ServerConfig, addresses: AddressSource) -> Result<Se
 
     let app = http::router(core.clone(), Listener::Loopback, stop_rx);
     let server = axum_server::from_tcp(listener)?
-        .acceptor(core.tuning())
+        .acceptor(core.tuning(false))
         .handle(axum_server::Handle::with_control(http_control));
     let server = bound_idle_connections(server, core.settings.request_timeout);
     let task = tokio::spawn(server.serve(app.into_make_service()));

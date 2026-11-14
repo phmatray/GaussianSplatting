@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Une page qui intègre la visionneuse Splat Live</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 28px 32px;
+        background: #f4f1ea;
+        color: #23201b;
+        font: 16px/1.5 Georgia, "Times New Roman", serif;
+      }
+      main {
+        max-width: 1000px;
+        margin: 0 auto;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 28px;
+      }
+      p {
+        margin: 0 0 16px;
+      }
+      iframe {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        border: 0;
+        border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      }
+      footer {
+        margin-top: 14px;
+        color: #6b655a;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Répétition du 14 novembre</h1>
+      <p>La scène a été captée en volume. Faites-la tourner, mettez-la en pause, regardez-la en plein écran ou dans un casque.</p>
+      <!-- The address of the viewer is given by the page's own query: ?src=<encoded URL>.
+           The snippet is the one the share dialog of Splat Live hands out. -->
+      <iframe id="viewer" title="Visionneuse Splat Live" allow="fullscreen; xr-spatial-tracking" allowfullscreen></iframe>
+      <footer>Page de démonstration de l'intégration par &lt;iframe&gt; (e2e/app/embed.html).</footer>
+    </main>
+    <script>
+      const src = new URLSearchParams(location.search).get('src');
+      // Only an http(s) address is ever put in the frame.
+      if (src && /^https?:\/\//.test(src)) document.getElementById('viewer').src = src;
+    </script>
+  </body>
+</html>

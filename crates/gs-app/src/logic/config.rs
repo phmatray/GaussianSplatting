@@ -15,12 +15,28 @@ pub struct Resolution {
     pub height: u32,
 }
 
-/// Ring camera resolutions, all 4:3.
-pub const RESOLUTIONS: [Resolution; 4] = [
-    Resolution { label: "Basse", width: 96, height: 72 },
-    Resolution { label: "Moyenne", width: 120, height: 90 },
-    Resolution { label: "Haute", width: 160, height: 120 },
-    Resolution { label: "Max", width: 240, height: 180 },
+/// Ring camera resolutions, all 4:3: `PipelineConfig::RIG_RESOLUTIONS`, the
+/// light preset's, the default and the finest that still runs live.
+pub const RESOLUTIONS: [Resolution; 3] = [
+    Resolution { label: "Légère", width: PipelineConfig::RIG_RESOLUTIONS[0].0, height: PipelineConfig::RIG_RESOLUTIONS[0].1 },
+    Resolution { label: "Standard", width: PipelineConfig::RIG_RESOLUTIONS[1].0, height: PipelineConfig::RIG_RESOLUTIONS[1].1 },
+    Resolution { label: "Fine", width: PipelineConfig::RIG_RESOLUTIONS[2].0, height: PipelineConfig::RIG_RESOLUTIONS[2].1 },
+];
+
+/// A cell size of the home scan the "Capture" section offers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellSize {
+    pub label: &'static str,
+    /// Edge of a fusion cell, meters.
+    pub meters: f32,
+}
+
+/// Scan cell presets: coarse and fast, the light preset's, the default.
+/// Finer cells would exceed the million cells the fusion keeps.
+pub const CELL_SIZES: [CellSize; 3] = [
+    CellSize { label: "4 cm", meters: 0.04 },
+    CellSize { label: "3,2 cm", meters: 0.032 },
+    CellSize { label: "2,4 cm", meters: 0.024 },
 ];
 
 /// Range of the camera count slider.
@@ -31,6 +47,20 @@ pub const WALK_SPEED_RANGE: (f32, f32) = (0.3, 2.5);
 /// Index into [`RESOLUTIONS`] of the preset the rig currently uses.
 pub fn resolution_index(config: &PipelineConfig) -> Option<usize> {
     RESOLUTIONS.iter().position(|r| r.width == config.rig.width && r.height == config.rig.height)
+}
+
+/// Index into [`CELL_SIZES`] of the cell size the scan currently uses.
+pub fn cell_size_index(config: &PipelineConfig) -> Option<usize> {
+    CELL_SIZES.iter().position(|c| (c.meters - config.scan.voxel_size).abs() < 5e-4)
+}
+
+pub fn patch_cell_size(cell: CellSize) -> Value {
+    json!({ "scan": { "voxel_size": cell.meters } })
+}
+
+/// Multi-view fusion of the ring cameras on or off.
+pub fn patch_fusion(on: bool) -> Value {
+    json!({ "fusion": { "enabled": on } })
 }
 
 pub fn patch_camera_count(count: u32) -> Value {
@@ -137,8 +167,16 @@ mod tests {
         let c = apply(base, patch_camera_count(9));
         assert_eq!(c, PipelineConfig { rig: RingRig { count: 9, ..base.rig }, ..base });
 
-        let c = apply(base, patch_resolution(RESOLUTIONS[3]));
-        assert_eq!(c, PipelineConfig { rig: RingRig { width: 240, height: 180, ..base.rig }, ..base });
+        let c = apply(base, patch_resolution(RESOLUTIONS[2]));
+        assert_eq!(c, PipelineConfig { rig: RingRig { width: 320, height: 240, ..base.rig }, ..base });
+
+        let c = apply(base, patch_fusion(false));
+        assert!(base.fusion.enabled && !c.fusion.enabled);
+        assert_eq!(PipelineConfig { fusion: base.fusion, ..c }, base);
+
+        let c = apply(base, patch_cell_size(CELL_SIZES[0]));
+        assert_eq!(c.scan.voxel_size, 0.04);
+        assert_eq!(PipelineConfig { scan: base.scan, ..c }, base);
 
         let c = apply(base, patch_noise(true));
         assert_eq!(c, PipelineConfig { noise: NoiseModel::realistic(), ..base });
@@ -167,6 +205,19 @@ mod tests {
         assert!(resolution_index(&PipelineConfig::for_scene(SceneKind::Stage)).is_some());
         let odd = PipelineConfig { rig: RingRig { width: 100, ..RingRig::default() }, ..PipelineConfig::default() };
         assert_eq!(resolution_index(&odd), None);
+        // The presets are the resolutions the pipeline recommends.
+        assert_eq!(RESOLUTIONS.map(|r| (r.width, r.height)), PipelineConfig::RIG_RESOLUTIONS);
+    }
+
+    #[test]
+    fn cell_presets_are_valid_and_found() {
+        for (i, preset) in CELL_SIZES.iter().enumerate() {
+            let c = apply(PipelineConfig::default(), patch_cell_size(*preset));
+            assert_eq!(c.scan.voxel_size, preset.meters, "{}", preset.label);
+            assert_eq!(cell_size_index(&c), Some(i));
+        }
+        assert!(cell_size_index(&PipelineConfig::light(SceneKind::House)).is_some());
+        assert!(cell_size_index(&PipelineConfig::for_scene(SceneKind::House)).is_some());
     }
 
     #[test]
@@ -190,7 +241,7 @@ mod tests {
         queue.push(patch_shadows(false));
         assert!(!queue.is_empty());
         let Some(ControlMsg::PatchConfig { patch }) = queue.take() else { panic!("expected a patch") };
-        assert_eq!(patch, json!({ "rig": { "count": 7, "width": 96, "height": 72 }, "shadows": false }));
+        assert_eq!(patch, json!({ "rig": { "count": 7, "width": 160, "height": 120 }, "shadows": false }));
         assert!(queue.is_empty());
     }
 }

@@ -29,6 +29,7 @@ fn state(core: &Core) -> Value {
     let config = ui.config.get_untracked();
     let link = ui.link.get_untracked();
     let counters = core.counters();
+    let pair = ui.pair.with_untracked(|pair| json!({ "qr": pair.qr.is_some(), "busy": pair.busy, "error": pair.error }));
     let xr_session = viewer.xr_info().map(|info| {
         json!({
             "frames": info.frames,
@@ -52,6 +53,8 @@ fn state(core: &Core) -> Value {
             "height": c.rig.height,
             "noise": !c.noise.is_none(),
             "shadows": c.shadows,
+            "fusion": c.fusion.enabled,
+            "voxelSize": c.scan.voxel_size,
             "backgroundSubtraction": c.background_subtraction,
             "paused": c.paused,
             "targetHz": c.target_hz,
@@ -72,12 +75,16 @@ fn state(core: &Core) -> Value {
             "canvasWidth": stats.canvas_width,
             "canvasHeight": stats.canvas_height,
             "sorts": stats.sorts,
+            "blend": stats.blend.active.as_str(),
+            "blendReason": stats.blend.reason.as_str(),
+            "blendFallback": stats.blend.reason.is_fallback(),
         },
         "nav": match viewer.nav_mode() { NavMode::Orbit => "orbit", NavMode::Fly => "fly" },
         "eye": vec3(viewer.eye()),
         "target": vec3(viewer.target()),
         "display": {
             "splatScale": params.splat_scale,
+            "blend": display.blend.id(),
             "pointMode": params.point_mode,
             "gizmos": params.show_gizmos,
             "showStatic": params.show_static,
@@ -103,6 +110,10 @@ fn state(core: &Core) -> Value {
             "layers": counters.layers,
             "previews": counters.previews,
             "droppedLayers": counters.dropped_layers,
+            "largestBytes": counters.largest_bytes,
+            "largestMs": counters.largest_ms,
+            "slowestMs": counters.slowest_ms,
+            "slowestBytes": counters.slowest_bytes,
             "batches": core.batches_received(),
         },
         "previewCount": counters.previews,
@@ -118,6 +129,49 @@ fn state(core: &Core) -> Value {
         "notice": ui.notice.get_untracked().map(|n| json!({ "error": n.error, "text": n.text })),
         "transferBytesPerSecond": ui.transfer_rate.get_untracked(),
         "server": ui.server.get_untracked().map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
+        "embed": ui.embed.get_untracked(),
+        "replay": ui.replay.get_untracked().map(|view| {
+            let seeks = core.seek_stats();
+            json!({
+                "title": view.name(),
+                "origin": match &view.origin {
+                    crate::state::ReplayOrigin::Url(url) => json!({ "url": url }),
+                    crate::state::ReplayOrigin::File => json!("file"),
+                    crate::state::ReplayOrigin::Memory(id) => json!({ "take": id }),
+                },
+                "status": serde_json::to_value(&view.status).unwrap_or(Value::Null),
+                "scrub": ui.scrub.get_untracked(),
+                "seeks": {
+                    "count": seeks.count,
+                    "lastMs": seeks.last_ms,
+                    "maxMs": seeks.max_ms,
+                    "meanMs": if seeks.count > 0 { seeks.total_ms / f64::from(seeks.count) } else { 0.0 },
+                },
+            })
+        }),
+        "recording": ui.recording.get_untracked().map(|r| json!({ "name": r.name, "bytes": r.bytes, "maxBytes": r.max_bytes, "durationS": r.duration_s })),
+        "takes": ui.takes.get_untracked().iter().map(|t| json!({
+            "id": t.id,
+            "place": match t.place { crate::state::TakePlace::Memory => "memory", crate::state::TakePlace::Server => "server" },
+            "title": t.title,
+            "file": t.file,
+            "bytes": t.bytes,
+            "durationS": t.duration_s,
+            "scene": t.scene,
+        })).collect::<Vec<_>>(),
+        "share": ui.share.get_untracked().map(|t| t.file),
+        "capture": ui.capture.get_untracked().map(|c| json!({
+            "info": serde_json::to_value(&c.info).unwrap_or(Value::Null),
+            "stats": c.stats.map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
+            "state": crate::logic::capture::CaptureState::of(c.stats.as_ref()).id(),
+        })),
+        "import": ui.import.get_untracked().map(|i| json!({
+            "file": i.file,
+            "upload": i.upload,
+            "progress": serde_json::to_value(&i.progress).unwrap_or(Value::Null),
+        })),
+        "pair": pair,
+        "sceneName": core.scene_name(),
         "panelOpen": ui.panel_open.get_untracked(),
         "uiHidden": ui.ui_hidden.get_untracked(),
         "errors": core.errors(),

@@ -21,7 +21,7 @@ use web_sys::{
 use super::{Inner, FAR, NEAR};
 use crate::gizmo::LineBatch;
 use crate::normalized::Output;
-use crate::params::{XrInfo, XrViewInfo};
+use crate::params::{XrInfo, XrTransport, XrViewInfo};
 use crate::rig::{Locomotion, LocomotionContext, PadState, Rig, NOMINAL_EYE_HEIGHT};
 
 /// A button counts as pressed above this analog value.
@@ -87,7 +87,7 @@ pub(super) async fn supported() -> bool {
 
 /// Reads the `xr-standard` gamepad of a controller: `axes[2..4]` is the
 /// thumbstick (`[0..2]` are the unused touchpad slots), `buttons[0]` the
-/// trigger, `[4]` A/X and `[5]` B/Y.
+/// trigger, `[1]` the grip, `[4]` A/X and `[5]` B/Y.
 fn read_pad(gamepad: &Gamepad) -> PadState {
     let axes = gamepad.axes();
     let axis = |i: u32| axes.get(i).as_f64().unwrap_or(0.0) as f32;
@@ -105,6 +105,7 @@ fn read_pad(gamepad: &Gamepad) -> PadState {
         trigger: button(0) as f32,
         primary: button(4) > BUTTON_THRESHOLD,
         secondary: button(5) > BUTTON_THRESHOLD,
+        squeeze: button(1) as f32,
     }
 }
 
@@ -310,7 +311,24 @@ impl Inner {
         self.notify_xr(false);
     }
 
+    /// One XR animation frame: draws it, then tells the listeners what the
+    /// controllers asked of the time line. No borrow is held by then, so a
+    /// listener may call back into the viewer.
     pub(super) fn on_xr_frame(&self, time_ms: f64, frame: XrFrame) {
+        self.draw_xr_frame(time_ms, frame);
+        let events = std::mem::take(&mut *self.xr_transport_pending.borrow_mut());
+        if events.is_empty() {
+            return;
+        }
+        let listeners: Vec<_> = self.xr_transport_listeners.borrow().clone();
+        for event in events {
+            for listener in &listeners {
+                listener(event);
+            }
+        }
+    }
+
+    fn draw_xr_frame(&self, time_ms: f64, frame: XrFrame) {
         let start = self.now();
         let session = frame.session();
         let mut guard = self.xr.borrow_mut();
@@ -345,8 +363,23 @@ impl Inner {
                 grips[!is_left as usize] = Some((is_left, grip));
             }
         }
-        let ctx = LocomotionContext { options: self.xr_options.get(), hints: self.hints.get(), floor_rig_y: x.floor_rig_y };
+        let timeline = self.xr_timeline.get();
+        let ctx = LocomotionContext {
+            options: self.xr_options.get(),
+            hints: self.hints.get(),
+            floor_rig_y: x.floor_rig_y,
+            timeline: timeline.is_some(),
+        };
         let events = x.locomotion.update(&left, &right, &x.rig_from_head, dt, &ctx);
+        {
+            let mut pending = self.xr_transport_pending.borrow_mut();
+            if events.toggle_play {
+                pending.push(XrTransport::TogglePlay);
+            }
+            if events.scrub != 0.0 {
+                pending.push(XrTransport::Scrub(events.scrub));
+            }
+        }
         if let Some(on) = self.xr_miniature_request.take() {
             x.locomotion.set_miniature(on, &x.rig_from_head, &ctx);
         }
@@ -372,6 +405,17 @@ impl Inner {
                 x.controllers.push((*is_left, world_from_grip));
                 x.overlay.controller(&world_from_grip, *is_left);
             }
+        }
+        if let Some(timeline) = timeline {
+            // Above the left hand, tilted towards the eyes like a wrist
+            // watch; in front of the user while no left hand is tracked.
+            let panel = match x.controllers.iter().find(|(is_left, _)| *is_left) {
+                Some((_, world_from_grip)) => {
+                    *world_from_grip * Mat4::from_translation(glam::Vec3::new(0.0, 0.07, -0.05)) * Mat4::from_rotation_x(-0.6)
+                }
+                None => world_from_rig * x.rig_from_head * Mat4::from_translation(glam::Vec3::new(0.0, -0.12, -0.5)),
+            };
+            x.overlay.timeline(&panel, &timeline);
         }
 
         // ---- draw

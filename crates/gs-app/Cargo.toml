@@ -11,6 +11,9 @@ gs-core.workspace = true
 gs-render.workspace = true
 gs-worker = { path = "../gs-worker" }
 glam.workspace = true
+# QR codes of share links are drawn here: the server only draws the codes
+# of its own addresses.
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 serde.workspace = true
 serde_json.workspace = true
 
@@ -34,5 +37,6 @@ features = [
   "CanvasRenderingContext2d", "ImageData",
   "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "ErrorEvent",
   "Worker", "WorkerOptions", "WorkerType",
-  "RequestInit", "Response", "Headers", "AbortController", "AbortSignal",
+  "RequestInit", "Response", "Headers", "AbortController", "AbortSignal", "Storage", "Clipboard",
+  "HtmlTextAreaElement", "HtmlSelectElement",
 ]

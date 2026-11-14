@@ -3,17 +3,21 @@
 //! objects that are not reactive (viewer, transport) live in
 //! [`crate::core::Core`].
 
-use gs_core::protocol::{PipelineConfig, ScanState, Stats};
+use gs_core::protocol::{CaptureInfo, CaptureStats, PipelineConfig, ScanState, Stats};
 use gs_core::scene::SceneKind;
-use gs_render::{NavMode, ViewerStats};
+use gs_render::{BlendStatus, NavMode, ViewerStats};
+use gs_worker::{CaptureProgress, ReplayStatus};
 use leptos::prelude::*;
 
+use crate::logic::render::BlendChoice;
 use crate::logic::source::{Link, ServerInfo, SourceKind};
 
 /// Local display settings (never sent to the pipeline).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Display {
     pub nav: NavMode,
+    /// Blending the viewer is asked for.
+    pub blend: BlendChoice,
     pub splat_scale: f32,
     pub point_mode: bool,
     pub gizmos: bool,
@@ -28,6 +32,7 @@ impl Default for Display {
     fn default() -> Self {
         Self {
             nav: NavMode::Orbit,
+            blend: BlendChoice::Auto,
             splat_scale: 1.0,
             point_mode: false,
             gizmos: true,
@@ -52,6 +57,94 @@ pub struct ScanView {
 pub struct FileInfo {
     pub name: String,
     pub splats: usize,
+}
+
+/// Where a replay reads its recording.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayOrigin {
+    /// A URL: the `file` parameter of a link, or a recording of the server.
+    /// The value is what a share link would name.
+    Url(String),
+    /// A file the user opened.
+    File,
+    /// A recording made in memory during this visit, by its take id.
+    Memory(u32),
+}
+
+/// The recording being replayed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplayView {
+    /// Name shown while the file header has not been read.
+    pub title: String,
+    pub origin: ReplayOrigin,
+    pub status: ReplayStatus,
+}
+
+impl ReplayView {
+    /// Name of the recording: the one in its header, else the file's.
+    pub fn name(&self) -> &str {
+        if self.status.name.is_empty() { &self.title } else { &self.status.name }
+    }
+}
+
+/// Where a finished recording lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakePlace {
+    /// In the memory of this page (a `Blob`), until the page is closed.
+    Memory,
+    /// In the recordings directory of the native server.
+    Server,
+}
+
+/// A finished recording the interface lists.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Take {
+    /// Stable within the page: the key of the list.
+    pub id: u32,
+    pub place: TakePlace,
+    pub title: String,
+    /// File name (`danse.gsrec`).
+    pub file: String,
+    pub bytes: u64,
+    pub duration_s: f64,
+    pub scene: String,
+}
+
+/// A recording in progress.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordingView {
+    pub name: String,
+    pub bytes: u64,
+    /// The bound of an in-memory recording; `None` on the server's disk.
+    pub max_bytes: Option<u64>,
+    pub duration_s: f64,
+}
+
+/// A capture session of the phone companion (or of a capture file) as the
+/// interface follows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureView {
+    pub info: CaptureInfo,
+    pub stats: Option<CaptureStats>,
+}
+
+/// The import of a capture file: read by the local worker, or sent to the
+/// server.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImportView {
+    pub file: String,
+    /// The file goes to the server: there is no frame-by-frame progress.
+    pub upload: bool,
+    pub progress: CaptureProgress,
+}
+
+/// The pairing code for the phone companion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PairView {
+    /// `data:` URL of the QR code of the pairing URI.
+    pub qr: Option<String>,
+    pub busy: bool,
+    pub error: Option<String>,
 }
 
 /// A transient message at the bottom of the window.
@@ -86,6 +179,9 @@ pub struct Ui {
     pub pipeline_hz: RwSignal<Option<f32>>,
     pub scan: RwSignal<Option<ScanView>>,
     pub viewer_stats: RwSignal<ViewerStats>,
+    /// Blending the viewer really uses, read back regularly: a fallback
+    /// can come and go by itself.
+    pub blend: RwSignal<BlendStatus>,
     /// Bytes received per second.
     pub transfer_rate: RwSignal<f32>,
     pub display: RwSignal<Display>,
@@ -112,6 +208,23 @@ pub struct Ui {
     pub lan_error: RwSignal<Option<String>>,
     /// `data:` URL of the QR code of the LAN address.
     pub qr: RwSignal<Option<String>>,
+    /// The page is the embedded viewer (`embed=1`): canvas and small
+    /// playback controls only.
+    pub embed: RwSignal<bool>,
+    pub fullscreen: RwSignal<bool>,
+    /// The recording on screen, when the source is a replay.
+    pub replay: RwSignal<Option<ReplayView>>,
+    /// The play head while the user drags the time line, seconds.
+    pub scrub: RwSignal<Option<f64>>,
+    pub recording: RwSignal<Option<RecordingView>>,
+    /// A start or stop of the recorder is under way.
+    pub record_busy: RwSignal<bool>,
+    pub takes: RwSignal<Vec<Take>>,
+    /// The recording whose share dialog is open.
+    pub share: RwSignal<Option<Take>>,
+    pub capture: RwSignal<Option<CaptureView>>,
+    pub import: RwSignal<Option<ImportView>>,
+    pub pair: RwSignal<PairView>,
 }
 
 impl Ui {
@@ -128,6 +241,7 @@ impl Ui {
             pipeline_hz: RwSignal::new(None),
             scan: RwSignal::new(None),
             viewer_stats: RwSignal::new(ViewerStats::default()),
+            blend: RwSignal::new(BlendStatus::default()),
             transfer_rate: RwSignal::new(0.0),
             display: RwSignal::new(Display::default()),
             preview_depth: RwSignal::new(false),
@@ -146,6 +260,17 @@ impl Ui {
             lan_busy: RwSignal::new(false),
             lan_error: RwSignal::new(None),
             qr: RwSignal::new(None),
+            embed: RwSignal::new(false),
+            fullscreen: RwSignal::new(false),
+            replay: RwSignal::new(None),
+            scrub: RwSignal::new(None),
+            recording: RwSignal::new(None),
+            record_busy: RwSignal::new(false),
+            takes: RwSignal::new(Vec::new()),
+            share: RwSignal::new(None),
+            capture: RwSignal::new(None),
+            import: RwSignal::new(None),
+            pair: RwSignal::new(PairView::default()),
         }
     }
 

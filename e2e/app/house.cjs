@@ -18,7 +18,10 @@ async function run({ browser, url }) {
   check('house: the mode switch shows the active mode', (await page.locator('#mode-house').getAttribute('aria-selected')) === 'true' && (await page.locator('#mode-stage').getAttribute('aria-selected')) === 'false');
   s = await waitState(page, (s) => s.display.dollhouse);
   check('house: a running scan is shown from above, ceiling clipped', s.nav === 'orbit' && s.eye[1] > 5 && Math.abs(s.display.clipY - 2.35) < 1e-3, `eye y ${s.eye[1].toFixed(2)}, clip ${s.display.clipY}`);
-  check('house: the house starts with its own splat size', Math.abs(s.display.splatScale - 1.2) < 1e-6 && (await page.locator('output[for=splat-scale]').innerText()) === '× 1,20', await page.locator('output[for=splat-scale]').innerText());
+  // This suite draws sorted (see lib.cjs): the slider stays at 1 and the
+  // viewer widens the surfels itself. The sizes of the normalised modes
+  // are checked in the render suite.
+  check('house: the house starts with the splat size of its blending mode', s.viewer.blend === 'sorted' && Math.abs(s.display.splatScale - 1) < 1e-6 && (await page.locator('output[for=splat-scale]').innerText()) === '× 1,00', `${s.viewer.blend}, ${await page.locator('output[for=splat-scale]').innerText()}`);
 
   const n0 = s.layers.static;
   const p0 = s.scan.progress;
@@ -159,7 +162,7 @@ async function run({ browser, url }) {
   await sleep(500);
   const back = await viewShot(page, 'stage-after-house.png');
   const cb = await content(page, back);
-  check('house: switching back to the stage works', s.nav === 'orbit' && !s.display.dollhouse && s.display.clipY === null && s.display.splatScale === 1 && s.scan === null && s.previews.ids.length === 6 && cb.colors > 60 && (await page.locator('#toggle-dollhouse').count()) === 0,
+  check('house: switching back to the stage works', s.nav === 'orbit' && !s.display.dollhouse && s.display.clipY === null && s.display.splatScale === 1 && s.scan === null && s.previews.ids.length === 8 && cb.colors > 60 && (await page.locator('#toggle-dollhouse').count()) === 0,
     `${JSON.stringify(s.layers)}, colors ${cb.colors}`);
 
   s = await state(page);

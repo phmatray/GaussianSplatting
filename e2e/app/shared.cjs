@@ -102,7 +102,7 @@ async function run({ browser }) {
     // ---- controls follow the echoed State, whoever changes them
     for (const [who, action] of [
       [reference.page, (p) => setSlider(p, '#cam-count', 9)],
-      [page, (p) => p.click('#res-0')],
+      [page, (p) => p.click('#res-1')],
       [reference.page, (p) => p.click('#toggle-noise')],
       [page, (p) => p.click('#toggle-shadows')],
       [reference.page, (p) => p.click('#toggle-bg')],
@@ -121,7 +121,7 @@ async function run({ browser }) {
     await sleep(6500);
     const [a, b] = [await controlsMatch(page), await controlsMatch(reference.page)];
     const [sa, sb] = [await state(page), await state(reference.page)];
-    check('shared: after concurrent changes both clients show the same echoed configuration', a.ok && b.ok && JSON.stringify(sa.config) === JSON.stringify(sb.config) && sa.config.paused && sa.config.noise && !sa.config.shadows && !sa.config.backgroundSubtraction && sa.config.width === 96, `${a.detail} || ${b.detail}`);
+    check('shared: after concurrent changes both clients show the same echoed configuration', a.ok && b.ok && JSON.stringify(sa.config) === JSON.stringify(sb.config) && sa.config.paused && sa.config.noise && !sa.config.shadows && !sa.config.backgroundSubtraction && sa.config.width === 240, `${a.detail} || ${b.detail}`);
     await page.keyboard.press('p');
     await page.click('#toggle-bg');
     await page.click('#toggle-shadows');

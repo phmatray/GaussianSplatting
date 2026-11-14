@@ -23,6 +23,7 @@ use crate::nav::{perspective, NavMode, Navigator};
 use crate::normalized::Output;
 use crate::params::{
     ActiveBlend, Applied, BlendQuality, BlendStatus, LayerContent, RenderParams, SceneHints, ViewerOptions, ViewerStats, XrInfo, XrOptions,
+    XrTimeline, XrTransport,
     LAYER_COUNT,
 };
 use crate::splats::{SortKey, SortOutcome, SplatScene};
@@ -61,6 +62,8 @@ struct Callbacks {
 
 /// Callback of [`Viewer::on_xr_change`].
 type XrListener = Rc<dyn Fn(bool)>;
+/// Callback of [`Viewer::on_xr_transport`].
+type XrTransportListener = Rc<dyn Fn(XrTransport)>;
 
 struct Inner {
     window: Window,
@@ -88,6 +91,12 @@ struct Inner {
     xr_listeners: RefCell<Vec<XrListener>>,
     /// Miniature mode requested through the API, applied by the next XR frame.
     xr_miniature_request: Cell<Option<bool>>,
+    /// The time line shown in the headset, if any.
+    xr_timeline: Cell<Option<XrTimeline>>,
+    xr_transport_listeners: RefCell<Vec<XrTransportListener>>,
+    /// What the controllers asked of the time line in the frame being
+    /// drawn; the listeners are called once no borrow is held.
+    xr_transport_pending: RefCell<Vec<XrTransport>>,
     stats: Cell<ViewerStats>,
     /// Timestamp of the previous desktop frame, ms.
     last_frame_ms: Cell<Option<f64>>,
@@ -163,6 +172,9 @@ impl Viewer {
             xr_error: RefCell::new(None),
             xr_listeners: RefCell::new(Vec::new()),
             xr_miniature_request: Cell::new(None),
+            xr_timeline: Cell::new(None),
+            xr_transport_listeners: RefCell::new(Vec::new()),
+            xr_transport_pending: RefCell::new(Vec::new()),
             stats: Cell::new(ViewerStats::default()),
             last_frame_ms: Cell::new(None),
             dirty: Cell::new(true),
@@ -489,6 +501,23 @@ impl Viewer {
         if self.xr_active() {
             self.inner.xr_miniature_request.set(Some(on));
         }
+    }
+
+    /// Shows the time line of a replay in the headset (`None` removes it)
+    /// and hands its controls to the left controller: see [`XrTimeline`].
+    /// Cheap; call it whenever the play head moves.
+    pub fn set_xr_timeline(&self, timeline: Option<XrTimeline>) {
+        self.inner.xr_timeline.set(timeline);
+    }
+
+    pub fn xr_timeline(&self) -> Option<XrTimeline> {
+        self.inner.xr_timeline.get()
+    }
+
+    /// Registers a listener for what the controllers ask of the time line
+    /// (see [`XrTransport`]). Called from the XR frame, after it is drawn.
+    pub fn on_xr_transport(&self, f: impl Fn(XrTransport) + 'static) {
+        self.inner.xr_transport_listeners.borrow_mut().push(Rc::new(f));
     }
 
     // -------------------------------------------------------------- lifetime

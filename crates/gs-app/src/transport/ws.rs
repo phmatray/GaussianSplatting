@@ -19,8 +19,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket, Worker};
 
-use super::worker::spawn_worker;
-use super::Sink;
+use super::worker::{post_request, spawn_worker};
+use super::{parse_recording, Sink};
 use crate::logic::source::{reconnect_delay_ms, Link};
 
 /// Control messages kept while the socket is down. Older ones are dropped:
@@ -146,6 +146,15 @@ impl WsTransport {
     /// True while the socket lives in the relay worker.
     pub fn relayed(&self) -> bool {
         self.inner.is_relayed()
+    }
+
+    /// Sends a request to the relay worker itself (an in-memory recording
+    /// of the stream). `false` when the socket lives on the main thread.
+    pub fn request(&self, request: &WorkerRequest, file: Option<&web_sys::Blob>) -> bool {
+        match &*self.inner.channel.borrow() {
+            Channel::Relay { worker, .. } if self.inner.relay_ready.get() => post_request(worker, request, file),
+            _ => false,
+        }
     }
 }
 
@@ -400,14 +409,23 @@ impl Inner {
                 // Before it is ready the worker cannot have rejected a
                 // request: it failed to load.
                 Ok(WorkerEvent::Error { .. }) if !self.relay_ready.get() => self.fall_back(),
+                Ok(event @ WorkerEvent::Record(_)) => self.sink.on_event.as_ref()(event),
+                // The relay's own recorder refused (nothing to record yet).
+                Ok(WorkerEvent::Error { message }) if message.contains("record") => {
+                    self.sink.on_error.as_ref()(crate::logic::replay::worker_refusal_text(&message));
+                }
                 // A control message that met a closing socket. The State
                 // that follows the reconnection is the truth.
-                Ok(WorkerEvent::Error { .. }) | Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
             return;
         }
-        // A batch: [id, buffer, buffer, ...].
+        // A batch: [id, buffer, buffer, ...], or a finished recording.
         let Ok(batch) = data.dyn_into::<js_sys::Array>() else { return };
+        if let Some((meta, parts)) = parse_recording(&batch) {
+            self.sink.on_recording.as_ref()(meta, parts);
+            return;
+        }
         let Some(id) = batch.get(0).as_f64() else { return };
         if !self.relay_stale.get() {
             for item in batch.iter().skip(1) {

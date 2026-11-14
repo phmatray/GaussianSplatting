@@ -166,6 +166,41 @@ impl LineBatch {
         }
     }
 
+    /// The time line of a replay, in the plane of `world_from_panel` (x to
+    /// the right, y up, the origin at the middle of the bar): the loaded
+    /// part, the part played, the play head, and to the left a triangle
+    /// while it plays or two bars while it is paused. Sizes are real
+    /// meters when the matrix carries the rig scale.
+    pub fn timeline(&mut self, world_from_panel: &Mat4, timeline: &crate::XrTimeline) {
+        const HALF: f32 = 0.08;
+        const TRACK: [f32; 3] = [0.55, 0.6, 0.7];
+        const PLAYED: [f32; 3] = [0.36, 0.78, 1.0];
+        let p = |x: f32, y: f32| world_from_panel.transform_point3(Vec3::new(x, y, 0.0));
+        let at = |fraction: f32| -HALF + 2.0 * HALF * if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+        self.segment(p(-HALF, 0.0), p(HALF, 0.0), TRACK, 0.45, 2.0);
+        let (played, loaded) = (at(timeline.progress), at(timeline.buffered));
+        if loaded > played {
+            self.segment(p(played, 0.0), p(loaded, 0.0), TRACK, 0.9, 3.0);
+        }
+        if played > -HALF {
+            self.segment(p(-HALF, 0.0), p(played, 0.0), PLAYED, 1.0, 4.0);
+        }
+        // The play head.
+        self.segment(p(played, -0.008), p(played, 0.008), [1.0, 1.0, 1.0], 1.0, 3.0);
+        // The state, left of the bar.
+        let x = -HALF - 0.022;
+        if timeline.playing {
+            let (a, b, c) = (p(x - 0.006, 0.008), p(x - 0.006, -0.008), p(x + 0.008, 0.0));
+            for (from, to) in [(a, b), (b, c), (c, a)] {
+                self.segment(from, to, PLAYED, 1.0, 2.5);
+            }
+        } else {
+            for dx in [-0.004, 0.004] {
+                self.segment(p(x + dx, 0.008), p(x + dx, -0.008), [1.0, 1.0, 1.0], 1.0, 3.0);
+            }
+        }
+    }
+
     /// A tracked VR controller: a short pointing ray and a small cross at the
     /// grip. `world_from_grip` carries the rig scale, so the sizes below are
     /// real meters.
@@ -259,6 +294,29 @@ mod tests {
         let mut empty = LineBatch::default();
         empty.scene(&GizmoScene::default());
         assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn timeline_gizmo_shows_progress_and_state() {
+        let length = |s: &(Vec3, Vec3)| (s.0 - s.1).length();
+        let mut batch = LineBatch::default();
+        batch.timeline(&Mat4::IDENTITY, &crate::XrTimeline { progress: 0.25, buffered: 0.75, playing: true });
+        let segs = segments(&batch);
+        // Track, loaded, played, head, triangle.
+        assert_eq!(segs.len(), 7);
+        assert!((length(&segs[0]) - 0.16).abs() < 1e-6);
+        assert!((length(&segs[1]) - 0.08).abs() < 1e-6 && (length(&segs[2]) - 0.04).abs() < 1e-6);
+        assert!((segs[3].0.x + 0.04).abs() < 1e-6, "head at a quarter");
+        // Paused at the start: track, head, two bars; nothing is played.
+        let mut batch = LineBatch::default();
+        batch.timeline(&Mat4::IDENTITY, &crate::XrTimeline { progress: f32::NAN, buffered: 0.0, playing: false });
+        assert_eq!(batch.len(), 4);
+        // Out-of-range values stay on the bar.
+        let mut batch = LineBatch::default();
+        batch.timeline(&Mat4::from_translation(Vec3::Y), &crate::XrTimeline { progress: 7.0, buffered: -3.0, playing: false });
+        for (a, b) in segments(&batch) {
+            assert!(a.x.abs() <= 0.11 && b.x.abs() <= 0.11 && (a.y - 1.0).abs() < 0.01);
+        }
     }
 
     #[test]

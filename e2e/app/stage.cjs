@@ -31,7 +31,8 @@ async function run({ browser, url }) {
   check('stage: falls back to the local worker on a static host', s.source === 'worker' && s.connected, `source ${s.source}, link ${s.link}`);
   const badge = await page.locator('#source-badge').innerText();
   check('stage: the badge names the source', /Local \(WASM\)/.test(badge) && (await page.locator('#source-badge').getAttribute('data-link')) === 'connected', badge);
-  check('stage: first State describes the light stage', s.scene === 'stage' && s.config.cameras === 6 && s.config.width === 120 && !s.config.paused, JSON.stringify(s.config));
+  // The light preset of the quality round: eight 160x120 cameras, fused.
+  check('stage: first State describes the light stage', s.scene === 'stage' && s.config.cameras === 8 && s.config.width === 160 && s.config.height === 120 && s.config.targetHz === 20 && s.config.fusion && !s.config.paused, JSON.stringify(s.config));
   check('stage: both layers hold splats', s.layers.static > 1000 && s.layers.dynamic > 100, JSON.stringify(s.layers));
   check('stage: orbit navigation by default', s.nav === 'orbit' && !s.display.dollhouse);
   await shot(page, 'stage.png');
@@ -65,13 +66,14 @@ async function run({ browser, url }) {
   check('stage: the transfer rate is measured', true, shown.rate);
 
   // ---- thumbnails
-  await waitState(page, (s) => s.previews.ids.length === 6 && Object.keys(s.previews.painted).length === 6, 20000);
-  const before = await Promise.all([0, 1, 2, 3, 4, 5].map((id) => thumb(page, id)));
+  const cams = [0, 1, 2, 3, 4, 5, 6, 7];
+  await waitState(page, (s) => s.previews.ids.length === 8 && Object.keys(s.previews.painted).length === 8, 20000);
+  const before = await Promise.all(cams.map((id) => thumb(page, id)));
   check('stage: one painted thumbnail per camera', before.every((t) => t && t.width >= 32 && t.colors > 8 && t.shown), JSON.stringify(before.map((t) => t && `${t.width}x${t.height}/${t.colors}`)));
   await waitState(page, (s, n) => Object.values(s.previews.painted).every((v) => v >= n), 20000, Math.max(...Object.values((await state(page)).previews.painted)) + 3);
-  const after = await Promise.all([0, 1, 2, 3, 4, 5].map((id) => thumb(page, id)));
+  const after = await Promise.all(cams.map((id) => thumb(page, id)));
   const changed = after.filter((t, i) => t.hash !== before[i].hash).length;
-  check('stage: the thumbnails are live', changed >= 4, `${changed}/6 changed`);
+  check('stage: the thumbnails are live', changed >= 5, `${changed}/8 changed`);
   const rgb = await thumb(page, 0);
   await page.click('#preview-mode-1');
   await page.waitForFunction(() => window.__splatLive.state().previews.depth);
@@ -80,6 +82,15 @@ async function run({ browser, url }) {
   await page.locator('#section-cameras').scrollIntoViewIfNeeded();
   await shot(page, 'stage-thumbnails-depth.png');
   await page.click('#preview-mode-0');
+
+  // ---- multi-view fusion: without it the eight cameras' splats are stacked
+  const fused = (await state(page)).layers.dynamic;
+  check('stage: the statistics show the fusion time', /ms/.test(await page.locator('#stat-fuse').innerText()), await page.locator('#stat-fuse').innerText());
+  await page.click('#toggle-fusion');
+  s = await waitState(page, (s, n) => !s.config.fusion && s.layers.dynamic > n * 1.3, 30000, fused);
+  check('stage: the fusion switch reaches the pipeline (stacked views hold more splats)', !s.config.fusion && (await page.locator('#toggle-fusion').getAttribute('aria-checked')) === 'false', `${fused} fused, ${s.layers.dynamic} stacked`);
+  await page.click('#toggle-fusion');
+  await waitState(page, (s, n) => s.config.fusion && s.layers.dynamic < n * 1.2, 30000, fused);
 
   // ---- pause and resume
   await page.click('#btn-pause');
@@ -102,14 +113,23 @@ async function run({ browser, url }) {
   check('stage: the slider shows the echoed value', (await page.inputValue('#cam-count')) === '3' && (await page.locator('output[for=cam-count]').innerText()) === '3');
   check('stage: thumbnails follow the camera count', (await page.locator('#tiles canvas').count()) === 3);
 
+  // The presets are PipelineConfig::RIG_RESOLUTIONS; the light preset starts on the first.
+  const presets = await page.locator('#section-capture [id^=res-]:not(#res-label):not(#res-text)').allInnerTexts();
+  check('stage: the resolution presets are the ones the pipeline recommends', presets.join('|') === 'Légère|Standard|Fine' && (await page.locator('#res-0').getAttribute('aria-checked')) === 'true', presets.join('|'));
+  await page.click('#res-1');
+  s = await waitState(page, (s) => s.config.width === 240 && s.config.height === 180);
+  check('stage: resolution preset', (await page.locator('#res-1').getAttribute('aria-checked')) === 'true' && /240 × 180/.test(await page.locator('#res-text').innerText()), await page.locator('#res-text').innerText());
   await page.click('#res-0');
-  s = await waitState(page, (s) => s.config.width === 96 && s.config.height === 72);
-  check('stage: resolution preset', (await page.locator('#res-0').getAttribute('aria-checked')) === 'true' && /96 × 72/.test(await page.locator('#res-text').innerText()), await page.locator('#res-text').innerText());
+  await waitState(page, (s) => s.config.width === 160 && s.config.height === 120);
+
+
 
   const staticBefore = s.layers.static;
   await page.click('#toggle-bg');
   s = await waitState(page, (s) => !s.config.backgroundSubtraction && s.layers.static === 0);
-  check('stage: without background subtraction everything is in the live layer', s.layers.static === 0 && s.layers.dynamic > staticBefore / 2, JSON.stringify(s.layers));
+  // The whole scene, fused across the views: fewer splats than the plate
+  // of the same cameras, which is not fused.
+  check('stage: without background subtraction everything is in the live layer', s.layers.static === 0 && s.layers.dynamic > staticBefore / 4, `${JSON.stringify(s.layers)}, the plate held ${staticBefore}`);
   await page.click('#toggle-bg');
   await waitState(page, (s) => s.config.backgroundSubtraction && s.layers.static > 0);
   await page.click('#toggle-noise');
@@ -124,6 +144,7 @@ async function run({ browser, url }) {
   // ---- resume, with the keyboard
   await page.keyboard.press('p');
   s = await waitState(page, (s) => !s.config.paused);
+
   const r1 = await viewShot(page, 'stage-resumed-a.png');
   await sleep(700);
   const r2 = await viewShot(page, 'stage-resumed-b.png');

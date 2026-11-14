@@ -27,14 +27,17 @@ PNG=$OUT/tauri-$PROFILE.png
 
 echo "== run under Xvfb"
 export BIN LOG PNG
-# The application data (certificate) goes to a scratch home.
-export XDG_DATA_HOME=$OUT/data SPLAT_LIVE_VERBOSE=1
+# The application data (certificate, recordings, exports) goes to a
+# scratch home, emptied first.
+rm -rf "$OUT/data" "$OUT/config"
+export XDG_DATA_HOME=$OUT/data XDG_CONFIG_HOME=$OUT/config SPLAT_LIVE_VERBOSE=1
 xvfb-run -a -s "-screen 0 1280x800x24" bash -c '
   "$BIN" > "$LOG" 2>&1 &
   PID=$!
-  # Wait until the page reports frames through its logged request.
-  for i in $(seq 1 80); do
-    grep -q "report=.*%22frames%22%3A[1-9][0-9]" "$LOG" 2>/dev/null && break
+  # Wait until the page reports frames and the end of its recording
+  # checks through its logged request.
+  for i in $(seq 1 120); do
+    grep -q "report=.*%22frames%22%3A[1-9][0-9].*%22pair%22" "$LOG" 2>/dev/null && break
     kill -0 $PID 2>/dev/null || { echo "the application exited early"; break; }
     sleep 0.5
   done
@@ -62,8 +65,28 @@ check "frames are codec messages"                 "report=.*%22magic%22%3A%22GSL
 check "POST /api/lan from the webview"            "POST /api/lan \(origin [a-z:/.]+\) -> 200"
 check "QR image shown"                            "report=.*%22qr%22%3A%22[0-9]+x[0-9]+%22"
 check "WebAssembly allowed by the CSP"            "report=.*%22wasm%22%3Atrue"
+check "POST /api/record from the webview"         "report=.*%22record%22%3Atrue"
+check "a recording read by ranges (CORS)"         "report=.*%22range%22%3Atrue"
+check "the recording is listed"                   "report=.*%22listed%22%3Atrue"
+check "export_recording wrote both files"         "report=.*%22exports%22%3Atrue"
+check "hostile names are refused by the commands" "report=.*%22export_refused%22%3Atrue.*%22reveal_refused%22%3Atrue"
+check "pairing QR image shown"                    "report=.*%22pair%22%3A%22[0-9]+x[0-9]+%22"
 check "no error reported by the page"             "report=.*%22errors%22%3A%5B%5D"
 check "clean shutdown on SIGTERM"                 "server stopped"
+# The exported files exist where the log says, and the archive is whole.
+EXPORTS=$(grep -o "exported [A-Za-z]* of .* to .* ([0-9]* bytes)" "$LOG" | sed -E "s/^exported [A-Za-z]* of .* to (.*) \([0-9]* bytes\)$/\1/")
+COUNT=0
+while IFS= read -r FILE; do
+  [ -n "$FILE" ] || continue
+  if [ -s "$FILE" ]; then COUNT=$((COUNT + 1)); else echo "FAIL exported file missing: $FILE"; FAIL=1; fi
+  case "$FILE" in
+    *.zip) python3 -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; assert {'index.html', 'share.json', 'recording.gsrec'} <= set(z.namelist())" "$FILE" \
+             && echo "ok   the exported archive is a whole share archive" || { echo "FAIL the exported archive is damaged"; FAIL=1; } ;;
+    *.gsrec) python3 "$ROOT/tools/gsrec.py" verify "$FILE" > /dev/null \
+             && echo "ok   the exported recording verifies (tools/gsrec.py)" || { echo "FAIL the exported recording does not verify"; FAIL=1; } ;;
+  esac
+done <<< "$EXPORTS"
+[ "$COUNT" = 2 ] && echo "ok   two files exported" || { echo "FAIL $COUNT exported file(s) instead of 2"; FAIL=1; }
 [ -s "$PNG" ] && echo "screenshot: $PNG" || { echo "FAIL no screenshot"; FAIL=1; }
 echo "log: $LOG"
 exit $FAIL

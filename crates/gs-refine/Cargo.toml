@@ -1,0 +1,31 @@
+[package]
+name = "gs-refine"
+description = "Offline mode: optimises Gaussians against the photographs of a recorded capture (CPU, rayon)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "gs_refine"
+
+[[bin]]
+name = "gs-refine"
+path = "src/bin/gs-refine.rs"
+
+[dependencies]
+gs-core = { workspace = true, features = ["par"] }
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Depth maps of the nerfstudio export (16-bit PNG).
+png.workspace = true
+# Ctrl-C of the command-line tool: stop cleanly and keep the best result.
+ctrlc = "3.4"
+# Processor time of a run next to its wall time (the report states both).
+cpu-time = "1.0"
+bytemuck.workspace = true
+
+[dev-dependencies]
+# The capture simulator of gs-core (`tests/ingest_sim`), shared by path.
+jpeg-encoder = "0.7"

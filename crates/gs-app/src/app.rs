@@ -8,8 +8,9 @@ use wasm_bindgen::JsCast;
 
 use crate::core::{self, with_core};
 use crate::dom;
+use crate::logic::replay::{SKIP_S, STEP_S};
 use crate::state::Ui;
-use crate::ui::{Overlays, Panel, TopBar};
+use crate::ui::{Overlays, Panel, ShareDialog, Timeline, TopBar};
 
 /// Up to this window width the panel starts closed and is a sheet at the
 /// bottom (the same breakpoint as in `style.css`).
@@ -42,10 +43,31 @@ fn install_window_listeners(ui: Ui) {
         if event.ctrl_key() || event.meta_key() || event.alt_key() || event.repeat() || typing(&event) {
             return;
         }
+        let replay = ui.replay.with_untracked(Option::is_some);
         match event.key().to_lowercase().as_str() {
-            "h" => ui.ui_hidden.update(|hidden| *hidden = !*hidden),
+            "h" if !ui.embed.get_untracked() => ui.ui_hidden.update(|hidden| *hidden = !*hidden),
             "p" => with_core(|core| core.toggle_pause()),
-            "escape" => ui.ui_hidden.set(false),
+            "r" if !replay => with_core(|core| core.toggle_record()),
+            "escape" => {
+                // The dialog first, then the hidden interface.
+                if ui.share.with_untracked(Option::is_some) {
+                    ui.share.set(None);
+                } else {
+                    ui.ui_hidden.set(false);
+                }
+            }
+            // The time line of a replay. None of these is a fly key.
+            "k" if replay => with_core(|core| core.replay_toggle()),
+            "j" if replay => with_core(|core| core.replay_seek_by(-SKIP_S)),
+            "l" if replay => with_core(|core| core.replay_seek_by(SKIP_S)),
+            "," if replay => with_core(|core| core.replay_seek_by(-STEP_S)),
+            "." if replay => with_core(|core| core.replay_seek_by(STEP_S)),
+            "home" if replay => with_core(|core| core.replay_seek(0.0)),
+            "end" if replay => with_core(|core| core.replay_end()),
+            "b" if replay => with_core(|core| {
+                let looping = core.ui.replay.with_untracked(|view| view.as_ref().is_some_and(|v| v.status.looping));
+                core.replay_loop(!looping);
+            }),
             _ => {}
         }
     });
@@ -54,10 +76,14 @@ fn install_window_listeners(ui: Ui) {
     // would then seem dead. Pointer users get the focus back on the view.
     let _ = window_event_listener(ev::pointerup, move |event| {
         let Some(element) = event.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return };
-        if element.closest("input[type=range], .toggle, .segmented, .tile").ok().flatten().is_some() {
+        if element.closest("input[type=range], .toggle, .segmented, .tile, .tl-btn").ok().flatten().is_some() {
             request_animation_frame(dom::blur_active_element);
         }
     });
+
+    // Full screen is entered and left asynchronously, and also by the
+    // browser's own keys: the button follows the event.
+    let _ = window_event_listener_untyped("fullscreenchange", move |_| ui.fullscreen.set(dom::is_fullscreen()));
 
     // Drag and drop of a splat file anywhere on the window.
     let _ = window_event_listener(ev::dragover, move |event| {
@@ -79,7 +105,7 @@ fn install_window_listeners(ui: Ui) {
         }
         event.prevent_default();
         if let Some(file) = event.data_transfer().and_then(|data| data.files()).and_then(|files| files.get(0)) {
-            with_core(|core| core.import_file(file));
+            with_core(|core| core.open_file(file));
         }
     });
 }
@@ -107,14 +133,22 @@ pub fn App() -> impl IntoView {
             id="app"
             class:ui-hidden=move || ui.ui_hidden.get()
             class:xr=move || ui.xr_active.get()
-            class:panel-open=move || ui.panel_open.get()
+            // The embedded viewer has no panel for the overlays to keep clear of.
+            class:panel-open=move || ui.panel_open.get() && !ui.embed.get()
+            class:embed=move || ui.embed.get()
+            class:replay=move || ui.replay.with(Option::is_some)
         >
             <div class="viewport">
                 <canvas id="view" node_ref=canvas></canvas>
             </div>
-            <TopBar />
-            <Panel />
+            // The embedded viewer is the canvas and its small controls.
+            <Show when=move || !ui.embed.get()>
+                <TopBar />
+                <Panel />
+            </Show>
             <Overlays />
+            <Timeline />
+            <ShareDialog />
         </div>
     }
 }

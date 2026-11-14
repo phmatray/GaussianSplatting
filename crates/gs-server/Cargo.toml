@@ -46,6 +46,9 @@ socket2 = "0.6"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 mime_guess = "2"
 percent-encoding = "2"
+# The share archive: checksums and deflate of the web build's files.
+crc32fast = "1"
+miniz_oxide.workspace = true
 log = { version = "0.4", features = ["std"] }
 
 [dev-dependencies]
@@ -57,3 +60,5 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tempfile = "3"
 flate2 = "1"
+# The simulated phone of the gs-core tests (tests/common/phone.rs) writes JPEGs.
+jpeg-encoder = "0.7"

@@ -2,8 +2,12 @@
 //! everything that happens when a wire message arrives. Views read the
 //! signals in [`Ui`] and call the methods of [`Core`].
 
+mod capture;
+mod record;
+mod replay;
+
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -20,11 +24,15 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 use crate::logic::config::PatchQueue;
 use crate::logic::files::{self, FileFormat};
 use crate::logic::rate::RateMeter;
+use crate::logic::render::{recommended_splat_scale, BlendChoice};
+use crate::logic::share::{ShareManifest, ViewerParams};
 use crate::logic::source::{api_url, forced_source, is_loopback_base, ws_url, Link, ServerInfo, SourceKind};
 use crate::logic::{depth, present};
-use crate::state::{Display, FileInfo, Notice, ScanView, Ui};
-use crate::transport::{Sink, Transport};
+use crate::state::{CaptureView, Display, FileInfo, Notice, ScanView, Ui};
+use crate::transport::{ReplayLink, Sink, Transport};
 use crate::{dom, net, tauri};
+
+pub use replay::{ReplayStart, SeekStats};
 
 /// Quiet time after the last change of a control before the configuration
 /// patch is sent, in milliseconds.
@@ -41,6 +49,13 @@ const MAX_ERRORS: usize = 50;
 const NEW_SCAN_PROGRESS: f32 = 0.02;
 /// Time given to `GET /api/info` before the page falls back to the worker.
 const INFO_TIMEOUT_MS: i32 = 2500;
+/// Local storage key of the rendering choice.
+const BLEND_KEY: &str = "splat-live.blend";
+/// Time given to `share.json`, which only an unpacked share archive has.
+const MANIFEST_TIMEOUT_MS: i32 = 1500;
+/// The camera counts as untouched while it is this close to where the
+/// automatic framing of a capture left it, meters.
+const AUTO_VIEW_TOLERANCE: f32 = 1.0e-3;
 
 thread_local! {
     static CORE: RefCell<Option<Rc<Core>>> = const { RefCell::new(None) };
@@ -63,8 +78,16 @@ pub struct Counters {
     pub stats: u64,
     pub layers: u64,
     pub previews: u64,
-    /// Layer messages ignored while an imported file is shown.
+    /// Layer messages not applied: ignored while an imported file is
+    /// shown, or refused because the layer would grow beyond its bound.
     pub dropped_layers: u64,
+    /// Size of the largest message applied so far, and the time the main
+    /// thread spent applying it (decoding, GPU upload), milliseconds.
+    pub largest_bytes: u64,
+    pub largest_ms: f64,
+    /// Longest time spent applying one message, and its size.
+    pub slowest_ms: f64,
+    pub slowest_bytes: u64,
 }
 
 /// The latest thumbnail of one camera.
@@ -81,6 +104,21 @@ struct PreviewTile {
 struct FileSession {
     /// The pipeline was already paused: leave it paused afterwards.
     paused_before: bool,
+}
+
+/// How the live source waits while a recording (or the file of a link)
+/// owns the view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Suspended {
+    /// It does not: it is the source, or there is none yet.
+    No,
+    /// The local pipeline is on hold in its worker.
+    WorkerHeld,
+    /// The connection to the server was dropped and will be opened again.
+    ServerDropped,
+    /// The connection to the server was kept (its worker still had a
+    /// recording to hand over); its messages are ignored meanwhile.
+    ServerKept,
 }
 
 pub struct Core {
@@ -112,10 +150,35 @@ pub struct Core {
     handheld: Cell<Option<(ScanState, CameraInfo)>>,
     /// The viewer stands inside the scan head, whose gizmos are hidden.
     in_scan_head: Cell<bool>,
+    /// The user moved the splat size slider: the recommended size no longer
+    /// follows the blending mode, until the scene changes.
+    scale_custom: Cell<bool>,
     errors: RefCell<Vec<String>>,
     notice_serial: Cell<u32>,
     /// RGBA pixels of the thumbnail being painted.
     scratch: RefCell<Vec<u8>>,
+    /// The recording being replayed: while it is there, it is the source.
+    replay: RefCell<Option<ReplayLink>>,
+    suspended: Cell<Suspended>,
+    /// What a link asked of the replay, applied with its first picture.
+    replay_start: Cell<Option<ReplayStart>>,
+    /// The camera a link asked for the live scene, applied with its first State.
+    live_start: Cell<Option<ReplayStart>>,
+    seek_serial: Cell<u32>,
+    /// The latest seek asked for: its id and where it goes, seconds.
+    seek_target: Cell<Option<(u32, f64)>>,
+    /// Seeks on their way: `(id, clock value when sent)`.
+    seek_sent: RefCell<VecDeque<(u32, f64)>>,
+    seek_stats: Cell<SeekStats>,
+    /// Recordings made in memory, by take id.
+    blobs: RefCell<BTreeMap<u32, web_sys::Blob>>,
+    next_take: Cell<u32>,
+    /// Timer ticks since the start, to pace the recorder polls.
+    record_polls: Cell<u32>,
+    /// Where the automatic framing of a capture left the camera.
+    auto_eye: Cell<Option<Vec3>>,
+    /// A layer message was refused for its size (reported once per session).
+    layer_overflow: Cell<bool>,
 }
 
 /// Creates the viewer on `canvas` and starts everything else. Called once,
@@ -150,20 +213,83 @@ pub fn start(canvas: HtmlCanvasElement, ui: Ui) {
         overview_pending: Cell::new(false),
         handheld: Cell::new(None),
         in_scan_head: Cell::new(false),
+        scale_custom: Cell::new(false),
         errors: RefCell::new(Vec::new()),
         notice_serial: Cell::new(0),
         scratch: RefCell::new(Vec::new()),
+        replay: RefCell::new(None),
+        suspended: Cell::new(Suspended::No),
+        replay_start: Cell::new(None),
+        live_start: Cell::new(None),
+        seek_serial: Cell::new(0),
+        seek_target: Cell::new(None),
+        seek_sent: RefCell::new(VecDeque::new()),
+        seek_stats: Cell::new(SeekStats::default()),
+        blobs: RefCell::new(BTreeMap::new()),
+        next_take: Cell::new(1),
+
+        record_polls: Cell::new(0),
+        auto_eye: Cell::new(None),
+        layer_overflow: Cell::new(false),
     });
     CORE.with(|c| *c.borrow_mut() = Some(core.clone()));
-
+    if let Some(blend) = dom::stored(BLEND_KEY).and_then(|id| BlendChoice::from_id(&id)) {
+        ui.display.update(|d| d.blend = blend);
+    }
+    core.apply_params();
     core.viewer.on_xr_change(|active| with_core(|core| core.on_xr_change(active)));
+    core.viewer.on_xr_transport(|event| with_core(|core| core.on_xr_transport(event)));
     spawn_local(async move {
         let supported = Viewer::xr_supported().await;
         ui.xr_supported.set(Some(supported));
     });
     crate::debug::install();
     let _ = set_interval_with_handle(|| with_core(Core::on_timer), Duration::from_millis(500));
-    spawn_local(connect());
+
+    // What the link asks for: a file, the embedded viewer, a camera.
+    let pairs = dom::query_pairs();
+    let (params, problems) = ViewerParams::from_pairs(pairs.iter().map(|(name, value)| (name.as_str(), value.as_str())));
+    ui.embed.set(params.embed);
+    let names: Vec<String> = pairs.into_iter().map(|(name, _)| name).collect();
+    spawn_local(boot(params, names, problems.into_iter().map(|p| p.text).collect()));
+}
+
+/// The `share.json` of an unpacked share archive, next to the page.
+async fn manifest() -> Option<ViewerParams> {
+    let url = dom::resolve_url("share.json")?;
+    let answer = net::request(&url, None, MANIFEST_TIMEOUT_MS).await.ok()?;
+    answer.ok().then(|| ShareManifest::parse(&answer.body)).flatten()
+}
+
+/// Opens what the page was asked to show: the file of the link, the
+/// recording of a share archive, or the live source.
+async fn boot(mut params: ViewerParams, link_names: Vec<String>, problems: Vec<String>) {
+    let forced = forced_source(dom::query_param("source").as_deref());
+    // Only a static host can be a share archive: the desktop shell and a
+    // forced source are not.
+    if params.file.is_none() && forced.is_none() && !tauri::is_tauri() {
+        if let Some(shared) = manifest().await {
+            let names: Vec<&str> = link_names.iter().map(String::as_str).collect();
+            params = shared.overridden_by(params, &names);
+            with_core(|core| core.ui.embed.set(params.embed));
+        }
+    }
+    if let Some(problem) = problems.first() {
+        with_core(|core| core.notify(true, format!("Lien incomplet\u{a0}: {problem}")));
+    }
+    if params.embed {
+        // The embedded viewer shows the scene, not the rig that filmed it
+        // (and has no switch to hide the gizmos with).
+        with_core(|core| core.set_display(|d| d.gizmos = false));
+    }
+    let start = ReplayStart::of(&params);
+    match &params.file {
+        Some(file) => with_core(|core| core.open_link_file(file, start)),
+        None => {
+            with_core(|core| core.live_start.set(Some(start).filter(|s| s.view.is_some() || s.nav.is_some())));
+            connect().await;
+        }
+    }
 }
 
 /// How the page found its source.
@@ -233,6 +359,8 @@ fn sink() -> Sink {
         on_message: Rc::new(|bytes| with_core(|core| core.on_bytes(bytes))),
         on_link: Rc::new(|link| with_core(|core| core.on_link(link))),
         on_error: Rc::new(|message| with_core(|core| core.report_error(message))),
+        on_event: Rc::new(|event| with_core(|core| core.on_worker_event(event))),
+        on_recording: Rc::new(|meta, parts| with_core(|core| core.on_recording(meta, parts))),
     }
 }
 
@@ -274,6 +402,7 @@ impl Core {
         }
         if link == Link::Connected && !was_connected && self.ui.source.get_untracked() == Some(SourceKind::Server) {
             self.refresh_server_info();
+            self.refresh_takes();
         }
     }
 
@@ -281,8 +410,13 @@ impl Core {
         self.transport.borrow().as_ref().map(Transport::kind)
     }
 
-    /// Sends a control message to the pipeline.
+    /// Sends a control message to the pipeline. While a recording owns the
+    /// view there is nobody to control: the live pipeline, on hold, must
+    /// not be changed by controls that show the recording's configuration.
     pub fn send(&self, msg: ControlMsg) {
+        if self.is_replay() {
+            return;
+        }
         if let Some(transport) = self.transport.borrow().as_ref() {
             transport.send(&msg);
         }
@@ -312,25 +446,63 @@ impl Core {
 
     // ------------------------------------------------------------- messages
 
+    /// One message of the live source.
     fn on_bytes(&self, bytes: &[u8]) {
-        let mut counters = self.counters.get();
-        counters.messages += 1;
-        counters.bytes += bytes.len() as u64;
+        // A recording owns the view: whatever the live source still
+        // delivers (a batch that was on its way) belongs to nobody.
+        if self.is_replay() {
+            return;
+        }
         // While a file is shown its splats own the layers; the stream keeps
         // flowing (State, Stats, thumbnails) and "Revenir au direct" asks
         // for a fresh snapshot.
         if self.file.get().is_some() && codec::peek_kind(bytes) == Ok(Kind::Layer) {
+            let mut counters = self.counters.get();
+            counters.messages += 1;
+            counters.bytes += bytes.len() as u64;
             counters.dropped_layers += 1;
             self.counters.set(counters);
             return;
         }
+        self.apply_bytes(bytes);
+    }
+
+    /// Applies one wire message, of the live source or of a recording: the
+    /// viewer takes the layers, the interface everything else.
+    fn apply_bytes(&self, bytes: &[u8]) {
+        let mut counters = self.counters.get();
+        counters.messages += 1;
+        counters.bytes += bytes.len() as u64;
+        // A stream (a recording somebody made up, say) must not grow a
+        // layer without bound.
+        if let Some((layer, replace, count)) = files::layer_message(bytes) {
+            if !files::layer_fits(self.viewer.layer_len(layer), replace, count) {
+                counters.dropped_layers += 1;
+                self.counters.set(counters);
+                if !self.layer_overflow.replace(true) {
+                    self.report_error(format!(
+                        "La scène dépasse {} splats par calque\u{a0}: la suite n'est pas affichée.",
+                        crate::logic::format::count(files::MAX_LAYER_SPLATS as u64)
+                    ));
+                }
+                return;
+            }
+        }
+        let started = dom::now_ms();
         let applied = self.viewer.apply_message(bytes);
+        let elapsed = dom::now_ms() - started;
         match &applied {
             Ok(Applied::State(_)) => counters.states += 1,
             Ok(Applied::Stats(_)) => counters.stats += 1,
             Ok(Applied::Preview(_)) => counters.previews += 1,
             Ok(Applied::Layer { .. }) => counters.layers += 1,
             Err(_) => {}
+        }
+        if bytes.len() as u64 >= counters.largest_bytes {
+            (counters.largest_bytes, counters.largest_ms) = (bytes.len() as u64, elapsed);
+        }
+        if elapsed > counters.slowest_ms {
+            (counters.slowest_ms, counters.slowest_bytes) = (elapsed, bytes.len() as u64);
         }
         self.counters.set(counters);
         match applied {
@@ -351,22 +523,24 @@ impl Core {
             }
         };
         let scene = state.config.scene;
-        let previous = self.session.borrow().as_ref().map(|s| s.config.scene);
-        let scene_changed = previous != Some(scene);
+        // A capture reports the house scene: its name tells it apart.
+        let previous = self.session.borrow().as_ref().map(|s| (s.config.scene, s.scene.clone()));
+        let scene_changed = previous != Some((scene, state.scene.clone()));
         let camera_ids = present::camera_ids(&state);
         if scene_changed {
             // Statistics and thumbnails of the other scene are stale.
-            self.last_stats.set(None);
-            self.handheld.set(None);
-            self.previews.borrow_mut().clear();
-            self.tick_rate.set(RateMeter::default());
-            self.ui.pipeline_hz.set(None);
-            self.ui.stats.set(None);
-            self.ui.scan.set(None);
+            self.forget_moment();
         } else {
             self.previews.borrow_mut().retain(|id, _| camera_ids.contains(&u32::from(*id)));
         }
         let config = state.config;
+        // The counters of a capture come with its Stats; keep them across
+        // a State of the same capture.
+        let capture = state.capture.clone().map(|info| {
+            let stats = self.ui.capture.with_untracked(|old| old.as_ref().filter(|_| !scene_changed).and_then(|old| old.stats));
+            CaptureView { info, stats }
+        });
+        Ui::set_if_changed(self.ui.capture, capture);
         *self.session.borrow_mut() = Some(state);
 
         self.ui.scene.set(Some(scene));
@@ -377,6 +551,54 @@ impl Core {
         if self.file.get().is_none() {
             let reset_view = self.reset_view.replace(false) || scene_changed;
             self.present(reset_view);
+            if reset_view {
+                if let Some(start) = self.live_start.take() {
+                    self.apply_start_view(start);
+                }
+            }
+        }
+    }
+
+    /// Forgets the session on screen: another source is about to describe
+    /// its own.
+    fn clear_session(&self) {
+        self.viewer.clear_layers();
+        self.viewer.set_gizmos(&GizmoScene::default());
+        *self.session.borrow_mut() = None;
+        self.forget_moment();
+        self.ui.scene.set(None);
+        self.ui.config.set(None);
+        self.ui.capture.set(None);
+        self.ui.camera_ids.set(Vec::new());
+        self.auto_eye.set(None);
+        self.layer_overflow.set(false);
+    }
+
+    /// Forgets the statistics and thumbnails on screen: they belong to
+    /// another moment (a seek of a replay) or to another scene.
+    fn forget_moment(&self) {
+        self.last_stats.set(None);
+        self.handheld.set(None);
+        self.previews.borrow_mut().clear();
+        self.tick_rate.set(RateMeter::default());
+        self.ui.pipeline_hz.set(None);
+        self.ui.stats.set(None);
+        self.ui.scan.set(None);
+        self.ui.capture.update(|capture| {
+            if let Some(capture) = capture {
+                capture.stats = None;
+            }
+        });
+        self.clear_thumbnails();
+    }
+
+    /// Blanks the thumbnail canvases: what they show is no longer true.
+    fn clear_thumbnails(&self) {
+        for id in self.ui.camera_ids.get_untracked() {
+            if let Some(canvas) = dom::element_by_id::<HtmlCanvasElement>(&format!("preview-{id}")) {
+                // Resizing a canvas clears it.
+                canvas.set_width(canvas.width());
+            }
         }
     }
 
@@ -386,17 +608,26 @@ impl Core {
         let session = self.session.borrow();
         let Some(state) = session.as_ref() else { return };
         self.viewer.set_scene_hints(present::scene_hints(state));
+        let capture = state.capture.is_some();
         if reset_view {
-            let nav = present::default_nav(state.config.scene);
+            let nav = present::session_nav(state);
             self.saved_view.set(None);
             self.viewer.set_nav_mode(nav);
             self.viewer.set_view(Vec3::from_array(state.viewer_start.eye), Vec3::from_array(state.viewer_start.target));
+            // A capture grows: the camera follows it until the user takes over.
+            self.auto_eye.set(capture.then(|| self.viewer.eye()));
+            self.scale_custom.set(false);
             self.ui.display.update(|d| {
                 d.nav = nav;
                 d.dollhouse = false;
-                d.splat_scale = present::default_splat_scale(state.config.scene);
             });
-            self.overview_pending.set(state.config.scene == SceneKind::House);
+            self.overview_pending.set(state.config.scene == SceneKind::House && !capture);
+        } else if capture && self.auto_eye.get().is_some_and(|eye| eye.distance(self.viewer.eye()) < AUTO_VIEW_TOLERANCE) {
+            if let Some(bounds) = present::scene_hints(state).bounds {
+                let (eye, target) = present::frame_view(&bounds, self.viewer.fov_y(), self.aspect());
+                self.viewer.set_view(eye, target);
+                self.auto_eye.set(Some(self.viewer.eye()));
+            }
         }
         drop(session);
         self.update_gizmos();
@@ -431,6 +662,20 @@ impl Core {
             }
         };
         let previous = self.last_stats.replace(Some(stats));
+        // Statistics arrive at the tick rate: the views only hear of a change.
+        if self.ui.capture.with_untracked(|capture| capture.as_ref().is_some_and(|c| c.stats != stats.capture)) {
+            self.ui.capture.update(|capture| {
+                if let Some(capture) = capture {
+                    capture.stats = stats.capture;
+                }
+            });
+        }
+        // The server saves a finished capture as a recording by itself:
+        // the list is worth another look once it has had time to write it.
+        let finished = |stats: Option<Stats>| stats.and_then(|s| s.capture).is_some_and(|c| c.finished);
+        if finished(Some(stats)) && !finished(previous) && !self.is_replay() {
+            set_timeout(|| with_core(Core::refresh_takes), Duration::from_millis(1500));
+        }
         let scan = stats.scan.map(|s| ScanView { state: s.state, progress: s.progress });
         let scan_changed = previous.and_then(|p| p.scan).map(|s| s.state) != stats.scan.map(|s| s.state);
         Ui::set_if_changed(self.ui.scan, scan);
@@ -447,7 +692,7 @@ impl Core {
         if let Some(scan) = stats.scan {
             let first_look = self.overview_pending.replace(false) && scan.state != ScanState::Done;
             let new_scan = scan_changed && scan.state == ScanState::Scanning && scan.progress < NEW_SCAN_PROGRESS;
-            if (first_look || new_scan) && self.file.get().is_none() {
+            if (first_look || new_scan) && self.file.get().is_none() && stats.capture.is_none() {
                 self.set_display(|d| d.dollhouse = true);
             }
         }
@@ -531,6 +776,9 @@ impl Core {
 
     /// Switches between the live stage and the home scan.
     pub fn set_scene(&self, scene: SceneKind) {
+        if self.is_replay() {
+            self.close_replay();
+        }
         if self.file.get().is_some() {
             self.return_to_live();
         }
@@ -540,15 +788,6 @@ impl Core {
         self.send(ControlMsg::SetScene { scene });
     }
 
-    pub fn toggle_pause(&self) {
-        // The echoed configuration is the truth; without one there is
-        // nothing to pause yet.
-        let Some(config) = self.ui.config.get_untracked() else { return };
-        if self.file.get().is_some() {
-            return;
-        }
-        self.send(ControlMsg::SetPaused { paused: !config.paused });
-    }
 
     // -------------------------------------------------------------- display
 
@@ -584,6 +823,12 @@ impl Core {
         if new.auto_rotate != old.auto_rotate {
             self.viewer.set_auto_rotate(new.auto_rotate.then_some(AUTO_ROTATE_SPEED));
         }
+        if new.splat_scale != old.splat_scale {
+            self.scale_custom.set(true);
+        }
+        if new.blend != old.blend {
+            dom::store(BLEND_KEY, new.blend.id());
+        }
         self.ui.display.set(new);
         self.apply_params();
     }
@@ -609,18 +854,46 @@ impl Core {
         ((view.right() - panel.left()) / view.width()) as f32
     }
 
+    /// Scene whose measured splat size applies, `None` for an imported file
+    /// (shown as it was written).
+    fn scale_scene(&self) -> Option<SceneKind> {
+        if self.file.get().is_some() {
+            return None;
+        }
+        self.session.borrow().as_ref().map(|s| s.config.scene)
+    }
+
+    /// Pushes the display settings to the viewer. The splat size follows
+    /// the blending mode the viewer answers with, until the user moves the
+    /// slider.
     fn apply_params(&self) {
-        let display = self.ui.display.get_untracked();
+        let mut display = self.ui.display.get_untracked();
         let clip = if display.dollhouse { self.session.borrow().as_ref().and_then(present::dollhouse_clip) } else { None };
-        self.viewer.set_params(RenderParams {
-            splat_scale: display.splat_scale,
-            point_mode: display.point_mode,
-            show_gizmos: display.gizmos,
-            show_static: display.show_static,
-            show_dynamic: display.show_dynamic,
-            clip_y_max: clip,
-            ..self.viewer.params()
-        });
+        let (blend, quality) = display.blend.params(self.viewer.xr_active());
+        let push = |display: &Display| {
+            self.viewer.set_params(RenderParams {
+                blend,
+                quality,
+                splat_scale: display.splat_scale,
+                point_mode: display.point_mode,
+                show_gizmos: display.gizmos,
+                show_static: display.show_static,
+                show_dynamic: display.show_dynamic,
+                clip_y_max: clip,
+                ..self.viewer.params()
+            });
+        };
+        push(&display);
+        let status = self.viewer.blend_status();
+        Ui::set_if_changed(self.ui.blend, status);
+        if !self.scale_custom.get() {
+            let recommended = self.scale_scene().map_or(1.0, |scene| recommended_splat_scale(scene, status.active));
+            if recommended != display.splat_scale {
+                display.splat_scale = recommended;
+                self.ui.display.set(display);
+                push(&display);
+            }
+        }
     }
 
     /// Leaves the overview for a visit of the scanned house: inside, at
@@ -670,6 +943,9 @@ impl Core {
         if active {
             self.ui.xr_error.set(None);
         }
+        // The automatic rendering choice differs inside a headset.
+        self.apply_params();
+        self.sync_xr_timeline();
     }
 
     /// Must be called synchronously from a click handler: the browser only
@@ -741,8 +1017,16 @@ impl Core {
             }
         };
         let was_live = self.file.get().is_none();
-        if was_live {
-            let paused_before = self.ui.config.get_untracked().is_some_and(|c| c.paused);
+        if self.replay.borrow_mut().take().is_some() {
+            // The file takes over from a recording; the live source stays
+            // suspended and is woken by "Revenir au direct".
+            self.ui.replay.set(None);
+            self.ui.scrub.set(None);
+            self.sync_xr_timeline();
+            self.file.set(Some(FileSession { paused_before: true }));
+        } else if was_live {
+            let live = self.transport.borrow().is_some() && self.suspended.get() == Suspended::No;
+            let paused_before = !live || self.ui.config.get_untracked().is_some_and(|c| c.paused);
             // From here on layer messages of the stream are ignored.
             self.file.set(Some(FileSession { paused_before }));
             if !paused_before {
@@ -768,11 +1052,11 @@ impl Core {
             let (eye, target) = present::frame_view(&bounds, self.viewer.fov_y(), self.aspect());
             self.viewer.set_view(eye, target);
         }
+        // A file is shown as it was written (`scale_scene`).
+        self.scale_custom.set(false);
         self.ui.display.update(|d| {
             d.nav = NavMode::Orbit;
             d.dollhouse = false;
-            // A file is shown as it was written.
-            d.splat_scale = 1.0;
         });
         self.apply_params();
         self.ui.file_error.set(None);
@@ -783,6 +1067,11 @@ impl Core {
     pub fn return_to_live(&self) {
         let Some(file) = self.file.take() else { return };
         self.ui.file.set(None);
+        if self.suspended.get() != Suspended::No || self.transport.borrow().is_none() {
+            // The file came after a recording, or the page opened on it.
+            self.resume_live();
+            return;
+        }
         self.viewer.clear_layers();
         self.reset_view.set(true);
         if let Some(transport) = self.transport.borrow().as_ref() {
@@ -873,6 +1162,11 @@ impl Core {
     /// Twice per second: viewer statistics, data rate, VR errors.
     fn on_timer(&self) {
         Ui::set_if_changed(self.ui.viewer_stats, self.viewer.stats());
+        // A fallback of the blending mode comes and goes by itself (a
+        // resize lets the viewer try again): the size that suits it follows.
+        if self.viewer.blend_status() != self.ui.blend.get_untracked() {
+            self.apply_params();
+        }
         // The viewer walked into or out of a scan head that stands still.
         if self.viewer_in_scan_head() != self.in_scan_head.get() {
             self.update_gizmos();
@@ -885,6 +1179,7 @@ impl Core {
         self.rate_window.set((now, bytes_now));
         let smoothed = self.ui.transfer_rate.get_untracked() * 0.5 + rate as f32 * 0.5;
         Ui::set_if_changed(self.ui.transfer_rate, if smoothed < 1.0 { 0.0 } else { smoothed });
+        self.tick_recording();
         // `enter_xr` fails asynchronously and without a callback.
         if !self.viewer.xr_active() {
             Ui::set_if_changed(self.ui.xr_error, self.viewer.xr_error());
@@ -941,6 +1236,12 @@ impl Core {
 
     pub fn is_file_mode(&self) -> bool {
         self.file.get().is_some()
+    }
+
+    /// Name of the scene of the session on screen (`stage`, `house`,
+    /// `capture`).
+    pub fn scene_name(&self) -> Option<String> {
+        self.session.borrow().as_ref().map(|s| s.scene.clone())
     }
 
     /// Paint counts of the thumbnails, by camera id.

@@ -2,11 +2,14 @@
 //!
 //! ```text
 //! gs-server [--port N] [--lan] [--lan-port N] [--dist DIR]
-//!           [--scene stage|house] [--light] [--cert-dir DIR] [--verbose]
+//!           [--scene stage|house] [--light] [--cert-dir DIR]
+//!           [--recordings-dir DIR] [--captures-dir DIR] [--no-capture-files]
+//!           [--verbose]
 //! ```
 //!
 //! Prints the URLs to open and, with `--lan`, the QR code and the
-//! certificate fingerprint for the headset. Ctrl-C stops it cleanly.
+//! certificate fingerprint for the headset, then the pairing code for the
+//! phone. Ctrl-C stops it cleanly.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -33,6 +36,12 @@ Options :
   --light            réglages allégés pour une machine modeste
   --cert-dir DIR     dossier où conserver le certificat auto-signé
                      (défaut : le dossier de données de l'utilisateur)
+  --recordings-dir DIR
+                     dossier des enregistrements 4D (.gsrec)
+                     (défaut : « recordings » dans le dossier de données)
+  --captures-dir DIR dossier des captures brutes reçues d'un iPhone (.gscap)
+                     (défaut : « captures » à côté des enregistrements)
+  --no-capture-files ne conserve pas les captures brutes sur le disque
   --verbose          journal détaillé (diagnostics en anglais)
   -h, --help         affiche cette aide
   -V, --version      affiche la version
@@ -49,6 +58,9 @@ struct Args {
     scene: SceneKind,
     light: bool,
     cert_dir: Option<PathBuf>,
+    recordings_dir: Option<PathBuf>,
+    captures_dir: Option<PathBuf>,
+    keep_captures: bool,
     verbose: bool,
 }
 
@@ -67,6 +79,9 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> 
         scene: SceneKind::Stage,
         light: false,
         cert_dir: None,
+        recordings_dir: None,
+        captures_dir: None,
+        keep_captures: true,
         verbose: false,
     };
     while let Some(arg) = argv.next() {
@@ -84,6 +99,9 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> 
             "--lan-port" => args.lan_port = port(value("un port")?)?,
             "--dist" => args.dist = Some(PathBuf::from(value("un dossier")?)),
             "--cert-dir" => args.cert_dir = Some(PathBuf::from(value("un dossier")?)),
+            "--recordings-dir" => args.recordings_dir = Some(PathBuf::from(value("un dossier")?)),
+            "--captures-dir" => args.captures_dir = Some(PathBuf::from(value("un dossier")?)),
+            "--no-capture-files" => args.keep_captures = false,
             "--scene" => {
                 args.scene = match value("stage ou house")?.as_str() {
                     "stage" => SceneKind::Stage,
@@ -102,8 +120,9 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> 
     Ok(Parsed::Run(args))
 }
 
-/// The per-user data directory of the platform, with `splat-live` appended.
-fn default_cert_dir() -> Option<PathBuf> {
+/// The per-user data directory of the platform, with `splat-live` appended:
+/// the certificate lives there, and the recordings in a directory below.
+fn default_data_dir() -> Option<PathBuf> {
     let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     let base = if cfg!(windows) {
         var("APPDATA")
@@ -157,6 +176,28 @@ fn print_banner(server: &ServerHandle, args: &Args, dist: Option<&PathBuf>) {
                 println!("  acceptez le certificat une fois, puis choisissez « Entrer en VR ».");
             }
         }
+        // The pairing code holds the token of this run: it is shown here,
+        // on the terminal of whoever started the server, and nowhere else.
+        if let Some(uri) = server.pairing_uri() {
+            if let Some(qr) = gs_server::qr_terminal(&uri) {
+                println!();
+                println!("  Capture avec un iPhone : scannez ce code dans l'application SplatCapture");
+                println!("  (il change à chaque démarrage du serveur).");
+                println!();
+                for line in qr.lines() {
+                    println!("  {line}");
+                }
+            }
+        }
+    }
+    println!();
+    match server.recordings_dir() {
+        Some(dir) => println!("  Enregistrements  : {}", dir.display()),
+        None => println!("  Enregistrements  : désactivés (aucun dossier de données)"),
+    }
+    match server.captures_dir().filter(|_| args.keep_captures) {
+        Some(dir) => println!("  Captures brutes  : {}", dir.display()),
+        None => println!("  Captures brutes  : non conservées"),
     }
     println!();
     println!("Ctrl-C pour arrêter.");
@@ -200,7 +241,10 @@ async fn run(args: Args) -> Result<(), gs_server::Error> {
         lan: args.lan,
         lan_port: args.lan_port,
         dist: dist.clone(),
-        cert_dir: args.cert_dir.clone().or_else(default_cert_dir),
+        cert_dir: args.cert_dir.clone().or_else(default_data_dir),
+        recordings_dir: args.recordings_dir.clone().or_else(|| default_data_dir().map(|dir| dir.join("recordings"))),
+        captures_dir: args.captures_dir.clone(),
+        keep_captures: args.keep_captures,
         ..ServerConfig::default()
     };
     let server = gs_server::start(config).await?;
@@ -275,6 +319,7 @@ mod tests {
         assert_eq!((args.port, args.lan_port, args.lan, args.light), (7878, 7879, false, false));
         assert_eq!(args.scene, SceneKind::Stage);
         assert!(args.dist.is_none() && args.cert_dir.is_none());
+        assert!(args.recordings_dir.is_none() && args.captures_dir.is_none() && args.keep_captures);
     }
 
     #[test]
@@ -285,6 +330,12 @@ mod tests {
         assert_eq!(args.scene, SceneKind::House);
         assert_eq!(args.dist, Some(PathBuf::from("web")));
         assert_eq!(args.cert_dir, Some(PathBuf::from("/tmp/c")));
+
+        let line = "--recordings-dir /data/rec --captures-dir=/data/cap --no-capture-files";
+        let Ok(Parsed::Run(args)) = parse(line) else { panic!("expected a run") };
+        assert_eq!(args.recordings_dir, Some(PathBuf::from("/data/rec")));
+        assert_eq!(args.captures_dir, Some(PathBuf::from("/data/cap")));
+        assert!(!args.keep_captures);
     }
 
     #[test]

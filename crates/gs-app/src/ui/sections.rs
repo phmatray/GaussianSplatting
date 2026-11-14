@@ -7,10 +7,12 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use super::icons::Icon;
+use super::phone::{CaptureCard, ReplayCard};
 use super::widgets::{Section, Segmented, Slider, StatRow, Toggle};
 use crate::core::with_core;
-use crate::logic::config::{self, CAMERA_COUNT_RANGE, RESOLUTIONS, WALK_SPEED_RANGE};
+use crate::logic::config::{self, CAMERA_COUNT_RANGE, CELL_SIZES, RESOLUTIONS, WALK_SPEED_RANGE};
 use crate::logic::files::FileFormat;
+use crate::logic::render::{self, BlendChoice};
 use crate::logic::{format, present};
 use crate::logic::source::SourceKind;
 use crate::state::{use_ui, Display, ScanView, Ui};
@@ -62,6 +64,14 @@ fn StageCapture() -> impl IntoView {
             remote=true
         />
         <p class="hint" id="res-text">{resolution_text}</p>
+        <Toggle
+            id="toggle-fusion"
+            label="Fusion des vues"
+            hint="Chaque point de surface garde le splat de la caméra qui le voit le mieux"
+            checked=config_value(ui, |c| c.fusion.enabled)
+            on_change=Callback::new(|on: bool| patch(config::patch_fusion(on)))
+            remote=true
+        />
         <Toggle
             id="toggle-bg"
             label="Soustraction du fond"
@@ -155,7 +165,15 @@ fn HouseCapture() -> impl IntoView {
             format=|v| format!("{} m/s", format::decimal(v as f32, 1))
             remote=true
         />
-        <p class="hint">"Changer la vitesse relance le scan depuis le début."</p>
+        <Segmented
+            id="cell"
+            label="Taille des cellules"
+            options=CELL_SIZES.iter().map(|c| c.label).collect()
+            selected=Signal::derive(move || ui.config.with(|c| c.as_ref().and_then(config::cell_size_index)))
+            on_select=Callback::new(|index: usize| patch(config::patch_cell_size(CELL_SIZES[index])))
+            remote=true
+        />
+        <p class="hint">"Changer la vitesse ou la taille des cellules relance le scan depuis le début."</p>
     }
 }
 
@@ -163,26 +181,38 @@ fn HouseCapture() -> impl IntoView {
 pub fn CaptureSection() -> impl IntoView {
     let ui = use_ui();
     let house = move || ui.scene.get() == Some(SceneKind::House);
+    // The controls of the simulation make no sense for a recording (its
+    // pipeline ran in the past) nor for a capture (its sensor is a phone).
+    let replay = move || ui.replay.with(Option::is_some);
+    let capture = move || ui.capture.with(Option::is_some);
     view! {
         <Section id="section-capture" title="Capture" icon="capture">
-            <Show when=house fallback=|| view! { <StageCapture /> }>
-                <HouseCapture />
+            <Show when=replay>
+                <ReplayCard />
             </Show>
-            <Toggle
-                id="toggle-noise"
-                label="Bruit du capteur"
-                hint="Imite une caméra de profondeur grand public"
-                checked=config_value(ui, |c| !c.noise.is_none())
-                on_change=Callback::new(|on: bool| patch(config::patch_noise(on)))
-                remote=true
-            />
-            <Toggle
-                id="toggle-shadows"
-                label="Ombres"
-                checked=config_value(ui, |c| c.shadows)
-                on_change=Callback::new(|on: bool| patch(config::patch_shadows(on)))
-                remote=true
-            />
+            <Show when=capture>
+                <CaptureCard />
+            </Show>
+            <Show when=move || !replay() && !capture()>
+                <Show when=house fallback=|| view! { <StageCapture /> }>
+                    <HouseCapture />
+                </Show>
+                <Toggle
+                    id="toggle-noise"
+                    label="Bruit du capteur"
+                    hint="Imite une caméra de profondeur grand public"
+                    checked=config_value(ui, |c| !c.noise.is_none())
+                    on_change=Callback::new(|on: bool| patch(config::patch_noise(on)))
+                    remote=true
+                />
+                <Toggle
+                    id="toggle-shadows"
+                    label="Ombres"
+                    checked=config_value(ui, |c| c.shadows)
+                    on_change=Callback::new(|on: bool| patch(config::patch_shadows(on)))
+                    remote=true
+                />
+            </Show>
         </Section>
     }
 }
@@ -226,6 +256,19 @@ pub fn DisplaySection() -> impl IntoView {
                     checked=display_value(ui, |d| d.dollhouse)
                     on_change=Callback::new(|on: bool| set_display(|d| d.dollhouse = on))
                 />
+            </Show>
+            <Segmented
+                id="blend"
+                label="Rendu"
+                options=BlendChoice::LABELS.to_vec()
+                selected=Signal::derive(move || Some(ui.display.get().blend.index()))
+                on_select=Callback::new(|index: usize| set_display(|d| d.blend = BlendChoice::ALL[index]))
+            />
+            <p class="hint" id="blend-status" data-active=move || ui.blend.get().active.as_str() data-reason=move || ui.blend.get().reason.as_str()>
+                {move || format!("Mélange actif\u{a0}: {}.", render::active_label(ui.blend.get().active))}
+            </p>
+            <Show when=move || render::fallback_text(ui.blend.get()).is_some()>
+                <p class="warning" id="blend-fallback" role="status">{move || render::fallback_text(ui.blend.get())}</p>
             </Show>
             <Slider
                 id="splat-scale"
@@ -343,6 +386,7 @@ pub fn StatsSection() -> impl IntoView {
                 <StatRow id="stat-hz" label="Pipeline" value=Signal::derive(pipeline_hz) />
                 <StatRow id="stat-capture" label="Capture" value=stat(|s| format::ms(s.capture_ms)) />
                 <StatRow id="stat-recon" label="Reconstruction" value=stat(|s| format::ms(s.reconstruct_ms)) />
+                <StatRow id="stat-fuse" label="Fusion" value=stat(|s| format::ms(s.fuse_ms)) />
                 <StatRow id="stat-encode" label="Encodage" value=stat(|s| format::ms(s.encode_ms)) />
                 <StatRow id="stat-static" label="Splats statiques" value=stat(|s| format::count(u64::from(s.splats_static))) />
                 <StatRow id="stat-dynamic" label="Splats dynamiques" value=stat(|s| format::count(u64::from(s.splats_dynamic))) />
@@ -473,7 +517,7 @@ pub fn FileSection() -> impl IntoView {
     let pick = move |ev: leptos::ev::Event| {
         let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
         if let Some(file) = input.files().and_then(|list| list.get(0)) {
-            with_core(|core| core.import_file(file));
+            with_core(|core| core.open_file(file));
         }
         // The same file can be picked again.
         input.set_value("");
@@ -509,10 +553,12 @@ pub fn FileSection() -> impl IntoView {
                 <span class="field-label">"Importer un fichier"</span>
                 <label class="btn wide" id="import-btn" for="import-input">
                     <Icon name="upload" />
-                    "Choisir un .ply ou un .splat"
+                    "Choisir un fichier"
                 </label>
-                <input type="file" id="import-input" class="visually-hidden" accept=".ply,.splat" on:change=pick />
-                <p class="hint">"Vous pouvez aussi glisser un fichier dans la fenêtre."</p>
+                <input type="file" id="import-input" class="visually-hidden" accept=".ply,.splat,.gsrec,.gscap" on:change=pick />
+                <p class="hint">
+                    "Une scène .ply ou .splat, un enregistrement .gsrec ou une capture .gscap. Vous pouvez aussi glisser le fichier dans la fenêtre."
+                </p>
             </div>
             <Show when=move || ui.file_error.get().is_some()>
                 <p class="error" id="file-error">{move || ui.file_error.get()}</p>

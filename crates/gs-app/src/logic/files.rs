@@ -10,6 +10,30 @@ use gs_core::Splat;
 pub const MAX_IMPORT_BYTES: u64 = 768 * 1024 * 1024;
 /// Largest number of splats the import displays.
 pub const MAX_IMPORT_SPLATS: usize = 4_000_000;
+/// Largest number of splats one layer of a stream may hold in the viewer:
+/// the live pipeline, a capture and their recordings stay far below (the
+/// fusion keeps a million cells), a file built to exhaust the memory of
+/// the page does not get further.
+pub const MAX_LAYER_SPLATS: usize = MAX_IMPORT_SPLATS;
+
+/// What a layer wire message would do: `(layer id, replaces the layer,
+/// splats carried)`. `None` for any other message and for one too short to
+/// say (the viewer reports what is wrong with it).
+pub fn layer_message(bytes: &[u8]) -> Option<(u8, bool, usize)> {
+    use gs_core::codec::{self, Kind, HEADER_SIZE, LAYER_HEADER_SIZE, SPLAT_WIRE_SIZE};
+    if codec::peek_kind(bytes) != Ok(Kind::Layer) || bytes.len() < HEADER_SIZE + LAYER_HEADER_SIZE {
+        return None;
+    }
+    let body = &bytes[HEADER_SIZE..];
+    // The count the bytes really hold, whatever the header announces.
+    Some((body[0], body[1] == 0, (bytes.len() - HEADER_SIZE - LAYER_HEADER_SIZE) / SPLAT_WIRE_SIZE))
+}
+
+/// True when a layer that holds `held` splats may take this message.
+pub fn layer_fits(held: usize, replace: bool, count: usize) -> bool {
+    (if replace { count } else { held.saturating_add(count) }) <= MAX_LAYER_SPLATS
+}
+
 /// Splats farther than this from the origin are dropped (meters): they are
 /// garbage, and they would ruin the framing of the view.
 const MAX_COORDINATE: f32 = 1.0e5;
@@ -144,6 +168,34 @@ pub fn parse_import(name: &str, bytes: &[u8]) -> Result<Vec<Splat>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_messages_are_sized_by_their_bytes_and_bounded() {
+        use gs_core::codec::{encode, encode_layer, Body, LayerMode, Message};
+        let mut append = Vec::new();
+        encode_layer(1, 0, 0, LayerMode::Append, &cloud(5), &mut append);
+        assert_eq!(layer_message(&append), Some((0, false, 5)));
+        let mut replace = Vec::new();
+        encode_layer(2, 0, 1, LayerMode::Replace, &cloud(3), &mut replace);
+        assert_eq!(layer_message(&replace), Some((1, true, 3)));
+        // A header that announces more than the bytes hold counts for what is there.
+        let mut lying = append.clone();
+        lying[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(layer_message(&lying), Some((0, false, 5)));
+        // Other messages, short ones and garbage are not layer messages.
+        assert_eq!(layer_message(&encode(&Message { seq: 0, time_ms: 0, body: Body::Stats("{}".into()) })), None);
+        assert_eq!(layer_message(&append[..30]), None);
+        assert_eq!(layer_message(b"junk"), None);
+        assert_eq!(layer_message(&[]), None);
+
+        assert!(layer_fits(0, true, MAX_LAYER_SPLATS));
+        assert!(!layer_fits(0, true, MAX_LAYER_SPLATS + 1));
+        assert!(layer_fits(MAX_LAYER_SPLATS - 5, false, 5));
+        assert!(!layer_fits(MAX_LAYER_SPLATS - 5, false, 6));
+        // A replace only counts itself; huge numbers do not wrap.
+        assert!(layer_fits(MAX_LAYER_SPLATS, true, 10));
+        assert!(!layer_fits(usize::MAX, false, usize::MAX));
+    }
 
     fn cloud(n: usize) -> Vec<Splat> {
         (0..n)

@@ -74,7 +74,7 @@ async function run() {
     if (fs.existsSync(SERVER_BIN)) {
       const server = await startServer({ dist, certs: path.join(tmp, 'certs'), port: PORT + 84 });
       try {
-        measurements.server = judge('server', await session('server', `${server.url}/`, collectorPort), { source: 'server', channel: 'relay', scene: 'stage', cameras: 6 });
+        measurements.server = judge('server', await session('server', `${server.url}/`, collectorPort), { source: 'server', channel: 'relay', scene: 'stage', cameras: 8 });
       } finally {
         await server.stop();
       }
@@ -83,7 +83,7 @@ async function run() {
     }
     const { srv, url } = await serve({ dir: dist, port: PORT + 87 });
     try {
-      measurements.worker = judge('worker', await session('worker', url, collectorPort), { source: 'worker', channel: 'worker', scene: 'stage', cameras: 6 });
+      measurements.worker = judge('worker', await session('worker', url, collectorPort), { source: 'worker', channel: 'worker', scene: 'stage', cameras: 8 });
       measurements.worker_house = judge('worker house', await session('worker-house', `${url}?scene=house`, collectorPort), { source: 'worker', channel: 'worker', scene: 'house', cameras: 5 });
     } finally {
       srv.close();

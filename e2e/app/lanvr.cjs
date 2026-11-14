@@ -10,7 +10,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { check, DIST, PORT, iwerBundle, consoleErrors, glWarnings, state, waitState, open, shot, imageStats, hasContent, sleep, startServer, SERVER_BIN } = require('./lib.cjs');
+const { check, DIST, PORT, iwerBundle, pinBlend, consoleErrors, glWarnings, state, waitState, open, shot, imageStats, hasContent, sleep, startServer, SERVER_BIN } = require('./lib.cjs');
 
 const xrFrames = async (page, n) => {
   const start = (await state(page)).xr.session.frames;
@@ -29,6 +29,7 @@ const distance = (a, b) => Math.hypot(...a.map((v, i) => v - b[i]));
 // A page with an emulated Quest 3, accepting the self-signed certificate.
 async function headsetPage(browser) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 640 }, ignoreHTTPSErrors: true });
+  await pinBlend(ctx);
   const page = await ctx.newPage();
   const logs = [];
   page.on('console', (m) => logs.push(`[${m.type()}] ${m.text()}`));

@@ -113,6 +113,9 @@
 //!   virtual table in front of the user, ceiling clipped when
 //!   [`SceneHints::ceiling_height`] is known). Left X: toggle gizmos. Right
 //!   B: reset the position. The desktop loop idles while a session runs.
+//!   While a replay's time line is set ([`Viewer::set_xr_timeline`]) it is
+//!   drawn above the left controller, left Y plays and pauses, and the left
+//!   stick scrubs while the left grip is held ([`XrTransport`]).
 //!
 //! # Lifetime
 //!
@@ -161,7 +164,7 @@ pub use gizmo::{FrustumGizmo, GizmoScene, GridGizmo};
 pub use nav::NavMode;
 pub use params::{
     ActiveBlend, Applied, BlendMode, BlendQuality, BlendReason, BlendStatus, LayerContent, RenderParams, SceneHints, ViewerOptions,
-    ViewerStats, XrInfo, XrOptions, XrViewInfo, LAYER_COUNT, LAYER_DYNAMIC, LAYER_STATIC, LIVE_LAYER_WEIGHT,
+    ViewerStats, XrInfo, XrOptions, XrTimeline, XrTransport, XrViewInfo, LAYER_COUNT, LAYER_DYNAMIC, LAYER_STATIC, LIVE_LAYER_WEIGHT,
 };
 #[cfg(target_arch = "wasm32")]
 pub use viewer::Viewer;
