@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use gs_core::pipeline::Pipeline;
 use gs_core::protocol::{ControlMsg, PipelineConfig, ScanState};
 use gs_core::record::{
-    classify, verify, ByteRange, Compression, IoSink, KeyframePolicy, MessageClass, Player, PlayerOptions, Pushed,
-    RecordError, Recorder, RecorderOptions, StreamState, HEADER_JSON_SIZE,
+    classify, read_info, verify, ByteRange, Compression, IoSink, KeyframePolicy, MessageClass, Player, PlayerOptions,
+    Pushed, RecordError, RecordSink, Recorder, RecorderOptions, StreamState, WriteError, HEADER_JSON_SIZE,
 };
 use gs_core::scene::SceneKind;
 use record_support::*;
@@ -932,6 +932,63 @@ fn the_recorder_takes_the_stream_as_it_comes() {
         assert_eq!(viewer.layers[0].len(), live.layers[0].len());
     }
     assert!(file.len() < record(&stream, tiny_options()).len() * 3 / 4);
+
+    // The header alone tells what a file is.
+    let file = record(&stream, tiny_options());
+    let info = read_info(&file[..12 + HEADER_JSON_SIZE]).unwrap();
+    assert_eq!((info.name.as_str(), info.scene.as_str(), info.protocol, info.duration_s), ("tiny", "tiny", 1, 6.0));
+    assert_eq!(info.created, "2026-11-14T10:00:00Z");
+    assert_eq!(read_info(&file[..500]), Err(RecordError::TooShort));
+    assert_eq!(read_info(b"PK\x03\x04"), Err(RecordError::BadMagic));
+
+    // A sink that fails (a full disk): the recorder stops, and what
+    // reached the sink still plays.
+    struct Disk {
+        bytes: Vec<u8>,
+        room: usize,
+    }
+    impl RecordSink for Disk {
+        type Error = &'static str;
+        fn append_bytes(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+            let fits = bytes.len().min(self.room - self.bytes.len());
+            self.bytes.extend_from_slice(&bytes[..fits]);
+            if fits < bytes.len() {
+                Err("disk full")
+            } else {
+                Ok(())
+            }
+        }
+        fn patch_bytes(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.bytes.patch_bytes(offset, bytes).map_err(|_| "unreachable")
+        }
+    }
+    let mut recorder = Recorder::new(Disk { bytes: Vec::new(), room: 9000 }, tiny_options());
+    let mut failed_at = None;
+    for (i, (time, message)) in stream.iter().enumerate() {
+        match recorder.push(*time, message) {
+            Ok(_) => assert!(failed_at.is_none()),
+            Err(WriteError::Sink(error)) => {
+                assert_eq!((error, failed_at.replace(i)), ("disk full", None));
+            }
+            Err(error) => assert_eq!((error, failed_at.is_some()), (WriteError::Stopped, true)),
+        }
+    }
+    let failed_at = failed_at.expect("9000 bytes do not hold the session");
+    let disk = recorder.into_sink();
+    assert_eq!(disk.bytes.len(), 9000);
+    let report = verify(&disk.bytes).unwrap();
+    assert!(report.truncated && report.problems.is_empty());
+    let mut player = Player::from_bytes(disk.bytes).unwrap();
+    player.seek(f64::MAX);
+    let mut viewer = Viewer::default();
+    viewer.apply_all(&player.update());
+    assert!(
+        player.duration().unwrap() <= stream[failed_at].0 && player.duration().unwrap() >= stream[failed_at].0 - 0.5
+    );
+    assert!(viewer.state.is_some());
+    let mut recorder = Recorder::new(Disk { bytes: Vec::new(), room: 3000 }, tiny_options());
+    let _ = stream.iter().try_for_each(|(time, message)| recorder.push(*time, message).map(|_| ()));
+    assert_eq!(recorder.finish().err(), Some(WriteError::Stopped));
 
     // A name too long for the fixed header is cut, not refused.
     let long = RecorderOptions { name: "é".repeat(5000), ..tiny_options() };

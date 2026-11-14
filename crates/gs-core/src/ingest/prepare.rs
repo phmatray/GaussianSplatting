@@ -201,6 +201,8 @@ pub enum SkipReason {
     NoDepth,
     /// `person` mode with masks: nobody in this frame.
     NoPerson,
+    /// The depth map is larger than [`MAX_FUSED_DEPTH_PIXELS`].
+    DepthSize,
 }
 
 impl SkipReason {
@@ -215,9 +217,16 @@ impl SkipReason {
             Self::Color => "color",
             Self::NoDepth => "no_depth",
             Self::NoPerson => "no_person",
+            Self::DepthSize => "depth_size",
         }
     }
 }
+
+/// Largest depth map a frame may carry to be reconstructed (1024 x 1024;
+/// ARKit delivers 256 x 192). The frame format allows four times as much,
+/// and a hostile frame of a few kilobytes can announce it: every pixel
+/// costs reconstruction time, so the bound on the work per frame is here.
+pub const MAX_FUSED_DEPTH_PIXELS: usize = 1 << 20;
 
 /// The camera of a frame on its depth grid, or why it has none.
 ///
@@ -226,6 +235,9 @@ impl SkipReason {
 /// round-off: ARKit delivers one, and anything else (a damaged file, a
 /// phone that lost track and sends zeros) must not reach the fusion.
 pub fn frame_camera(frame: &CaptureFrame) -> Result<Camera, SkipReason> {
+    if frame.depth_pixels() > MAX_FUSED_DEPTH_PIXELS {
+        return Err(SkipReason::DepthSize);
+    }
     let m = &frame.world_from_cam;
     if !m.iter().all(|v| v.is_finite()) {
         return Err(SkipReason::Pose);
@@ -425,6 +437,8 @@ mod tests {
         assert_eq!(with_pose(&|m| m[15] = 2.0), Err(SkipReason::Pose));
         assert_eq!(with_pose(&|m| m[3] = 0.5), Err(SkipReason::Pose));
         assert_eq!(with_pose(&|m| m[12] = 1.0e6), Err(SkipReason::Pose));
+        let huge = CaptureFrame { depth_width: 2048, depth_height: 1024, depth_mm: Vec::new(), ..base.clone() };
+        assert_eq!(frame_camera(&huge), Err(SkipReason::DepthSize));
         // A rotation with round-off is fine.
         let turned = Mat4::from_rotation_y(0.7) * Mat4::from_rotation_x(-0.3);
         assert!(with_pose(&|m| {

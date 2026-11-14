@@ -253,6 +253,28 @@ impl CaptureSession {
         Ok(session)
     }
 
+    /// Starts a `live` capture over what this one has fused: its layer 0
+    /// (as viewers have it, cropped to the region of interest) stays as
+    /// the backdrop and its floor is kept, while every frame of the new
+    /// capture replaces layer 1.
+    ///
+    /// This only makes sense while the phone's AR session goes on, so that
+    /// both captures share one world: the app keeps its session between
+    /// captures unless it was restarted or reset. The host decides; a
+    /// plain [`CaptureSession::new`] starts with an empty layer 0.
+    pub fn into_live(mut self, hello: &Hello) -> Self {
+        if let Some(region) = self.region() {
+            self.fusion.retain(|splat, _| region.contains(splat.position()));
+        }
+        let mut live = Self::new(&Hello { mode: CaptureMode::Live, ..hello.clone() }, self.params);
+        live.fusion = self.fusion;
+        live.floor = Floor { guessed: None, ..self.floor };
+        live.sent_floor = live.floor.y();
+        live.bounds = Aabb::from_points(live.fusion.splats().iter().map(Splat::position));
+        live.seq = self.seq;
+        live
+    }
+
     // -- inspection ----------------------------------------------------------
 
     pub fn mode(&self) -> CaptureMode {

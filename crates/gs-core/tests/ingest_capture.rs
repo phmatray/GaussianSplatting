@@ -502,6 +502,21 @@ fn person_mode_keeps_the_person_and_live_mode_shows_one_view() {
     let reply = live.finish();
     assert_eq!(kinds(&reply.to_viewers), "S 0r T");
     assert!(!live.dynamic_splats().is_empty());
+
+    // Live over a finished scan of the same AR session: the scan stays as
+    // layer 0 (cropped as it was shown), at its floor, and takes no frame.
+    let backdrop = person.static_splats();
+    let floor = person.floor();
+    let mut over = person.into_live(&Hello::offline(CaptureMode::Live, "Direct", "d", "a"));
+    assert_eq!((over.mode(), over.name(), over.frames_received(), over.floor()), (CaptureMode::Live, "Direct", 0, floor));
+    let mut client = Client::default();
+    client.apply(&over.snapshot());
+    assert_eq!(client.layers[0].len(), backdrop.len());
+    let reply = over.handle_decoded(&shots[2].frame);
+    assert!(kinds(&reply.to_viewers).ends_with("1r P T") && !kinds(&reply.to_viewers).contains('0'));
+    client.apply(&reply.to_viewers);
+    assert_eq!(over.static_splats(), backdrop);
+    assert!(!client.layers[1].is_empty() && over.floor() == floor);
 }
 
 /// Mean colour of a cloud.

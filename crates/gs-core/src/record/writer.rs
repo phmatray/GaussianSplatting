@@ -431,6 +431,13 @@ impl<S: RecordSink> Recorder<S> {
         Ok((self.sink, summary))
     }
 
+    /// Gives the sink back without finishing the file: after the sink
+    /// failed, or to abandon a recording. What was written plays up to its
+    /// last complete record.
+    pub fn into_sink(self) -> S {
+        self.sink
+    }
+
     /// Bytes written so far.
     pub fn bytes_written(&self) -> u64 {
         self.written

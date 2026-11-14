@@ -254,6 +254,22 @@ pub struct RecordingInfo {
     pub duration_s: f64,
 }
 
+/// Reads the JSON header from the first bytes of a recording, for example
+/// to list the recordings of a directory without reading them: the first
+/// 1024 bytes suffice for files of this module's writer (the header may be
+/// as long as `12 + MAX_HEADER_JSON` bytes in general).
+///
+/// `duration_s` is 0 for a recording that was never finished; [`verify`]
+/// finds out how long it plays.
+///
+/// [`RecordError::TooShort`] when `prefix` ends inside the header.
+pub fn read_info(prefix: &[u8]) -> Result<RecordingInfo, RecordError> {
+    match parse_file_header(prefix)? {
+        HeaderParse::Done { info, .. } => Ok(info),
+        HeaderParse::NeedMore(_) => Err(RecordError::TooShort),
+    }
+}
+
 /// Kind of a record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -444,11 +460,12 @@ pub(crate) fn split_keyframe(payload: &[u8]) -> Result<Vec<&[u8]>, RecordError> 
 /// Parses an index payload. The entries must be in strictly increasing
 /// offset order and in time order.
 pub(crate) fn parse_index(payload: &[u8]) -> Result<Vec<(f64, u64)>, RecordError> {
-    if payload.len() % INDEX_ENTRY_SIZE != 0 {
+    let chunks = payload.chunks_exact(INDEX_ENTRY_SIZE);
+    if !chunks.remainder().is_empty() {
         return Err(RecordError::BadIndex);
     }
-    let mut entries: Vec<(f64, u64)> = Vec::with_capacity(payload.len() / INDEX_ENTRY_SIZE);
-    for entry in payload.chunks_exact(INDEX_ENTRY_SIZE) {
+    let mut entries: Vec<(f64, u64)> = Vec::with_capacity(chunks.len());
+    for entry in chunks {
         let time = f64::from_bits(u64_at(entry, 0));
         let offset = u64_at(entry, 8);
         let ordered = entries.last().is_none_or(|&(t, o)| time >= t && offset > o);
