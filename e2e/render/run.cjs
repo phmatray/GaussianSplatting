@@ -5,7 +5,7 @@
 // Environment:
 //   SKIP_BUILD=1       use the existing crates/gs-render-harness/dist
 //   GS_RENDER_OUT=dir  where screenshots and reports go (default: out/render-e2e)
-//   ONLY=compare,xr    run a subset (compare, modes, nav, live, xr, robust, perf),
+//   ONLY=compare,xr    run a subset (compare, modes, adversarial, nav, live, xr, robust, perf),
 //                      or `measure`: pictures and timings of the blending
 //                      modes (see measure.cjs), not part of the default run
 //   PERF_N=200000,1000000   splat counts of the perf check
@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const lib = require('./lib.cjs');
 
-const SUITES = ['compare', 'modes', 'nav', 'live', 'xr', 'robust', 'perf'];
+const SUITES = ['compare', 'modes', 'adversarial', 'nav', 'live', 'xr', 'robust', 'perf'];
 // On request only (ONLY=measure): pictures and timings, not checks.
 const OPTIONAL = ['measure'];
 

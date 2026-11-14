@@ -241,6 +241,9 @@ impl Inner {
         self.nav.borrow_mut().clear_keys();
         self.xr_miniature_request.set(None);
         let raf_handle = session.request_animation_frame(callbacks.xr_frame.as_ref().unchecked_ref());
+        // The eyes have a size of their own: targets that could not be
+        // allocated for the canvas may well fit.
+        self.retry_normalized();
         *self.xr.borrow_mut() = Some(XrState {
             session: session.clone(),
             space,
@@ -286,6 +289,8 @@ impl Inner {
             self.gl.bind_framebuffer(GL::FRAMEBUFFER, None);
             self.lines.borrow_mut().set_overlay(&LineBatch::default());
         }
+        // Back to views of the canvas size.
+        self.retry_normalized();
         self.last_frame_ms.set(None);
         self.dirty.set(true);
         self.notify_xr(false);

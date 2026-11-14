@@ -39,15 +39,19 @@
 //! * `orbitCheck(steps, degrees)`: every view of an orbit on the GPU and on
 //!   the CPU: how well each pair agrees, and how much consecutive pictures
 //!   differ in either sequence. A renderer that pops or flickers on its own
-//!   changes more from frame to frame than its reference does.
+//!   changes more from frame to frame than its reference does. On the still
+//!   stage the same is reported for the ray-traced scene itself (`truth`):
+//!   how much an ideal picture changes over the same orbit.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use glam::Vec3;
+use gs_core::capture::render_reference;
 use gs_core::experimental::wblend::{self, WblendOptions};
 use gs_core::pipeline::Pipeline;
 use gs_core::raster::{mean_abs_error, psnr, Image};
+use gs_core::scene::{Scene, SceneSnapshot, StageScene};
 use gs_core::{Aabb, Camera, Splat};
 use gs_render::{
     ActiveBlend, GizmoScene, GridGizmo, LayerContent, NavMode, RenderParams, SceneHints, Viewer, ViewerOptions, LAYER_DYNAMIC, LAYER_STATIC,
@@ -65,6 +69,9 @@ struct Page {
     viewer: Viewer,
     canvas: HtmlCanvasElement,
     cloud: SceneCloud,
+    /// The stage itself at the instant of the cloud, for ray-traced ground
+    /// truth (`None` in the house, and once the stage is animated).
+    truth: Option<SceneSnapshot>,
     /// The ticking pipeline of `animate=1`.
     pipeline: RefCell<Option<Pipeline>>,
     paused: Cell<bool>,
@@ -324,12 +331,19 @@ impl Page {
 
     /// `orbitCheck(steps, degrees)`: see the module documentation.
     fn orbit_check(&self, steps: u32, degrees: f32) -> JsValue {
-        let (mut gpu_changes, mut cpu_changes) = (Changes::default(), Changes::default());
+        let (mut gpu_changes, mut cpu_changes, mut truth_changes) = (Changes::default(), Changes::default(), Changes::default());
         let (mut worst, mut sum, mut frames) = (f32::INFINITY, 0.0f64, 0u32);
+        let background = self.viewer.params().background.map(|c| (c * 255.0).round() as u8);
         for i in 0..steps.clamp(2, 400) {
             let cam = self.orbited((degrees * i as f32).to_radians());
             let Ok(gpu) = self.viewer.snapshot(&cam) else { continue };
             let cpu = self.reference(&cam);
+            if let Some(scene) = &self.truth {
+                // The picture an ideal reconstruction would give: what the
+                // frame-to-frame change of any renderer is measured against.
+                let frame = render_reference(scene, &cam, true, 3, background);
+                truth_changes.push(Image { width: frame.width, height: frame.height, rgb: frame.rgb });
+            }
             let agreement = psnr(&gpu, &cpu).min(99.0);
             worst = worst.min(agreement);
             sum += agreement as f64;
@@ -345,6 +359,9 @@ impl Page {
         dom::set(&out, "meanPsnr", sum / frames.max(1) as f64);
         dom::set(&out, "gpu", gpu_changes.report(blend));
         dom::set(&out, "cpu", cpu_changes.report(blend));
+        if self.truth.is_some() {
+            dom::set(&out, "truth", truth_changes.report("ground truth"));
+        }
         out.into()
     }
 
@@ -481,8 +498,9 @@ async fn run(canvas: HtmlCanvasElement) -> Result<(), String> {
     } else {
         None
     };
+    let truth = (!house && !animate).then(|| StageScene::new().snapshot(time));
     let page =
-        Rc::new(Page { viewer, canvas, cloud, pipeline: RefCell::new(pipeline), paused: Cell::new(false), ticks: Cell::new(0) });
+        Rc::new(Page { viewer, canvas, cloud, truth, pipeline: RefCell::new(pipeline), paused: Cell::new(false), ticks: Cell::new(0) });
     export(&page);
     if animate {
         let p = page.clone();

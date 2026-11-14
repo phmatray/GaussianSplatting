@@ -628,6 +628,10 @@ impl Inner {
         let moved = self.nav.borrow_mut().update(dt);
         // The runtime owns the canvas size during a VR session; here it is ours.
         let (width, height, resized, px_scale) = self.resize_canvas();
+        if resized {
+            // Targets of another size: worth another try.
+            self.retry_normalized();
+        }
         let hidden = self.canvas.client_width() == 0 || self.canvas.client_height() == 0;
         if hidden || !(moved || resized || self.dirty.get()) {
             self.record_frame(interval, self.now() - start, None);
@@ -661,6 +665,15 @@ impl Inner {
         self.record_frame(interval, self.now() - start, Some((width, height)));
     }
 
+    /// Lets the next frame try the normalised mode again after its render
+    /// targets could not be allocated: the views are about to change size.
+    /// Never panics, whatever event handler it is called from.
+    fn retry_normalized(&self) {
+        if let Ok(mut scene) = self.scene.try_borrow_mut() {
+            scene.retry_normalized();
+        }
+    }
+
     /// Makes the draw order valid for `view` when the frame is drawn sorted;
     /// the normalised mode has no order. Once per frame, before its views.
     fn prepare_order(
@@ -684,8 +697,10 @@ impl Inner {
     /// set, ready for the gizmo lines.
     ///
     /// When the normalised mode fails here (its render targets could not be
-    /// allocated) it is given up for this context and the view is drawn
-    /// sorted instead; `blend_status` reports the fallback from then on.
+    /// allocated) it is suspended and the view is drawn sorted instead;
+    /// `blend_status` reports the fallback until the size of the views
+    /// changes (a resize, a VR session starting or ending) or the context is
+    /// restored, when the mode is tried again.
     fn draw_splats(&self, scene: &mut SplatScene, status: BlendStatus, vp: &ViewParams, params: &RenderParams, clip_y: f32, output: Output) {
         let gl = &self.gl;
         let (framebuffer, [x, y, width, height]) = (output.framebuffer, output.viewport);
@@ -698,8 +713,12 @@ impl Inner {
             match scene.draw_normalized(vp, params, clip_y, quality, output) {
                 Ok(()) => return,
                 Err(error) => {
-                    web_sys::console::warn_1(&format!("gs-render: normalised blending failed, falling back to sorted blending: {error}").into());
-                    scene.disable_normalized();
+                    // Announced when it happens, not on every retry.
+                    if scene.suspend_normalized() {
+                        web_sys::console::warn_1(
+                            &format!("gs-render: normalised blending failed, falling back to sorted blending: {error}").into(),
+                        );
+                    }
                     let key = SortKey { show: [params.show_static, params.show_dynamic], clip_y };
                     scene.sort(&vp.view, key, &|| self.now(), true);
                 }
@@ -748,9 +767,20 @@ impl Inner {
             let vp = ViewParams::from_projection(cam.view_matrix(), &cam.projection_matrix(NEAR, FAR), width as f32, height as f32);
             let mut scene = self.scene.borrow_mut();
             let status = scene.blend_status(&params);
+            let suspended = scene.normalized_suspended();
             self.prepare_order(&mut scene, status, &vp.view, &params, clip_y, true);
             let output = Output { framebuffer: Some(&framebuffer), viewport: [0, 0, width as i32, height as i32] };
             self.draw_splats(&mut scene, status, &vp, &params, clip_y, output);
+            if (width, height) != (self.canvas.width(), self.canvas.height()) {
+                // Targets of the snapshot's size are of no use to the next
+                // frame, and a large snapshot's would stay allocated until
+                // then. Nor does a snapshot too large for the normalised
+                // mode say anything about the canvas.
+                scene.release_normalized_targets();
+                if !suspended {
+                    scene.retry_normalized();
+                }
+            }
             // The order texture now belongs to this camera; the next sorted frame re-sorts.
             scene.invalidate_order();
             result = gl.read_pixels_with_opt_u8_array(0, 0, width as i32, height as i32, GL::RGBA, GL::UNSIGNED_BYTE, Some(&mut rgba));

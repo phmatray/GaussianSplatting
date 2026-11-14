@@ -114,7 +114,8 @@ pub enum BlendReason {
     /// The normalised mode was wanted and the extension exists, but its
     /// shaders did not compile or its render targets could not be created
     /// (out of memory, an incomplete framebuffer); the browser console has
-    /// the details.
+    /// the details. Targets are tried again when the size of the views
+    /// changes: a resized canvas, a VR session starting or ending.
     TargetsFailed,
 }
 

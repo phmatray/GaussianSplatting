@@ -100,12 +100,13 @@ function instrument() {
     }
     return list;
   }
-  function inspect(gl, what) {
+  function inspect(gl, what, draws) {
     stats.draws++;
     if (gl.isContextLost()) return;
     const program = gl.getParameter(gl.CURRENT_PROGRAM);
     const framebuffer = gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING);
-    if (program && framebuffer) {
+    // A clear or a read-back runs no program: only draws can sample.
+    if (draws && program && framebuffer) {
       const attached = [];
       for (const attachment of [gl.DEPTH_ATTACHMENT, gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3]) {
         if (gl.getFramebufferAttachmentParameter(gl.DRAW_FRAMEBUFFER, attachment, gl.FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) === gl.TEXTURE) {
@@ -129,7 +130,7 @@ function instrument() {
     const real = P[name];
     P[name] = function (...args) {
       const result = real.apply(this, args);
-      inspect(this, name);
+      inspect(this, name, name.startsWith('draw'));
       return result;
     };
   }
@@ -229,7 +230,9 @@ async function stress(browser, url) {
   console.log('\n=== adversarial: GL objects, errors and feedback loops under stress ===');
   const cycles = Number(process.env.ADV_CYCLES || 200);
   const xr = !!iwerBundle();
-  const { ctx, page, logs } = await open(browser, url, { iwer: xr });
+  // With the gizmo lines: their pass samples the visibility depth of the
+  // normalised mode right after it was rendered.
+  const { ctx, page, logs } = await open(browser, url, { iwer: xr, extra: '&gizmos=1' });
   const SIZES = [[480, 300], [400, 260], [520, 280], [360, 300]];
   const MODES = ['soft', 'hard', 'sorted'];
   const PERIOD = 12;
@@ -271,7 +274,6 @@ async function stress(browser, url) {
   // The sorted picture and the gizmo lines must not depend on what was drawn
   // before: the passes of the normalised mode leave the GL state usable.
   await page.setViewportSize({ width: 480, height: 300 });
-  await cmd(page, 'gizmos', true);
   await setMode(page, 'sorted');
   const fAfter = await shot(page, 'adversarial-gizmos-sorted-after-stress.png');
   await setMode(page, 'soft');
@@ -300,7 +302,7 @@ async function canvas(browser, url) {
     await sized(480, 300);
     await setMode(page, rendering);
     await canvasMatches(page, 'at 480x300', rendering, targets(480, 300));
-    await page.setViewportSize({ width: 371, height: 233 });
+    await metrics(371, 233, 1);
     await sized(371, 233);
     await canvasMatches(page, 'resized to an odd 371x233', rendering, targets(371, 233));
     await metrics(300, 200, 2);
@@ -393,11 +395,18 @@ async function temporal(browser, url) {
     check(`adversarial: every frame of the orbit matches the reference [${blend}] (worst PSNR >= ${MIN_PSNR[blend]} dB)`, r.blend === blend && r.frames === 60 && r.worstPsnr >= MIN_PSNR[blend],
       `worst ${r.worstPsnr.toFixed(2)} dB, mean ${r.meanPsnr.toFixed(2)} dB over ${r.frames} frames`);
     // Frame-to-frame change of the GPU sequence against the reference's
-    // own: within 5 % of it plus one pixel in ten thousand.
-    const calm = (g, c) => g <= 1.05 * c + 1e-4;
+    // own. Normalised: within 5 % of it plus one pixel in ten thousand.
+    // Sorted: the 8-bit framebuffer rounds after every splat, a noise of a
+    // quarter of a level that is new in every frame; large jumps must
+    // still be the reference's.
+    const sorted = rendering === 'sorted';
+    const calm = (g, c, slack) => g <= 1.05 * c + slack;
     check(`adversarial: the GPU orbit changes from frame to frame as the reference does, no more [${blend}]`,
-      calm(r.gpu.jumpFraction8, r.cpu.jumpFraction8) && calm(r.gpu.jumpFraction32, r.cpu.jumpFraction32) && r.gpu.meanAbsDiff <= 1.05 * r.cpu.meanAbsDiff + 0.01,
+      calm(r.gpu.jumpFraction8, r.cpu.jumpFraction8, sorted ? 1e-3 : 1e-4) && calm(r.gpu.jumpFraction32, r.cpu.jumpFraction32, 1e-4) && calm(r.gpu.meanAbsDiff, r.cpu.meanAbsDiff, sorted ? 0.15 : 0.01),
       `pixels changing by more than 8 levels per 0.5 degree: GPU ${pct(r.gpu.jumpFraction8)}, CPU ${pct(r.cpu.jumpFraction8)}; more than 32: GPU ${pct(r.gpu.jumpFraction32)}, CPU ${pct(r.cpu.jumpFraction32)}; mean abs diff GPU ${r.gpu.meanAbsDiff.toFixed(3)}, CPU ${r.cpu.meanAbsDiff.toFixed(3)}`);
+    if (r.truth) {
+      console.log(`      the scene itself (ray-traced): ${pct(r.truth.jumpFraction8)} of the pixels change by more than 8 levels, ${pct(r.truth.jumpFraction32)} by more than 32, mean abs diff ${r.truth.meanAbsDiff.toFixed(3)}`);
+    }
   }
   fs.writeFileSync(path.join(OUT, 'adversarial-temporal.json'), JSON.stringify(rows, null, 2));
   const errs = consoleErrors(logs);
@@ -463,6 +472,40 @@ async function fallback(browser, url) {
       await canvasMatches(page, 'with an RGBA16F coverage target', rendering);
     }
     cleanGl('RGBA16F coverage target', await glStats(page), logs);
+    await ctx.close();
+  }
+
+  // Targets that cannot be allocated once (memory pressure, a huge canvas):
+  // sorted while it lasts, normalised again at the next size.
+  {
+    const { ctx, page, logs } = await open(browser, url, { instrumented: false });
+    const sized = (w, h) => page.waitForFunction(([w, h]) => { const s = window.__scene.state(); return s.canvasWidth === w && s.canvasHeight === h; }, [w, h], { timeout: 20000 }).catch(() => {});
+    await page.evaluate(() => {
+      window.__realStatus = WebGL2RenderingContext.prototype.checkFramebufferStatus;
+      WebGL2RenderingContext.prototype.checkFramebufferStatus = () => 0x8cd6;
+    });
+    for (const [width, height] of [[500, 320], [460, 280], [440, 300]]) {
+      await page.setViewportSize({ width, height });
+      await sized(width, height);
+      await drawn(page);
+    }
+    let s = await state(page);
+    const warnings = logs.filter((l) => /falling back to sorted blending/.test(l)).length;
+    check('adversarial: while the targets cannot be allocated the viewer draws sorted, says why, and warns once', s.blend === 'sorted' && s.blendReason === 'targets-failed' && s.blendFallback && s.offscreen[0] === 0 && warnings === 1,
+      `${s.blend} (${s.blendReason}), ${warnings} console warning(s) over three resizes`);
+    await canvasMatches(page, 'during the fallback', 'sorted');
+    await page.evaluate(() => { WebGL2RenderingContext.prototype.checkFramebufferStatus = window.__realStatus; });
+    await drawn(page);
+    s = await state(page);
+    check('adversarial: the fallback lasts as long as the views keep their size', s.blend === 'sorted' && s.blendReason === 'targets-failed', `${s.blend} (${s.blendReason})`);
+    await page.setViewportSize({ width: 480, height: 300 });
+    await sized(480, 300);
+    await drawn(page);
+    s = await state(page);
+    check('adversarial: after a transient allocation failure the normalised mode comes back with the next resize', s.blend === 'normalized-soft' && !s.blendFallback && s.offscreen[0] === 480, `${s.blend} (${s.blendReason}), targets ${s.offscreen.join('x')}`);
+    await canvasMatches(page, 'after the failure has passed', 'soft');
+    const errs = consoleErrors(logs);
+    check('adversarial: no console errors around the allocation failure', errs.length === 0, errs.slice(0, 4).join(' | '));
     await ctx.close();
   }
 

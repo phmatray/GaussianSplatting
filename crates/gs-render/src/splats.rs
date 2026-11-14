@@ -160,6 +160,9 @@ pub(crate) struct SplatScene {
     sorted: Sorted,
     /// The normalised mode, or why this context cannot have it.
     normalized: Result<Normalized, BlendReason>,
+    /// The render targets of the normalised mode could not be allocated for
+    /// a view: the mode is suspended until [`SplatScene::retry_normalized`].
+    targets_failed: bool,
     /// Splats submitted by the most recent draw.
     drawn: u32,
     /// Duration of the last sort, milliseconds.
@@ -369,6 +372,7 @@ impl SplatScene {
                 sorted_last_frame: false,
             },
             normalized: create_normalized(gl),
+            targets_failed: false,
             drawn: 0,
             sort_ms: 0.0,
             sort_count: 0,
@@ -387,6 +391,7 @@ impl SplatScene {
         self.pipeline = Pipeline::new(&self.gl, self.layout.max_rows)?;
         // The old programs and targets died with the old context.
         self.normalized = create_normalized(&self.gl);
+        self.targets_failed = false;
         self.detached = false;
         self.sorted.version = 0;
         self.sorted.instances = 0;
@@ -430,6 +435,7 @@ impl SplatScene {
         let content: [Option<LayerContent>; LAYER_COUNT] =
             std::array::from_fn(|i| (shown[i] && !self.layers[i].splats.is_empty()).then_some(self.layers[i].content));
         let support = match &self.normalized {
+            Ok(_) if self.targets_failed => NormalizedSupport::Unavailable(BlendReason::TargetsFailed),
             Ok(_) => NormalizedSupport::Available,
             Err(reason) => NormalizedSupport::Unavailable(*reason),
         };
@@ -460,16 +466,26 @@ impl SplatScene {
         }
     }
 
-    /// Gives the normalised mode up for this context (a render target could
-    /// not be allocated): [`Self::blend_status`] reports the fallback from
-    /// now on.
-    pub fn disable_normalized(&mut self) {
-        if let Ok(normalized) = &mut self.normalized {
-            if !self.detached {
-                normalized.destroy(&self.gl);
-            }
-        }
-        self.normalized = Err(BlendReason::TargetsFailed);
+    /// Suspends the normalised mode (a render target could not be
+    /// allocated): [`Self::blend_status`] reports the fallback until
+    /// [`Self::retry_normalized`]. Returns whether it was available before,
+    /// that is, whether this is news.
+    pub fn suspend_normalized(&mut self) -> bool {
+        self.release_normalized_targets();
+        self.normalized.is_ok() && !std::mem::replace(&mut self.targets_failed, true)
+    }
+
+    /// Lets the next frame try the normalised mode again after
+    /// [`Self::suspend_normalized`]: the size of the view has changed, so
+    /// the targets that could not be allocated are no longer the ones asked
+    /// for.
+    pub fn retry_normalized(&mut self) {
+        self.targets_failed = false;
+    }
+
+    /// Whether the normalised mode is suspended.
+    pub fn normalized_suspended(&self) -> bool {
+        self.targets_failed
     }
 
     /// Copy of all splats, layer 0 first.

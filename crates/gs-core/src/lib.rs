@@ -6,11 +6,13 @@
 pub mod capture;
 pub mod codec;
 pub mod experimental;
+pub mod ingest;
 pub mod io;
 pub mod multiview;
 pub mod pipeline;
 pub mod protocol;
 pub mod raster;
+pub mod record;
 pub mod reconstruct;
 pub mod rig;
 pub mod scene;
