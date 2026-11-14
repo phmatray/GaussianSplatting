@@ -44,8 +44,8 @@ use crate::scenes::{self, SceneCloud};
 const BACKGROUND: [u8; 3] = [18, 20, 28];
 /// The difference image is amplified by this factor.
 const DIFF_GAIN: u8 = 16;
-const WIDTH: u32 = 480;
-const HEIGHT: u32 = 360;
+pub(crate) const WIDTH: u32 = 480;
+pub(crate) const HEIGHT: u32 = 360;
 
 /// How the splats of a case reach the viewer.
 #[derive(Clone, Copy, PartialEq)]
@@ -66,7 +66,7 @@ struct Case {
     params: RenderParams,
 }
 
-fn base_params() -> RenderParams {
+pub(crate) fn base_params() -> RenderParams {
     RenderParams {
         background: BACKGROUND.map(|c| c as f32 / 255.0),
         // The reference has no fill-rate clamp.
@@ -76,7 +76,7 @@ fn base_params() -> RenderParams {
     }
 }
 
-fn look_at(eye: [f32; 3], target: [f32; 3], width: u32, height: u32) -> Camera {
+pub(crate) fn look_at(eye: [f32; 3], target: [f32; 3], width: u32, height: u32) -> Camera {
     Camera::look_at(Vec3::from(eye), Vec3::from(target), Vec3::Y, 50f32.to_radians(), width, height)
 }
 
@@ -388,7 +388,7 @@ async fn canvas_case(
 }
 
 /// Renders one case on the GPU and on the CPU and publishes the outcome.
-async fn run_case(viewer: &Viewer, results: &js_sys::Array, name: &str, cam: &Camera, params: RenderParams) -> Result<(), String> {
+pub(crate) async fn run_case(viewer: &Viewer, results: &js_sys::Array, name: &str, cam: &Camera, params: RenderParams) -> Result<(), String> {
     dom::set_status(&format!("compare: {name}"));
     // Let the page paint the previous row.
     dom::sleep(0).await;
@@ -416,7 +416,7 @@ async fn run_case(viewer: &Viewer, results: &js_sys::Array, name: &str, cam: &Ca
 }
 
 /// The three renderings of surfel content, with the suffix of their cases.
-fn renderings(params: RenderParams) -> [(&'static str, RenderParams); 3] {
+pub(crate) fn renderings(params: RenderParams) -> [(&'static str, RenderParams); 3] {
     [
         ("sorted", RenderParams { blend: BlendMode::Sorted, ..params }),
         ("hard", RenderParams { blend: BlendMode::Normalized, quality: BlendQuality::Hard, ..params }),

@@ -9,15 +9,17 @@
 //! Query parameters: `scene`, `time=<s>` (instant of the dance, default
 //! 2.4), `blend`, `quality`, `mask_float=1`, `light=1` (the light pipeline
 //! preset), `patch=<JSON>` (merged into the pipeline configuration),
-//! `gizmos=1`.
+//! `gizmos=1`, `max_dpr=<n>` (how much of the device pixel ratio the canvas
+//! follows, default 1).
 //!
 //! For scripts, `window.__scene`:
 //!
 //! * `state()`: splat counts, blending status, statistics, the session.
 //! * `cmd(name, arg)`: `view [ex, ey, ez, tx, ty, tz]`, `blend`, `quality`,
 //!   `clipY`, `fov`, `points`, `gizmos`, `splatScale`, `sortedScale`,
-//!   `cullBackfaces`, `showDynamic`, `liveWeight`, `content`, `nav`,
-//!   `enterXr`, `exitXr`, `miniature`, `pause`.
+//!   `cullBackfaces`, `showDynamic`, `liveWeight`, `weights [static, live]`,
+//!   `renderScale`, `content`, `nav`, `enterXr`, `exitXr`, `miniature`,
+//!   `pause`.
 //! * `timing(frames)`: draws `frames` frames of a slow orbit synchronously
 //!   (each one read back, so the GPU work is included) at the canvas size
 //!   and returns milliseconds per frame (mean, fastest, median) and the
@@ -30,6 +32,14 @@
 //!   on, that is the flicker of the renderer on a noisy live layer.
 //! * `fragments()`: fragments per pixel of the current view and mode,
 //!   counted by the CPU reference.
+//! * `compareCanvas()` (a promise): the canvas as the frame loop draws it
+//!   against the CPU reference of the current mode, camera and canvas size.
+//!   The check to run after anything that could leave the renderer in a
+//!   wrong state: a resize, a mode switch, a lost context.
+//! * `orbitCheck(steps, degrees)`: every view of an orbit on the GPU and on
+//!   the CPU: how well each pair agrees, and how much consecutive pictures
+//!   differ in either sequence. A renderer that pops or flickers on its own
+//!   changes more from frame to frame than its reference does.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -37,7 +47,7 @@ use std::rc::Rc;
 use glam::Vec3;
 use gs_core::experimental::wblend::{self, WblendOptions};
 use gs_core::pipeline::Pipeline;
-use gs_core::raster::Image;
+use gs_core::raster::{mean_abs_error, psnr, Image};
 use gs_core::{Aabb, Camera, Splat};
 use gs_render::{
     ActiveBlend, GizmoScene, GridGizmo, LayerContent, NavMode, RenderParams, SceneHints, Viewer, ViewerOptions, LAYER_DYNAMIC, LAYER_STATIC,
@@ -46,6 +56,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
 
+use crate::compare::reference_image;
 use crate::dom;
 use crate::live::{mask_float_targets, parse_blend, parse_quality};
 use crate::scenes::{self, SceneCloud};
@@ -154,6 +165,13 @@ impl Page {
                 let weight = arg.as_f64().unwrap_or(f64::NAN) as f32;
                 viewer.set_params(RenderParams { layer_weights: [params.layer_weights[0], weight], ..params });
             }
+            "weights" => {
+                let v = numbers_of(arg);
+                if v.len() == 2 {
+                    viewer.set_params(RenderParams { layer_weights: [v[0], v[1]], ..params });
+                }
+            }
+            "renderScale" => viewer.set_params(RenderParams { render_scale: arg.as_f64().unwrap_or(1.0) as f32, ..params }),
             // What both layers are taken to hold: "imported" draws them as
             // the viewer drew everything before the blending modes existed
             // (sorted, plain dilation), "surfels" is what the wire delivers.
@@ -270,6 +288,66 @@ impl Page {
         out.into()
     }
 
+    /// The CPU reference of what the viewer draws for `cam` right now.
+    fn reference(&self, cam: &Camera) -> Image {
+        let params = self.viewer.params();
+        // The clear colour as the framebuffer rounds it.
+        let background = params.background.map(|c| (c * 255.0).round() as u8);
+        reference_image(&self.viewer, cam, &params, background, gs_core::splat::DEFAULT_NEAR)
+    }
+
+    /// `compareCanvas()`: see the module documentation.
+    async fn compare_canvas(&self) -> Result<JsValue, JsValue> {
+        for _ in 0..600 {
+            let rendered = self.viewer.stats().frames_rendered;
+            // Marks the view dirty, so that the next frame draws.
+            self.viewer.set_view(self.viewer.eye(), self.viewer.target());
+            dom::next_frame().await;
+            if self.viewer.stats().frames_rendered == rendered {
+                continue;
+            }
+            // Still inside the frame that drew: the buffer is intact.
+            let gpu = dom::read_canvas(&self.canvas).ok_or("could not read the canvas back")?;
+            let cam = Camera::look_at(self.viewer.eye(), self.viewer.target(), Vec3::Y, self.viewer.fov_y(), gpu.width, gpu.height);
+            let cpu = self.reference(&cam);
+            let out = js_sys::Object::new();
+            dom::set(&out, "blend", self.viewer.blend_status().active.as_str());
+            dom::set(&out, "width", gpu.width);
+            dom::set(&out, "height", gpu.height);
+            // JSON has no Infinity: identical images report 99 dB.
+            dom::set(&out, "psnr", psnr(&gpu, &cpu).min(99.0));
+            dom::set(&out, "mae", mean_abs_error(&gpu, &cpu));
+            return Ok(out.into());
+        }
+        Err("the viewer never drew a frame".into())
+    }
+
+    /// `orbitCheck(steps, degrees)`: see the module documentation.
+    fn orbit_check(&self, steps: u32, degrees: f32) -> JsValue {
+        let (mut gpu_changes, mut cpu_changes) = (Changes::default(), Changes::default());
+        let (mut worst, mut sum, mut frames) = (f32::INFINITY, 0.0f64, 0u32);
+        for i in 0..steps.clamp(2, 400) {
+            let cam = self.orbited((degrees * i as f32).to_radians());
+            let Ok(gpu) = self.viewer.snapshot(&cam) else { continue };
+            let cpu = self.reference(&cam);
+            let agreement = psnr(&gpu, &cpu).min(99.0);
+            worst = worst.min(agreement);
+            sum += agreement as f64;
+            frames += 1;
+            gpu_changes.push(gpu);
+            cpu_changes.push(cpu);
+        }
+        let blend = self.viewer.blend_status().active.as_str();
+        let out = js_sys::Object::new();
+        dom::set(&out, "blend", blend);
+        dom::set(&out, "frames", frames);
+        dom::set(&out, "worstPsnr", if frames > 0 { worst } else { 0.0 });
+        dom::set(&out, "meanPsnr", sum / frames.max(1) as f64);
+        dom::set(&out, "gpu", gpu_changes.report(blend));
+        dom::set(&out, "cpu", cpu_changes.report(blend));
+        out.into()
+    }
+
     /// `fragments()`: see the module documentation.
     fn fragments(&self) -> JsValue {
         let cam = self.camera();
@@ -342,6 +420,17 @@ fn export(page: &Rc<Page>) {
     dom::set(&api, "flicker", flicker.as_ref().clone());
     flicker.forget();
     let p = page.clone();
+    let compare = Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
+        let p = p.clone();
+        wasm_bindgen_futures::future_to_promise(async move { p.compare_canvas().await })
+    });
+    dom::set(&api, "compareCanvas", compare.as_ref().clone());
+    compare.forget();
+    let p = page.clone();
+    let orbit = Closure::<dyn FnMut(u32, f32) -> JsValue>::new(move |steps: u32, degrees: f32| p.orbit_check(steps, degrees));
+    dom::set(&api, "orbitCheck", orbit.as_ref().clone());
+    orbit.forget();
+    let p = page.clone();
     let fragments = Closure::<dyn FnMut() -> JsValue>::new(move || p.fragments());
     dom::set(&api, "fragments", fragments.as_ref().clone());
     fragments.forget();
@@ -371,7 +460,7 @@ async fn run(canvas: HtmlCanvasElement) -> Result<(), String> {
         nav_mode: NavMode::Orbit,
         eye: Vec3::from_array(session.viewer_start.eye),
         target: Vec3::from_array(session.viewer_start.target),
-        max_dpr: 1.0,
+        max_dpr: dom::query_number("max_dpr", 1.0f32),
         ..ViewerOptions::default()
     };
     let viewer = Viewer::new(canvas.clone(), options).map_err(|e| format!("{e:?}"))?;

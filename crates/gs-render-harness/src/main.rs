@@ -5,6 +5,10 @@
 //!
 //! * `?test=compare` — GPU renderer against the CPU reference rasterizer on
 //!   deterministic clouds; PSNR per case in `window.__results`.
+//! * `?test=adversarial` — the same comparison on hand-built surfel clouds
+//!   and viewpoints that stress one decision of the normalised mode each
+//!   (near plane, grazing angles, the depth tolerance, culling, far views,
+//!   extreme layer weights, empty layers).
 //! * `?test=live` (default) — animated cloud through `Viewer::apply_message`,
 //!   with navigation, gizmos and an "Enter VR" button.
 //! * `?test=perf&n=200000` — sort and frame times for `n` splats in
@@ -22,6 +26,8 @@
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod clouds;
 
+#[cfg(target_arch = "wasm32")]
+mod adversarial;
 #[cfg(target_arch = "wasm32")]
 mod compare;
 #[cfg(target_arch = "wasm32")]
@@ -49,6 +55,7 @@ fn main() {
     dom::set_global("__test", &test.as_str().into());
     let started = match test.as_str() {
         "compare" => compare::start(),
+        "adversarial" => adversarial::start(),
         "perf" => perf::start(),
         "scene" => scene::start(),
         "drop" => drop_in_callback::start(),

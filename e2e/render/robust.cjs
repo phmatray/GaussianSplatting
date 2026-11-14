@@ -555,5 +555,5 @@ async function run({ browser, url }) {
   }
 }
 
-module.exports = { run };
+module.exports = { run, stereoAgainstReference };
 if (require.main === module) main(run);
