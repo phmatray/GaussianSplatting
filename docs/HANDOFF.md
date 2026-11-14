@@ -42,7 +42,38 @@ visionneuse WebGL2 affiche le résultat, aussi en réalité virtuelle (WebXR).
 
 ### Vérifié ici, par des tests relancés sur l'arbre final
 
-REMPLIR_SUITES
+Tout a tourné sous Linux, dans une machine virtuelle à 4 cœurs sans carte
+graphique.
+
+| Suite | Résultat sur l'arbre livré |
+| --- | --- |
+| `cargo test --no-fail-fast` (36 binaires de test) | 783 réussis, 0 échec, 7 ignorés. Relancé deux fois, par le relecteur final puis par l'orchestrateur. |
+| `cargo clippy --workspace --all-targets` | 0 avertissement |
+| `cargo clippy --target wasm32-unknown-unknown -p gs-app -p gs-worker -p gs-render` | 0 avertissement |
+| `cargo test -p splat-live` (coquille Tauri) | 4 réussis |
+| `python3 -m unittest discover -s tools` | 88 réussis |
+| `e2e/render` | 379 sur 379 |
+| `e2e/server` | `capture.py` 79, `refine.py` 41, `hostile.py` 102, `abuse.py` 40, `browser.cjs` 18, `real-frontend.cjs` 27, `share.cjs` 40, `tauri-smoke.sh` 21, `tauri-real.sh --debug` 15 : tous réussis |
+| `e2e/app` | 499 sur 500 en passe complète. L'échec est un contrôle sensible au temps, décrit en section 6. |
+
+Deux précisions sur l'ordre des passes : `e2e/render` et la passe complète de
+`e2e/app` ont tourné avant le tout dernier changement du serveur (le
+classement des adresses réseau, une fonction dans `net.rs`). Après ce
+changement ont été relancés tout `e2e/server` et les suites `capture`,
+`server`, `studio`, `refine`, `shared` et `lanvr` de `e2e/app` (166 sur 167,
+l'échec étant l'autre contrôle sensible au temps de la section 6).
+
+Vérifications faites une fois à la main par le relecteur final, dont les
+scripts ne sont pas dans le dépôt :
+
+- 110 scénarios sur le travail d'affinage du serveur : noms piégés, règles
+  d'origine et de réseau, huit démarrages simultanés, annulation puis
+  relance, capture supprimée en cours de travail, captures abîmées ou
+  vides, arrêt du serveur par SIGTERM et SIGKILL en plein travail.
+- Disque réellement plein (volume en mémoire de 300 Mo) : 18 contrôles.
+- Le parcours complet par l'interface : téléphone simulé qui envoie 220
+  images, fin de capture, affinage `rapide` réel pendant que la capture est
+  encore affichée (118 secondes), puis « Voir le résultat ».
 
 Chaque lot a été écrit par un agent puis attaqué par un second agent
 indépendant, chargé de le réfuter. Ces vérificateurs ont trouvé et corrigé de
@@ -362,7 +393,106 @@ retiré avec la mesure correspondante, sont dans la documentation du crate
 
 ## 5. Risques au premier contact
 
-REMPLIR_RISQUES
+Classés par ordre probable de rencontre. Les numéros de ligne valent pour
+l'arbre livré.
+
+1. **Erreurs de compilation Swift.** Rien sous `ios/SplatCapture` n'a jamais
+   été compilé. Commencer par
+   `cd ios/SplatCapture/Packages/SplatCaptureKit && swift test` (Swift pur,
+   fichiers d'exemple partagés), puis `xcodegen generate` et la compilation.
+   Les usages d'API les plus denses : `App/CaptureEngine.swift`
+   (configuration ARKit 152-179, classification des plans 357-380, délégué
+   d'images 559-661), `App/FrameEncoder.swift` (JPEG par CoreImage 110-129,
+   copies de `CVPixelBuffer` 134-212), `App/ServerLink.swift` (délégué
+   URLSession, épinglage du certificat 97-123), `App/CaptureView.swift`
+   271-360 (ARSCNView, lancer de rayon). `project.yml` fixe `SWIFT_VERSION`
+   5.0 avec la concurrence stricte minimale.
+2. **Le téléphone ne joint pas le Mac.** Vérifier dans cet ordre :
+   - le pare-feu de macOS peut bloquer ou demander une autorisation pour les
+     connexions entrantes sur `0.0.0.0:7879` d'un binaire non signé, et de
+     nouveau après chaque recompilation ;
+   - iOS demande la permission « réseau local » à la première connexion, et
+     cette tentative échoue. Le flux réessaie (`ServerLink.swift:343-365`)
+     mais pas `probe` (`ServerLink.swift:410`) : « joignable » peut afficher
+     faux une fois ;
+   - mauvaise adresse dans le QR code quand le Mac a plusieurs interfaces.
+     Le classement est dans `crates/gs-server/src/net.rs:38` et l'interface
+     n'utilise que l'adresse 0 (`crates/gs-app/src/core.rs:1172`). Essayer
+     `curl 'http://127.0.0.1:7878/api/pair?i=1'` ;
+   - le certificat est renouvelé quand l'adresse du Mac change
+     (`crates/gs-server/src/tls.rs:197-221`) et le jeton change à chaque
+     démarrage du serveur. Dans les deux cas il faut scanner de nouveau le
+     QR code.
+3. **Poignée de main WebSocket depuis `URLSessionWebSocketTask`.** L'écoute
+   du réseau local annonce l'ALPN `h2` puis `http/1.1`
+   (`crates/gs-server/src/tls.rs:80`). `/ingest` n'a été piloté que par des
+   clients Python et Rust en HTTP/1.1, et les envois en HTTP/2 uniquement
+   par curl. Si le téléphone ne reçoit pas `welcome` dans ses 8 secondes
+   (`ServerLink.swift:51`), lancer le serveur avec `--verbose` et essayer
+   une compilation où cette liste ALPN ne contient que `http/1.1`.
+4. **De vraies images dans la chaîne.** Aucune image d'iPhone n'a jamais été
+   ingérée : point principal décentré, vrai bruit et vraie confiance du
+   LiDAR, dérive d'ARKit. L'application envoie par défaut la couleur en 960
+   pixels de large (`CaptureEngine.swift:11`). Surveiller `frames_used`
+   face à `frames_received` dans la carte de capture et le drapeau `used`
+   des accusés de réception ; la fusion est dans
+   `crates/gs-core/src/ingest/session.rs`. Garder le premier `.gscap`
+   (section « Captures et affinage ») : c'est le premier vrai fichier de
+   test.
+5. **WKWebView (la fenêtre Tauri) et Safari n'ont jamais exécuté la
+   visionneuse.** Regarder `#blend-status` dans le panneau
+   (`crates/gs-app/src/ui/sections.rs:267`). S'il indique le mode trié, les
+   cibles en demi-flottants ont été refusées
+   (`crates/gs-render/src/normalized.rs:493`, message dans `splats.rs:181`)
+   et une pièce terminée vue de dessus ressemble à une boîte fermée. Si la
+   fenêtre est vide, suspecter le worker en module
+   (`crates/gs-app/src/transport/worker.rs:26-28`) ou la CSP
+   (`src-tauri/tauri.conf.json:32`) sous `tauri://localhost` ; lancer avec
+   `SPLAT_LIVE_VERBOSE=1` et une compilation de débogage pour avoir
+   l'inspecteur web. Les requêtes de `tauri://localhost` vers
+   `http://127.0.0.1` et `ws://` n'ont été exercées que sur WebKitGTK.
+6. **Téléchargements dans Tauri.** `export_recording` écrit dans
+   `~/Downloads` (`src-tauri/src/main.rs:58`), que macOS protège par une
+   demande d'autorisation, puis appelle `open -R` (`main.rs:179-187`). Rien
+   de cela n'a tourné sur un Mac, et aucun test ne clique un téléchargement
+   dans une fenêtre Tauri pour les types `refined` et `refined_share`.
+   Premiers clics à essayer : télécharger un enregistrement, un résultat
+   affiné, une archive de partage. Un fichier doit apparaître dans
+   Téléchargements et le Finder doit s'ouvrir dessus.
+7. **Durée de l'affinage et fils sur le M5.** Un travail prend tous les
+   cœurs sauf un (`crates/gs-server/src/refine.rs:270`), cœurs économes
+   compris. Comparer avec `--refine-threads` réglé sur le nombre de cœurs
+   performants. Le cache des vues fait 1 Go
+   (`crates/gs-refine/src/job.rs:131`) ; la mémoire n'a été mesurée que sur
+   des captures simulées.
+8. **Espace disque libre.** `statvfs` (`crates/gs-server/src/store.rs:199`)
+   n'a tourné que sous Linux. Vérifier
+   `curl http://127.0.0.1:7878/api/record` et comparer `storage.free_bytes`
+   au Finder. Sur APFS l'espace purgeable n'est pas compté : l'alerte sous
+   2 Gio et le refus 507 à l'envoi peuvent arriver trop tôt. Le
+   comportement sur un disque réellement plein a été vérifié ici, sur un
+   volume en mémoire de 300 Mo.
+9. **Vue en direct depuis Safari** sur iPhone, iPad ou Vision Pro par le
+   réseau local : Safari peut refuser une connexion `wss://` vers un
+   certificat auto-signé même après acceptation de l'avertissement de la
+   page. Les enregistrements et les résultats affinés passent par de
+   simples requêtes HTTPS et sont moins exposés.
+10. **Système de fichiers insensible à la casse (APFS).** Les fichiers en
+    cours d'écriture sont suivis par leur nom exact
+    (`crates/gs-server/src/store.rs:455`) : un `DELETE` qui écrit le nom
+    avec une autre casse passe le contrôle « occupé » et supprime un fichier
+    en cours d'usage. Atteignable seulement depuis la boucle locale avec une
+    origine autorisée ; l'interface utilise toujours le nom listé.
+11. **Prérequis de compilation.** L'espace de travail demande Rust 1.87.
+    Trunk télécharge wasm-bindgen 0.2.130 et wasm-opt pour macOS au premier
+    `trunk build` : cette étape demande le réseau. `bundle.active` vaut
+    `false` dans `src-tauri/tauri.conf.json:44` : `cargo tauri build` donne
+    un binaire nu, pas un `.app`.
+12. **Suites de bout en bout sous macOS.** Voir la section 8. Les contrôles
+    sensibles au temps peuvent se comporter autrement sur une machine bien
+    plus rapide : la suite `refine` de `e2e/app` a besoin qu'un travail de
+    150 itérations dure assez pour être annulé (`e2e/app/refine.cjs`,
+    `ITERATIONS`).
 
 ## 6. Défauts et limites connus
 
@@ -391,8 +521,8 @@ REMPLIR_RISQUES
   taille (688 Mo ont pris 2,0 Go). Avec `Range`, le cache est borné à 96 Mio.
 - Un enregistrement de scan n'a qu'une image clé : chaque retour en arrière
   rejoue le scan jusqu'à l'instant voulu. Pas de lecture à l'envers.
-- Le bouton d'enregistrement tourne jusqu'à 8 Gio ou jusqu'au disque plein ;
-  il n'y a pas de contrôle de l'espace libre.
+- Le bouton d'enregistrement tourne jusqu'à 8 Gio ou jusqu'au disque plein.
+  L'interface avertit sous 2 Gio libres, sans empêcher de démarrer.
 
 ### Serveur
 
@@ -412,7 +542,58 @@ REMPLIR_RISQUES
 - La marche du scan de maison démarre et s'arrête brusquement et ne couvre
   pas le côté ouest de la chambre.
 
-REMPLIR_DEFAUTS_FINAUX
+### Affinage par le serveur
+
+- Le temps restant affiché au début d'un affinage est environ trois fois
+  trop court (« reste environ 37 secondes » à l'itération 20 d'un travail de
+  109 secondes) : les premiers 30 % tournent à demi-largeur et vont plus
+  vite.
+- Un résultat tiré d'une capture d'une seule image, ou mal coupée, est
+  proposé comme un résultat normal.
+- La vue de départ d'une pièce affinée est la position de la première image
+  du téléphone, tournée vers le centre du nuage. Une vraie capture qui
+  commence face à un mur donnera une mauvaise première vue. Un `.ply`
+  produit par la ligne de commande et déposé dans le dossier n'a pas de vue
+  enregistrée et s'ouvre au milieu de ses limites.
+- Un export de jeu de données ne regarde l'annulation que pendant la
+  fusion ; annulé pendant la copie des images, il va au bout puis supprime
+  le dossier.
+- Un travail qui échoue ou panique rapporte `internal` avec un message en
+  anglais seulement.
+- Dans le formulaire, le choix « Peindre d'après les photos » est tronqué à
+  la largeur par défaut du panneau.
+- La zone que le téléphone n'a jamais vue reste une tache sombre dans le
+  résultat (visible au premier plan de la capture d'écran du parcours
+  complet).
+
+### Captures conservées
+
+- Rouvrir une capture conservée (bouton œil) la réimporte et écrit un
+  `.gsrec` de plus à chaque fois.
+- Pas de progression ni d'annulation pendant l'import d'une capture par le
+  serveur : la page montre une barre indéterminée.
+- Le refus d'une capture par un disque plein est dit à la page de bureau
+  seulement, pas à l'iPhone ni aux spectateurs du réseau local.
+- Sur un disque plein, le bouton d'enregistrement répond 500 `internal` au
+  lieu d'un code « disque plein » ; la page est tout de même prévenue par
+  `storage.problem`.
+
+### Tests
+
+- Il n'existe aucune passe entièrement verte de `e2e/app` : 499 sur 500 à
+  la dernière. Le contrôle `soak` de la mémoire du worker échoue plus
+  souvent qu'il ne passe à 40 secondes et passe à `SOAK_S=240` (palier
+  atteint tard, pas une fuite). Un contrôle de `shared` après redémarrage
+  du serveur compare deux valeurs à un instant d'un scan en cours et a
+  échoué une fois. Les deux tests sont laissés tels quels.
+- Le comportement de l'interface pour une capture que le téléphone vient de
+  terminer (affinage immédiat) n'a pas de test de bout en bout dans le
+  dépôt : le serveur a un test Rust, l'interface a été vérifiée une fois à
+  la main.
+- La branche macOS du repli sans `/proc` (`ps -M` dans
+  `e2e/server/abuse.py`) n'a jamais tourné. Les outils Python ont tourné
+  avec Python 3.13 ; avec le 3.9 de macOS, seule l'analyse syntaxique a été
+  vérifiée.
 
 ## 7. Règles du projet
 
@@ -441,16 +622,24 @@ Elles demandent Node, Playwright avec Chromium, et pour `e2e/app` et
 `e2e/server` un serveur compilé en mode release et l'interface construite.
 
 ```bash
-npm install playwright iwer          # dans un dossier au choix
-export GS_NPM_TOOLS=<ce dossier>/node_modules
+(cd e2e && npm install && npx playwright install chromium)   # une fois
 node e2e/render/run.cjs
 SKIP_BUILD=1 node e2e/app/run.cjs
+SKIP_BUILD=1 ONLY=refine node e2e/app/run.cjs                # une seule suite
 python3 e2e/server/capture.py
+python3 e2e/server/refine.py
+python3 e2e/server/hostile.py --quick
+python3 e2e/server/abuse.py
 node e2e/server/share.cjs
-python3 e2e/server/hostile.py
 ```
+
+`e2e/package.json` apporte Playwright et l'émulateur WebXR IWER pour tous les
+scripts ; aucune variable d'environnement n'est nécessaire.
 
 Sur le Mac, ces suites tourneront pour la première fois avec un vrai GPU :
 les contrôles de cadence, épinglés au mode trié à cause du rendu logiciel,
-pourront être resserrés. `e2e/server/tauri-smoke.sh` suppose Xvfb et
-WebKitGTK : il est propre à Linux.
+pourront être resserrés. `e2e/server/tauri-smoke.sh`, `e2e/server/tauri-real.sh` et la suite `webkit`
+de `e2e/app` supposent Xvfb ou WebKitGTK : ils sont propres à Linux (la
+suite `webkit` se saute d'elle-même). `hostile.py` et `abuse.py` lisaient
+`/proc` ; ils se rabattent maintenant sur `ps` et `lsof`, voie forcée et
+vérifiée sous Linux avec `GS_NO_PROC=1`, jamais exécutée sur macOS.
