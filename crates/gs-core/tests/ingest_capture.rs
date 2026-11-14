@@ -692,6 +692,64 @@ fn a_file_imports_to_the_same_cloud_as_its_stream() {
     assert!(session.is_finished() && !session.static_splats().is_empty());
 }
 
+/// A real iPhone sends colour at 1920x1440 in JPEGs of a few hundred
+/// kilobytes, twenty times the frames of the other tests and larger than
+/// the 64 KiB a reader takes at a time. Nothing that size is kept in the
+/// repository: the frames are filmed here.
+#[test]
+fn frames_the_size_of_a_real_phone_go_through_the_stream_and_the_file() {
+    // Grain brings the flat procedural pictures to the weight of photographs.
+    let sim = PhoneSim { color_width: 1920, color_height: 1440, color_grain: 6.0, ..PhoneSim::default() };
+    let (phone, shots) = living_room_shots(sim, 4, 30.0);
+    let frames: Vec<Vec<u8>> = shots.iter().map(|shot| encode_frame(&shot.frame).unwrap()).collect();
+    for (shot, bytes) in shots.iter().zip(&frames) {
+        assert_eq!((shot.frame.color_width, shot.frame.color_height, shot.frame.depth_width, shot.frame.depth_height), (1920, 1440, 256, 192));
+        assert!((200_000..4_000_000).contains(&bytes.len()), "a frame of {} bytes is not phone-sized", bytes.len());
+        assert!(bytes.len() < gs_core::ingest::MAX_INGEST_MESSAGE_BYTES, "a frame of {} bytes does not fit in a message", bytes.len());
+    }
+
+    // As a stream: every frame is decoded at a reduced scale and used.
+    let mut streamed = session(CaptureMode::Room);
+    for (i, bytes) in frames.iter().enumerate() {
+        assert_eq!(ack_of(&streamed.handle_frame(bytes).unwrap()), (i as u32, true));
+    }
+    streamed.finish();
+    assert!(streamed.static_splats().len() > 5_000, "{} splats", streamed.static_splats().len());
+
+    // As a file, read in pieces smaller than a frame, as a browser reads a
+    // file and a server a body.
+    let header = GscapHeader {
+        protocol: Some(1),
+        device: "iPhone17,2".into(),
+        app: "0.1.0".into(),
+        mode: "room".into(),
+        name: "Essai".into(),
+        created: "2026-11-14T12:00:00Z".into(),
+        region: None,
+        floor: None,
+    };
+    let mut writer = GscapWriter::new(Vec::new(), &header, 1024).unwrap();
+    for bytes in &frames {
+        writer.append(bytes).unwrap();
+    }
+    let file = writer.into_inner();
+    assert!(file.len() > 800_000);
+    for chunk in [4096, 64 * 1024, 1 << 20] {
+        let mut importer = GscapImporter::new(IngestParams::default());
+        for piece in file.chunks(chunk) {
+            importer.push(piece).unwrap();
+        }
+        let (mut session, summary) = importer.finish().unwrap();
+        assert_eq!((summary.frames, summary.frames_used, summary.truncated), (4, 4, false), "pieces of {chunk}");
+        assert_eq!(session.static_splats(), streamed.static_splats(), "pieces of {chunk}");
+    }
+    // Cut inside the last frame, hundreds of kilobytes before its end: the
+    // complete frames stay.
+    let (_, summary) = gs_core::ingest::import_gscap(&file[..file.len() - 100_000], IngestParams::default()).unwrap();
+    assert_eq!((summary.frames, summary.truncated), (3, true));
+    let _ = phone;
+}
+
 // ---------------------------------------------------------------------------
 // Novel-view quality
 // ---------------------------------------------------------------------------

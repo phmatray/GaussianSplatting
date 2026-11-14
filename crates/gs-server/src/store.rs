@@ -1,6 +1,8 @@
-//! Where recordings (`.gsrec`) and raw captures (`.gscap`) live on disk.
+//! Where recordings (`.gsrec`), raw captures (`.gscap`) and refined
+//! results (`.ply`) live on disk.
 //!
-//! Two flat directories, each holding files of one kind. Nothing in a
+//! Three flat directories, each holding files of one kind (and a fourth,
+//! `datasets`, that the dataset export fills with one directory per export). Nothing in a
 //! request ever becomes a path by itself: a file is reached by its *name*,
 //! which must pass [`is_safe_name`] and belong to a regular file directly
 //! inside the directory (a symbolic link is not followed). Names the
@@ -22,6 +24,13 @@ use serde::Serialize;
 pub(crate) const RECORDING_EXT: &str = ".gsrec";
 /// Extension of a raw capture, with its dot.
 pub(crate) const CAPTURE_EXT: &str = ".gscap";
+/// Extension of a refined result (an INRIA 3DGS file), with its dot.
+pub(crate) const REFINED_EXT: &str = ".ply";
+/// Extension of the description kept next to a refined result.
+pub(crate) const REFINED_META_EXT: &str = ".json";
+/// A description larger than this is not read by a listing (the report of
+/// the optimiser inside it is some tens of kilobytes).
+const MAX_REFINED_META: u64 = 4 << 20;
 /// Extension of a file that is still being received (never listed or
 /// served).
 const PART_EXT: &str = ".part";
@@ -47,6 +56,8 @@ const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'
 pub(crate) enum Kind {
     Recording,
     Capture,
+    /// Results of the offline refinement of a capture.
+    Refined,
 }
 
 impl Kind {
@@ -54,6 +65,7 @@ impl Kind {
         match self {
             Self::Recording => RECORDING_EXT,
             Self::Capture => CAPTURE_EXT,
+            Self::Refined => REFINED_EXT,
         }
     }
 
@@ -62,6 +74,7 @@ impl Kind {
         match self {
             Self::Recording => "recordings",
             Self::Capture => "captures",
+            Self::Refined => "refined",
         }
     }
 }
@@ -115,10 +128,105 @@ pub struct CaptureEntry {
     pub capturing: bool,
 }
 
+/// What is kept next to a refined result (`<stem>.json`): where it comes
+/// from and what it cost. The full report of the optimiser follows under
+/// `report`; a listing does not need it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RefinedMeta {
+    /// File name of the capture (`<stem>.gscap`) the result was made from.
+    pub capture: String,
+    /// What the user called that capture.
+    pub title: String,
+    /// `room`, `object`, `person` or `live`.
+    pub mode: String,
+    /// `rapide`, `standard` or `fin`.
+    pub preset: String,
+    /// End of the job, RFC 3339.
+    pub created: String,
+    pub gaussians: u64,
+    /// Iterations of the optimiser behind the result.
+    pub iterations: u32,
+    /// Seconds the optimisation took, without the preparation.
+    pub elapsed_s: f64,
+    /// Places the depth sensor did not measure were painted from the
+    /// photographs (`true`) or left as holes.
+    pub beyond_sensor: bool,
+    /// Where to look at a refined room from: the phone's first usable
+    /// position, looking into the room (eye x, y, z, then target x, y, z,
+    /// in the coordinates of the result, meters rounded to the millimeter).
+    /// `None` for an object or a person, which are looked at from around.
+    pub view: Option<[f64; 6]>,
+}
+
+/// One refined result as `GET /api/refined` lists it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RefinedEntry {
+    /// File name without `.ply`.
+    pub name: String,
+    /// File name.
+    pub file: String,
+    /// Size of the file in bytes.
+    pub size: u64,
+    /// `refined/<file>`, percent-encoded: usable as the `file` URL
+    /// parameter of the viewer.
+    pub url: String,
+    /// The server is still writing this file.
+    pub writing: bool,
+    #[serde(flatten)]
+    pub meta: RefinedMeta,
+}
+
+/// Something the disk refused that the user should hear about: reported by
+/// whoever was writing, read by `GET /api/record`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StorageProblem {
+    /// Grows with every report, so that an interface shows each one once.
+    pub serial: u64,
+    /// `capture_not_saved` or `recording_not_saved`.
+    pub code: &'static str,
+    /// The file concerned, when it has a name.
+    pub file: String,
+    /// English sentence for logs and developers.
+    pub message: String,
+}
+
+/// Bytes a non-privileged process may still write to the file system that
+/// holds `path` (the nearest existing ancestor is asked). `None` where the
+/// platform has no cheap answer.
+pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let existing = path.ancestors().find(|p| p.exists())?;
+        let c_path = std::ffi::CString::new(existing.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a
+        // plain-data out parameter the call fills in.
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: `statvfs` returned 0, so the structure is initialised.
+        let stat = unsafe { stat.assume_init() };
+        #[allow(clippy::unnecessary_cast)]
+        Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// The directories and what is being written in them right now.
 pub(crate) struct Store {
     recordings: Option<PathBuf>,
     captures: Option<PathBuf>,
+    refined: Option<PathBuf>,
+    datasets: Option<PathBuf>,
+    /// The latest thing the disk refused.
+    problem: Mutex<Option<StorageProblem>>,
     /// Files being written, as `(kind, file name)`: they are not deleted,
     /// zipped or replaced meanwhile.
     busy: Mutex<HashSet<(Kind, String)>>,
@@ -137,6 +245,12 @@ impl Hold {
     /// Name of the file.
     pub fn file(&self) -> &str {
         &self.file
+    }
+
+    /// Tells the interface that the disk refused this file
+    /// ([`Store::report_problem`]).
+    pub fn report_problem(&self, code: &'static str, message: impl std::fmt::Display) {
+        self.store.report_problem(code, &self.file, message);
     }
 }
 
@@ -253,14 +367,48 @@ impl Store {
     pub fn new(recordings: Option<PathBuf>, captures: Option<PathBuf>) -> Self {
         let captures = captures
             .or_else(|| recordings.as_ref().map(|dir| dir.parent().unwrap_or(Path::new("")).join("captures")));
-        Self { recordings, captures, busy: Mutex::new(HashSet::new()) }
+        let beside = |name: &str| recordings.as_ref().map(|dir| dir.parent().unwrap_or(Path::new("")).join(name));
+        let (refined, datasets) = (beside("refined"), beside("datasets"));
+        Self { recordings, captures, refined, datasets, problem: Mutex::new(None), busy: Mutex::new(HashSet::new()) }
+    }
+
+    /// Names the directories of the refined results and of the exported
+    /// datasets; `None` keeps the default, `refined` and `datasets` next to
+    /// the recordings.
+    pub fn with_work_dirs(mut self, refined: Option<PathBuf>, datasets: Option<PathBuf>) -> Self {
+        self.refined = refined.or(self.refined);
+        self.datasets = datasets.or(self.datasets);
+        self
     }
 
     pub fn dir(&self, kind: Kind) -> Option<&Path> {
         match kind {
             Kind::Recording => self.recordings.as_deref(),
             Kind::Capture => self.captures.as_deref(),
+            Kind::Refined => self.refined.as_deref(),
         }
+    }
+
+    /// Where exported datasets go: one directory per export.
+    pub fn datasets_dir(&self) -> Option<&Path> {
+        self.datasets.as_deref()
+    }
+
+    /// Remembers that the disk refused something, for the interface to say.
+    pub fn report_problem(&self, code: &'static str, file: &str, message: impl std::fmt::Display) {
+        let mut problem = self.problem.lock().unwrap_or_else(|p| p.into_inner());
+        let serial = problem.as_ref().map_or(0, |p| p.serial) + 1;
+        *problem = Some(StorageProblem { serial, code, file: file.to_string(), message: message.to_string() });
+    }
+
+    /// The latest problem reported since the server started.
+    pub fn problem(&self) -> Option<StorageProblem> {
+        self.problem.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Free bytes where the files of `kind` are written.
+    pub fn free_bytes(&self, kind: Kind) -> Option<u64> {
+        free_bytes(self.dir(kind)?)
     }
 
     /// The directory of `kind`, created if need be.
@@ -350,7 +498,7 @@ impl Store {
 
     /// Removes the leftovers of uploads a previous run did not finish.
     pub fn sweep_parts(&self) {
-        for kind in [Kind::Recording, Kind::Capture] {
+        for kind in [Kind::Recording, Kind::Capture, Kind::Refined] {
             let Some(dir) = self.dir(kind) else { continue };
             let Ok(entries) = fs::read_dir(dir) else { continue };
             for entry in entries.flatten() {
@@ -369,8 +517,14 @@ impl Store {
         if self.is_busy(kind, file) {
             return Err(io::Error::new(io::ErrorKind::ResourceBusy, "the file is being written"));
         }
-        match fs::remove_file(path) {
-            Ok(()) => Ok(true),
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                // The description of a refined result goes with it.
+                if kind == Kind::Refined {
+                    let _ = fs::remove_file(path.with_extension(&REFINED_META_EXT[1..]));
+                }
+                Ok(true)
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(err),
         }
@@ -429,6 +583,41 @@ impl Store {
         let path = self.existing(Kind::Recording, file)?;
         let meta = fs::symlink_metadata(&path).ok()?;
         Some(self.recording_entry(file, &path, &meta))
+    }
+
+    /// Every refined result of the directory, newest first. Reads the
+    /// description next to each file: call it off the async threads.
+    pub fn list_refined(&self) -> Vec<RefinedEntry> {
+        self.files(Kind::Refined).into_iter().map(|(file, path, meta)| self.refined_entry(&file, &path, &meta)).collect()
+    }
+
+    fn refined_entry(&self, file: &str, path: &Path, meta: &fs::Metadata) -> RefinedEntry {
+        let described = path.with_extension(&REFINED_META_EXT[1..]);
+        let small = fs::symlink_metadata(&described).is_ok_and(|m| m.is_file() && m.len() <= MAX_REFINED_META);
+        let mut info: RefinedMeta = small
+            .then(|| fs::read(&described).ok())
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let name = file.strip_suffix(REFINED_EXT).unwrap_or(file).to_string();
+        if info.title.is_empty() {
+            info.title = name.clone();
+        }
+        RefinedEntry {
+            name,
+            file: file.to_string(),
+            size: meta.len(),
+            url: url_of(Kind::Refined, file),
+            writing: self.is_busy(Kind::Refined, file),
+            meta: info,
+        }
+    }
+
+    /// The listing entry of one refined result.
+    pub fn refined(&self, file: &str) -> Option<RefinedEntry> {
+        let path = self.existing(Kind::Refined, file)?;
+        let meta = fs::symlink_metadata(&path).ok()?;
+        Some(self.refined_entry(file, &path, &meta))
     }
 
     /// Every raw capture of the directory, newest first.

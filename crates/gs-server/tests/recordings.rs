@@ -113,7 +113,11 @@ async fn the_record_button_records_what_viewers_receive() {
     // Nothing runs yet.
     let status = get(port, "/api/record").await;
     assert_eq!((status.status, status.header("cache-control")), (200, Some("no-store")));
-    assert_eq!(status.json(), json!({ "recording": null, "last": null }));
+    // (On the loopback listener the answer also tells the state of the
+    // disk, see `tests/refine.rs`: three members, not two.)
+    let body = status.json();
+    assert_eq!((&body["recording"], &body["last"]), (&Value::Null, &Value::Null));
+    assert_eq!(body.as_object().map(|members| members.len()), Some(3), "{body}");
     let answer = post_json(port, "/api/record", json!({ "action": "stop" })).await;
     assert_eq!((answer.status, answer.json()["code"].as_str()), (409, Some("not_recording")));
 

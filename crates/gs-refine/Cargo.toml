@@ -4,6 +4,7 @@ description = "Offline mode: optimises Gaussians against the photographs of a re
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "gs_refine"

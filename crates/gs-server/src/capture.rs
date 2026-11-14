@@ -101,6 +101,7 @@ impl RawCapture {
         if !self.failed {
             self.failed = true;
             log::error!("la capture n'est plus enregistrée dans {} : {err}", self.hold.file());
+            self.hold.report_problem("capture_not_saved", err);
         }
     }
 

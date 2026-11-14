@@ -7,11 +7,11 @@
 //   GS_APP_OUT=dir      where screenshots and reports go (default: out/app-e2e)
 //   GS_APP_PORT=8110    first port tried by the static server (8100-8199)
 //   ONLY=stage,vr       run a subset (stage, house, files, render, replay, embed, capture,
-//                       vr, narrow, layout, subpath, server, studio, shared, lanvr, webkit,
-//                       soak, perf)
+//                       vr, narrow, layout, subpath, server, studio, refine, shared, lanvr,
+//                       webkit, soak, perf)
 //   LONG_REPLAY=0       skip the minute-long stage recording of the replay suite (120 MB)
 //   SOAK_S=180          length of the memory soak in seconds (default 40)
-//   GS_SERVER_BIN=path  gs-server binary for the server, shared, lanvr and soak suites
+//   GS_SERVER_BIN=path  gs-server binary for the server, studio, refine, shared, lanvr and soak suites
 //                       (default: target/release/gs-server; skipped when missing)
 //   GS_NPM_TOOLS / IWER_BUNDLE   where to find the IWER WebXR emulator if it is
 //                       not installed with `npm install` in e2e/render
@@ -20,7 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const lib = require('./lib.cjs');
 
-const SUITES = ['stage', 'house', 'files', 'render', 'replay', 'embed', 'capture', 'vr', 'narrow', 'layout', 'subpath', 'server', 'studio', 'shared', 'lanvr', 'webkit', 'soak', 'perf', 'shots'];
+const SUITES = ['stage', 'house', 'files', 'render', 'replay', 'embed', 'capture', 'vr', 'narrow', 'layout', 'subpath', 'server', 'studio', 'refine', 'shared', 'lanvr', 'webkit', 'soak', 'perf', 'shots'];
 // Pictures for a person to look at: only on request (ONLY=shots).
 const ON_REQUEST = ['shots'];
 

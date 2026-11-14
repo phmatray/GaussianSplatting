@@ -96,6 +96,12 @@ impl Core {
                     with_core(|core| match bytes {
                         Ok(bytes) => {
                             core.import_bytes(&name, &bytes);
+                            // A link that asks for a walk without saying
+                            // from where starts inside the scene (the link
+                            // of a refined room).
+                            if start.nav == Some(NavMode::Fly) && start.view.is_none() {
+                                core.walk_into_file();
+                            }
                             core.apply_start_view(start);
                         }
                         Err(DownloadError::Status(status)) => {
@@ -443,7 +449,9 @@ impl Core {
         // The echoed configuration is the truth; without one there is
         // nothing to pause yet.
         let Some(config) = self.ui.config.get_untracked() else { return };
-        if self.file.get().is_some() {
+        // An imported file has nothing to pause, and a capture is paused
+        // on the phone (the server ignores the control).
+        if self.file.get().is_some() || self.ui.capture.with_untracked(Option::is_some) {
             return;
         }
         self.send(ControlMsg::SetPaused { paused: !config.paused });

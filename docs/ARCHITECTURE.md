@@ -3,11 +3,18 @@
 Live Gaussian splatting from a ring of cameras around a subject, viewable on a
 desktop and in a VR headset. Built with Rust, Tauri 2 and Leptos.
 
-There is no real capture hardware behind this demo. The "cameras" are simulated
-RGB-D sensors looking at a procedural animated 3D scene. Everything downstream
-of the sensors is a real pipeline: it only ever sees calibrated RGB + depth
-images, exactly what a rig of depth cameras (or RGB cameras followed by a
-feed-forward depth network) would deliver.
+There is no real capture hardware behind the two demos. The "cameras" are
+simulated RGB-D sensors looking at a procedural animated 3D scene. Everything
+downstream of the sensors is a real pipeline: it only ever sees calibrated
+RGB + depth images, exactly what a rig of depth cameras (or RGB cameras
+followed by a feed-forward depth network) would deliver.
+
+The same pipeline takes real frames from an iPhone with a LiDAR scanner
+("Real capture"), records what viewers receive and replays it anywhere ("4D
+recording and sharing"), and a kept capture can be optimised offline against
+its photographs ("Offline refinement"). None of it has met real hardware
+yet: no macOS, no Xcode build, no iPhone, no GPU, no headset. Every number in
+this document was measured on simulated data.
 
 ```
  procedural scene (t)          simulated sensors          reconstruction            transport              viewer
@@ -37,14 +44,18 @@ feed-forward depth network) would deliver.
 | Path | Target | Role |
 |---|---|---|
 | `crates/gs-core` | native + wasm | Math, scenes, sensors, reconstruction, wire codec, sorting, CPU reference rasterizer, PLY/.splat I/O, `Pipeline` |
-| `crates/gs-server` | native | Pipeline thread + axum HTTP/HTTPS + WebSocket broadcast. Library and headless `gs-server` binary |
+| `crates/gs-server` | native | Pipeline thread + axum HTTP/HTTPS + WebSocket broadcast; phone ingest, recorder, files on disk, share archives, the offline job slot. Library and headless `gs-server` binary |
+| `crates/gs-refine` | native | Offline mode: CPU Gaussian-splatting trainer on a `.gscap` (differentiable rasterizer, loss, Adam, densification), dataset export (COLMAP, nerfstudio). Library and `gs-refine` command-line tool |
 | `crates/gs-render` | wasm | WebGL2 Gaussian splat renderer, camera controls, gizmos, WebXR session |
-| `crates/gs-worker` | wasm (Web Worker) | Runs `Pipeline` in the browser when no native server is available; in server mode it relays the WebSocket to the page |
+| `crates/gs-worker` | wasm (Web Worker) | Runs `Pipeline` in the browser when no native server is available; in server mode it relays the WebSocket to the page. Also replays recordings, records in memory and ingests a `.gscap` without a server |
+| `crates/gs-render-harness` | wasm | Trunk test page for `gs-render` (GPU against CPU reference, live layer, WebXR, performance), driven by `e2e/render` |
 | `crates/gs-app` | wasm | Leptos CSR user interface, built with Trunk |
-| `src-tauri` | native | Tauri 2 desktop shell. Starts `gs-server`, exposes info commands. Workspace member outside `default-members` (needs WebKitGTK; root `cargo build` / `cargo test` skip it) |
-| `e2e` | node | Playwright end-to-end checks (desktop render, WS mode, emulated VR) |
+| `src-tauri` | native | Tauri 2 desktop shell. Starts `gs-server`, exposes three commands (`server_info`, `export_recording`, `reveal`). Workspace member outside `default-members` (needs WebKitGTK; root `cargo build` / `cargo test` skip it) |
+| `e2e/render`, `e2e/app`, `e2e/server` | node, python | End-to-end checks: the renderer against its CPU reference, the application in headless Chromium (static build and with `gs-server`, emulated VR), the server binary with the reference tools |
 | `ios/SplatCapture` | iOS (Swift) | Companion capture app: streams or records LiDAR RGB-D frames with ARKit poses. Built with Xcode on a Mac, not part of the Cargo workspace |
-| `tools` | python | Reference implementation of the capture file format, test fixtures, a simulated phone |
+| `tools` | python | Reference implementation of the capture and recording file formats (`gscap.py`, `gsrec.py`), test fixtures, a simulated phone and a reference ingest server |
+
+The workspace declares `rust-version = "1.87"` and every crate inherits it.
 
 ## Conventions (binding for every crate)
 
@@ -183,7 +194,19 @@ Routes (identical on both listeners unless noted):
 | `POST /api/lan` body `{"enabled": bool}` | Loopback listener only (403 on the LAN one). Starts or stops the LAN listener, answers the new info JSON |
 | `GET /api/qr.svg?i=<n>` | SVG QR code of `lan.urls[n]` (default 0). 404 while LAN is off |
 | `GET /ws` | WebSocket. Server to client: binary frames, one codec message each. Client to server: text frames, one `ControlMsg` JSON each |
-| anything else | The web build (`gs-app` dist), `index.html` fallback, correct MIME types (`application/wasm`) |
+| `GET /api/pair[?i=n]`, `GET /api/pair.svg[?i=n]` | Loopback only. The pairing URI of LAN address `n` (`{"uri", "uris"}`) and its QR code. 404 `lan_off`, 404 `no_address` |
+| `GET /ingest` | LAN listener only (403 `lan_only` on loopback). The phone's WebSocket, see "Real capture" |
+| `POST /api/captures` | Body: a `.gscap`. Loopback: `Origin` check; LAN: `Authorization: Bearer <token>`. Imports it and shows it |
+| `GET /api/captures`, `POST /api/captures/open` `{"file"}`, `GET`/`DELETE /captures/<file>.gscap` | Loopback only. The kept raw captures: list, ingest again, download (`Range`), delete |
+| `POST /api/record` `{"action":"start"|"stop"}` | Loopback only. The record button |
+| `GET /api/record` | Recorder state `{"recording", "last"}`; on loopback also `storage` (`free_bytes`, `low`, `problem`) |
+| `GET /api/recordings`, `GET`/`HEAD /recordings/<name>.gsrec` | The recordings: list (newest first; `dir` on loopback only) and files with `Range` |
+| `DELETE /recordings/<name>.gsrec` | Loopback only |
+| `GET`/`HEAD /api/share/<name>.zip` | Share archive of a recording |
+| `POST /api/refine` `{"action":"start"|"export"|"cancel"}`, `GET /api/refine` | Loopback only. The offline job slot, see "Offline refinement" |
+| `GET /api/refined`, `GET`/`HEAD /refined/<name>.ply`, `GET`/`HEAD /api/share/refined/<name>.zip` | The refined results: list, files with `Range`, share archive |
+| `DELETE /refined/<name>.ply` | Loopback only. Removes the result and its description |
+| anything else | The web build (`gs-app` dist), `index.html` fallback, correct MIME types (`application/wasm`). Paths under `/api/`, `/recordings/`, `/captures/` and `/refined/` that match nothing answer 404; `GET /share.json` answers 204 when the web build has none |
 
 ```json
 {
@@ -218,10 +241,113 @@ LAN is on, `lan.urls` and `lan.fingerprint` follow the machine's addresses
 address). The LAN listener has no authentication: anyone on the network can
 watch and send control messages, which is why it is off by default.
 
-The Tauri shell starts the server in-process and exposes one command,
-`server_info`, returning the same info JSON. The frontend resolves its
-source in this order: Tauri command (then uses `http_url` as base), else
-`GET /api/info` on its own origin, else the local `gs-worker`.
+The Tauri shell starts the server in-process, keeps its files under the
+application data directory (`recordings/`, `captures/`, `refined/`,
+`datasets/`, the certificate) and exposes three commands: `server_info`
+(the same info JSON); `export_recording {name, kind}` with `kind` one of
+`recording`, `share`, `refined`, `refined_share`, which writes the file into
+the user's download folder without overwriting anything and returns its path
+(a web view has no download manager; the application calls it instead of
+following a download link); `reveal {target}` for `recordings`, `captures`,
+`refined`, `datasets`, `exports` or a path `export_recording` returned. The
+frontend resolves its source in this order: Tauri command (then uses
+`http_url` as base), else `GET /api/info` on its own origin, else the local
+`gs-worker`.
+
+### Details fixed by `gs-server`
+
+- **Errors.** Every route answers an error as JSON `{"error": "<English
+  sentence>", "code": "<stable code>"}` with `Cache-Control: no-store`; an
+  interface shows its own text for the code. Codes: `loopback_only`,
+  `lan_only`, `origin_not_allowed`, `host_not_allowed`, `lan_off`,
+  `no_address`, `bad_request`, `timeout`, `already_recording`,
+  `not_recording`, `no_recordings_dir`, `not_found`, `in_use`, `busy`,
+  `import_in_progress`, `too_large`, `disk_full` (507), `bad_token`,
+  `no_frontend`, `unavailable`, `internal`, the format codes of a refused
+  capture file, and those of the offline job (`job_running`, `no_job`,
+  `unsupported_mode`, `no_refined_dir`, `disk_error`).
+- **Loopback listener.** A request whose `Host` is present and is not
+  `127.0.0.1`, `localhost` or `[::1]` (with or without port), or that carries
+  two `Host` headers, is answered 403 `host_not_allowed` (DNS rebinding).
+  CORS allows the Tauri origins and `extra_origins`: methods GET, HEAD, POST,
+  DELETE; request headers `Content-Type`, `Range`, `If-Range`,
+  `If-None-Match`; exposed `Content-Range`, `Content-Length`,
+  `Accept-Ranges`, `ETag`, `Content-Disposition`.
+- **LAN listener.** At most `max_lan_connections` (128) connections; one
+  beyond is closed at accept, before any TLS work. Read-only routes of the
+  recordings, of the refined results and of their share archives are served
+  there; nothing there changes the server except `/ingest` and the
+  token-authenticated `POST /api/captures`.
+- **Capture and simulation.** A capture replaces the simulation for every
+  viewer and the pipeline is parked. Control messages of viewers are ignored
+  while a capture is shown, except `set_scene`, which leaves the capture and
+  returns every viewer to the simulation; `set_scene` is ignored too while
+  the phone is connected and has not finished. A page must therefore never
+  send `set_scene` by itself at connect.
+- **One phone at a time.** A second phone gets the error `busy` (close
+  1008). A new `hello` takes over the attached connection when it is the
+  same hello (device, app, name, mode), when that connection has been
+  silent for 12 s, or when its capture is finished. Continuing a capture
+  needs the same name, mode and device; an imported capture is never
+  continued. No `hello` within 10 s, or a binary frame before it, is
+  `bad_hello`; at most 8 connections may be waiting for their hello (503
+  beyond); one frame beyond `max_inflight` is `flow_control`; a message
+  above 8 MiB closes with 1009; the server pings the phone and closes one
+  that is silent for `idle_timeout`. `progress` goes out every second while
+  a phone is attached and not finished.
+- **Live over a scan.** A `live` capture that follows a finished scan of the
+  same device plays in front of that scan; the scan is dropped if the first
+  live frame's index is not above the scan's last (the app was relaunched).
+- **Uploads.** `POST /api/captures` is streamed to a hidden `.part` file.
+  Its first 8 bytes are checked on arrival (400 `bad_file_magic`); the limit
+  is `max_upload_bytes` (16 GiB, 413); an announced length that does not fit
+  on the disk, or a write the disk refuses, is 507 `disk_full`; a stalled
+  body is 408 at `request_timeout`; 409 `busy` while a phone captures, 409
+  `import_in_progress` (one import at a time). An early refusal over HTTP/1
+  first discards up to 64 MiB of the body for at most 10 s so that the
+  client receives the answer. The answer is `{"ok", "frames",
+  "frames_used", "truncated", "name", "file", "recording", "shown"}`.
+- **Files of a capture.** The raw stream is kept as
+  `<slug(name)>-<YYYYMMDD-HHMMSS UTC>.gscap` in `captures` (next to the
+  recordings directory), `-2`, `-3` when taken; its header is rewritten in
+  place with the region and floor the phone sent; a reset replaces the file;
+  a capture without a frame leaves none. A finished capture is saved as
+  `<same stem>.gsrec`: a still (one keyframe) for the fusing modes, the
+  whole stream for `live` (an imported live capture on its frames' own time
+  stamps, gaps cut to 2 s). The files of one capture share their stem,
+  number suffix included. A scan whose phone never sent `finish` is finished
+  and saved when its capture is closed (`set_scene`, another capture taking
+  its place, shutdown).
+- **Recorder.** The file is a slug of the given name (letters and digits of
+  any script, `-`, `_`), `enregistrement-<timestamp>` without one; titles are
+  cut to 120 characters; the recorder counts as a spectator, so the scene
+  ticks for it alone; a recording ends by itself, complete, at
+  `max_recording_bytes` (8 GiB) with reason `full`; `saved.reason` is
+  `stopped`, `full`, `disk_error` or `too_large`. No fsync on the pipeline
+  thread.
+- **Names.** A file name accepted by a route is one path segment with the
+  right extension, no leading dot or space, no trailing dot or space, none
+  of `/ \ : * ? " < > |`, no control character, not a Windows device name, at
+  most 200 bytes, and a regular file directly in its directory (symbolic
+  links are not followed).
+- **Downloads.** Single byte ranges only (several ranges, another unit or a
+  malformed header get the whole file; beyond the end 416 with
+  `Content-Range: bytes */len`); a strong `ETag` of length and modification
+  time; `If-Range` accepts an ETag only; `?download` adds
+  `Content-Disposition: attachment`; never compressed. A download whose
+  client takes nothing for `send_timeout` (30 s) is abandoned.
+- **Share archive.** The web build at the root (deflated), `share.json`,
+  and the shared file stored under a fixed name: `recording.gsrec`, or
+  `scene.ply` for a refined result. ZIP64 only when needed; the whole
+  archive has a `Content-Length` (also on `HEAD`). `share.json` holds
+  `file`, `name`, `scene`, `created`, `size`, plus `autoplay`, `loop` and
+  `duration_s` for a recording, and `nav` / `view` for a refined room. 409
+  while a recording is written, 503 `no_frontend` without a web build.
+- **Disk.** `GET /api/record` on loopback carries `storage`: free bytes
+  where captures are written, `low` under 2 GiB, and the latest `problem`
+  (`serial`, `code` `capture_not_saved` or `recording_not_saved`, `file`)
+  when the disk refused a capture or a recording. The capture itself goes on.
+- **Log.** The debug access log replaces the pairing token with `<token>`.
 
 ## Viewer
 
@@ -437,6 +563,12 @@ and Rust tests. Where this section is silent, they decide:
   `POST /api/captures` answers `{"ok":true,"frames":n,"truncated":bool,
   "name":"…"}`, 400 for a damaged file, 401 for a missing or wrong token.
 
+- The app (`ios/SplatCapture`, never compiled): every capture name gets its
+  start time appended (`CaptureEngine.stampedName`), so that two captures
+  never share a name and the server never continues the wrong scan; after
+  `finish` the app waits up to 6 s for the server's last `progress` before
+  it closes. `tools/fake_phone.py` waits 8 s.
+
 ### Details fixed by `gs_core::ingest`
 
 The library has no sockets, files or clock and compiles for wasm32; the
@@ -536,9 +668,11 @@ records in memory, up to a bound, and offers the file as a download.
 buttons: for an `<iframe>`), `autoplay`, `loop`, `t=<seconds>`,
 `view=<eye x,y,z,target x,y,z>`, `nav=orbit|fly`. The desktop app shares a
 recording in two ways: a link (and QR code) on the local network,
-`https://<lan address>/?file=recordings/<name>.gsrec&embed=1`; and
-`GET /api/share/<name>.zip`, the web build with the recording inside and a
-`share.json` that names it, to unpack onto any static web host.
+`https://<lan address>/?file=recordings/<name>.gsrec&embed=1&autoplay=1&loop=1`;
+and `GET /api/share/<name>.zip`, the web build with the recording inside and
+a `share.json` that names it, to unpack onto any static web host. A refined
+result is shared the same way: `?file=refined/<name>.ply&embed=1` (plus
+`view` and `nav=fly` for a room) and `GET /api/share/refined/<name>.zip`.
 
 ### Details fixed by `gs_core::record`
 
@@ -582,6 +716,210 @@ recording in two ways: a link (and QR code) on the local network,
 - **Second implementation.** `tools/gsrec.py` (`info`, `verify`, `synth`)
   reads and writes the same bytes.
 
+### Details fixed by `gs-app` and `gs-worker`
+
+- **Replay** runs in a second instance of the worker. Meanwhile the live
+  source waits: the local pipeline is put on hold, the connection to a
+  server is closed and opened again afterwards. A page opened on `file=`
+  starts no live source until the user leaves the file.
+- **Sources of a replay.** A `Blob` up to 256 MiB is read whole, a larger
+  one through `Player::ranged` over `Blob.slice`. A URL is probed with
+  `Range: bytes=0-4095`: 206 with a total above 64 MiB means Range playback
+  in 4 MiB requests; otherwise one GET is streamed and plays while it
+  downloads (refused above 1 GiB; a host without Range costs about three
+  times the file in memory).
+- **Link parameters.** `file` is a relative reference or an absolute
+  http(s) URL without credentials, at most 2048 bytes, ending in `.gsrec`,
+  `.ply` or `.splat`; any other scheme is refused before any fetch. Flags
+  accept empty, `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`;
+  `autoplay` and `loop` default to off. A refused value is dropped and told
+  in a French notice; the others still apply. `share.json` next to
+  `index.html` (`file`, `embed`, `autoplay`, `loop`, `t`, `view`, `nav`; 16
+  KiB at most) gets no more trust than a link, and link parameters override
+  it one by one. It is fetched only without `file=`, `source=` and Tauri.
+- **Embed mode** has no top bar, panel, HUD or gizmos and no way back to a
+  live source.
+- **Imported files** (`.ply`, `.splat`) are framed from outside, in orbit.
+  One opened with `nav=fly` and no `view` starts inside its bounds, at eye
+  height (the link of a refined room).
+- **Recording target.** The server's recorder when the page talks to the
+  server over loopback; otherwise the memory of the worker behind the
+  transport, bounded at 256 MiB, handed over as a `Blob`. A finished scan is
+  saved on the server by a start followed by a stop; the interface calls any
+  recording shorter than 0.25 s a still. Deleting a recording, a capture or
+  a refined result asks once more (two clicks).
+- **A capture in the page.** A capture session is shown in orbit navigation,
+  from outside what was filmed: a room from high above (the viewer draws
+  walls and ceiling from their inner side only), an object or a person from
+  a three-quarter view; never from the session's own start view, which is
+  where the phone stood. The camera follows the growing bounds until the
+  user moves it. The pause button is hidden during a capture and the list of
+  recordings is read again when a capture finishes or is left.
+- **Capture files.** Before a `.gscap` is uploaded to the server the page
+  checks its 8 magic bytes. Without a server the worker ingests the file
+  itself, one frame at a time; it reads the header before it takes over, so
+  a file that is not a capture leaves the screen untouched.
+- **Bounds on what a stream may build.** A `State` is cut to 64 cameras,
+  4096 path points and names of 200 characters; thumbnails above one
+  megapixel are not painted; a layer may not grow beyond 4 000 000 splats.
+- **Worker protocol additions** (page to worker): `hold`, `record_start`,
+  `record_stop`, `record_still`, `replay_open`, `replay_play`,
+  `replay_pause`, `replay_seek`, `replay_speed`, `replay_loop`,
+  `replay_close`, `capture_cancel`, and `[json, Blob]` for `replay_file` and
+  `capture_file`. Worker to page: `replay` (status), `replay_reset`,
+  `record`, `capture`, and `["recording", meta, ArrayBuffer...]`.
+- **Rendering choice.** Auto is normalised soft on a screen and hard inside
+  a VR session; it is the only setting stored (`localStorage`,
+  `splat-live.blend`).
+- **VR time line.** Left Y plays and pauses; with the left grip held the
+  left stick scrubs.
+- **Desktop shell.** Inside Tauri every download goes through
+  `export_recording`, then `reveal`.
+- **Disk.** The page tells in French when the server's disk is nearly full
+  (`storage.low`) and each time it refused a capture or a recording
+  (`storage.problem`), and when an upload is refused for lack of room.
+
+## Offline refinement (binding for `gs-refine`, `gs-server`, `gs-app`)
+
+The real-time path never checks its picture against the photographs.
+`crates/gs-refine` takes a kept capture (`.gscap`: photographs, LiDAR depth,
+confidence, poses) and optimises 3D Gaussians against those photographs,
+starting from the cloud the real-time fusion makes of the same file. The
+result is an INRIA 3DGS `.ply` that the viewer draws like any imported file
+(sorted blending). It runs on the CPU only (rayon); `raster::Rasterizer` is
+the seam for a GPU implementation, which does not exist.
+
+**What it optimises.** Per Gaussian 14 numbers: position, three log standard
+deviations, a quaternion, an opacity logit, a colour (view independent,
+spherical harmonics of degree 0).
+
+- *Views.* Frames without normal tracking, blurred frames and near-repeats
+  are dropped; one frame in 8 is held out for evaluation and never fused.
+- *Start.* The other frames go through `gs_core::ingest::CaptureSession` as
+  an import does; the fused surfels become Gaussians 1.4 times larger with
+  0.7 of their opacity.
+- *Loss.* 0.8 L1 + 0.2 (1 - SSIM) against the photograph through one gain
+  per channel and image fitted in closed form; a depth term against the
+  LiDAR weighted by its confidence (0.2); in `object` and `person` captures
+  a coverage term outside the region (0.5).
+- *Optimiser.* Adam on the visible Gaussians; the first 30 % of the run at
+  half width; every 200 steps between 5 % and 80 % of the run, Gaussians
+  with a large screen-space gradient are split along their longest axis or
+  cloned, and those nearly transparent, larger than 0.5 m or not finite are
+  pruned. Pose refinement exists and is off.
+- *`photo_beyond_sensor`* (on by default): where the sensor measured nothing
+  (glass, mirrors, beyond 5 m) the photographs are fitted all the same,
+  which paints such places at a guessed depth; off, they stay holes.
+- A run is bit-identical for any number of threads and across a checkpoint.
+
+**Presets.** The number of iterations is `passes x training views`, with a
+minimum.
+
+| Preset | Width | Views at most | Passes | Iterations at least | Room cells | Gaussians at most |
+|---|---|---|---|---|---|---|
+| `rapide` | 480 | 300 | 6 | 1 500 | 2.4 cm | 1 000 000 |
+| `standard` | 640 | 600 | 15 | 4 000 | 1.6 cm | 2 000 000 |
+| `fin` | 960 | 1 200 | 30 | 12 000 | 1.6 cm | 4 000 000 |
+
+**Command line** (`gs-refine`, French messages; unknown options are errors).
+`gs-refine <capture.gscap> -o <out.ply> [--preset rapide|standard|fin]
+[--iterations n] [--mesure-seule] [--poses] [--splat] [--threads n]
+[--set path=value]` writes `<out>.ply`, `<out>.json` (the report) and, while
+unfinished, `<out>.reprise` (checkpoint, magic `GSRFCK2`); Ctrl-C stops
+after the current iteration and writes the best state; `--reprise <file>`
+goes on. `gs-refine info <capture>` describes a capture. `gs-refine export
+<capture> --format colmap|nerfstudio -o <dir>` writes a dataset.
+
+**Datasets.** Both formats get the photographs as recorded, one pinhole
+camera per image, the poses in the capture's world with the floor at
+`y = 0`, and the fused cloud as initial points. COLMAP: `images/`,
+`sparse/0/{cameras,images,points3D}.{txt,bin}`, world-to-camera with +Z
+forward and +Y down. nerfstudio: `transforms.json` (camera-to-world, OpenGL
+axes), `images/`, `depth/*.png` (16-bit millimeters), `masks/*.png` (person
+captures), `sparse_pc.ply`; to keep the capture's world, train with
+`--orientation-method none --center-method none --auto-scale-poses False`.
+
+**Server.** One offline job at a time, on a thread of its own inside the
+server process (not a child process: the desktop application is one
+binary), with `refine_threads` worker threads (default: every processor but
+one, which stays with the pipeline and the listeners).
+
+- `POST /api/refine` (loopback, `Origin` check):
+  `{"action":"start","capture":"<file>.gscap","preset":"rapide|standard|fin",
+  "beyond_sensor":bool}` (preset `standard` and `beyond_sensor` true when
+  absent), `{"action":"export","capture":"…","format":"colmap|nerfstudio"}`,
+  `{"action":"cancel"}`. 200 `{"job": status}`; 404 `not_found`; 409
+  `job_running` (the body carries the job in the way); 409 `in_use` (the
+  capture is still being written); 400 `unsupported_mode` (a `live` capture)
+  or `bad_request`; 503 `no_refined_dir`; 507 `disk_full`; 409 `no_job`.
+- `GET /api/refine` (loopback): `{"job": status|null, "last": end|null}`.
+  `status`: `id`, `kind` (`refine` | `export`), `capture`, `title`, `preset`,
+  `format`, `stage` (`prepare`, `select`, `fuse`, `exposure`, `poses`,
+  `evaluate`, `optimise`, `write`, `export`), `done`, `total`, `iteration`,
+  `iterations`, `elapsed_s`, `eta_s`, `loss`, `holdout_psnr`, `gaussians`,
+  `width`, `threads`, `cancelling`, `started`. `end`: the identity of the
+  job, `outcome` (`done`, `cancelled`, `failed`), `error` (`code`:
+  `bad_capture`, `no_views`, `disk_full`, `disk_error`, `internal`),
+  `result` (an entry of the list below), `dataset` (`name`, `dir`, `format`,
+  `images`, `points`, `depth_maps`, `masks`), `iterations_done`,
+  `iterations`, `elapsed_s`.
+- A refinement writes `<capture stem>-<preset>.ply` (`-2`, `-3` when taken)
+  into the directory `refined` next to the recordings, and beside it a
+  `.json` with `capture`, `title`, `mode`, `preset`, `created`, `gaussians`,
+  `iterations`, `elapsed_s`, `beyond_sensor`, `view` and, under `report`,
+  the optimiser's own report. The result is the best state on the held-out
+  views. `view` is where a refined room is first looked at from: the phone's
+  first training position, looking toward the bulk of the cloud.
+- **A cancelled refinement keeps nothing.** A run stopped in its first
+  hundreds of iterations is worse than the real-time fusion; a stop takes a
+  few seconds (the token is read at every iteration and every sixteen frames
+  of the preparation). A server that shuts down cancels its job.
+- A dataset export writes the directory `<capture stem>-<format>` (`-2`,
+  `-3` when taken) under `datasets`, next to the recordings; the interface
+  shows where it is. It is a directory on the server's machine, not a
+  download: datasets are made to be read by another program there.
+- `GET /api/refined` (both listeners): `{"results": [{"name", "file",
+  "size", "url", "writing"} + the fields of the description], "dir",
+  "datasets_dir"}` (the directories on loopback only). `url` is
+  `refined/<file>`, usable as the `file` parameter of the viewer.
+- `ServerConfig::refine_iterations` (`--refine-iterations N`) forces the
+  number of iterations of every job: for tests and demonstrations.
+
+**Application.** With a server reached over loopback the panel has a section
+"Captures et affinage": the kept captures (`GET /api/captures`; reopen one
+with `POST /api/captures/open`, delete), and for each "Affiner cette
+capture" with the preset, the `beyond_sensor` choice ("Peindre d'après les
+photos" / "Laisser les trous") and the dataset exports. The job is polled
+every second (stage, iteration, elapsed and remaining time, "Annuler").
+"Voir le résultat" downloads the `.ply` and shows it as an imported file; a
+room from its `view`, in fly navigation. A result is downloaded, shared
+(LAN link, `<iframe>`, archive) and deleted like a recording. A LAN client
+lists and views the results only. Without a server the section holds one
+sentence saying why the feature is absent.
+
+**What the interface must not claim.** The held-out PSNR is measured on
+photographs that are neighbours of the training photographs: it is not a
+free-viewpoint quality measure and is never shown as the quality of a
+result. Every text about the refinement says that it was measured on
+simulated captures only and that it runs on the CPU.
+
+**What was measured** (simulated captures only, exact ray-cast ground truth
+from viewpoints the phone never took, 640x480):
+
+- Bedroom, 220 frames, `rapide`: PSNR where the phone has looked 25.11 to
+  26.43 dB, SSIM 0.834 to 0.875, silhouettes 19.6 to 24.3 dB; at the
+  phone's own poses 29.9 to 37.3 dB. Living room on another path: 23.32 to
+  27.38 dB, SSIM 0.797 to 0.877. An object: 31.32 to 33.51 dB.
+- Far from the phone's path, where the fused cloud is already closed, the
+  gain is small or nil (`standard` on the bedroom: 29.40 to 29.43 dB); flat
+  interiors lose 1 to 3 dB to a faint mottle; holes the phone never saw stay
+  holes. Under simulated pose drift and exposure wander with another seed
+  the far-view gain is 0.13 dB while the held-out photographs report +3.6.
+- Time, through the server on the 4-core development VM with three threads:
+  108 s for `rapide` on that bedroom (278 241 Gaussians, 19 MB), 587 s for
+  `standard` (551 093 Gaussians, 37 MB; the machine was also compiling).
+  `fin` was never run to its end. Memory stayed under 0.9 GB.
+
 ## Verification
 
 - `cargo test -p gs-core`: unit tests plus novel-view quality tests
@@ -591,6 +929,20 @@ recording in two ways: a link (and QR code) on the local network,
   SSIM, coverage, a temporal flicker measure, holes opened by the fusion).
 - `cargo run --release -p gs-core --example quality_report`: dumps clouds,
   scores them at 1280x960 and renders before / after sheets.
-- `e2e/`: Playwright drives the real web build in headless Chromium: desktop
-  render is non-blank and animated, WebSocket mode against `gs-server`, and a
-  VR session through the IWER WebXR emulator.
+- `cargo test --no-fail-fast` at the root runs every crate but the desktop
+  shell (`cargo test -p splat-live` needs WebKitGTK or a Mac). The capture
+  path is tested with a simulated phone (`crates/gs-core/tests/ingest_sim`),
+  including frames of the size a real phone sends (1920x1440, a few hundred
+  kilobytes), generated at test time.
+- `python3 -m unittest discover -s tools`: the reference tools of the two
+  file formats, the fixtures shared with the Swift and Rust tests, the
+  simulated phone against the reference server.
+- `e2e/render`: the WebGL2 viewer against the CPU reference, pixel by pixel.
+- `e2e/app`: Playwright drives the real web build in headless Chromium
+  (software rasterizer): both demos, files, replay, embed, capture,
+  refinement, a VR session through the IWER WebXR emulator, and the suites
+  that need the `gs-server` binary.
+- `e2e/server`: the server binary with the reference tools and a browser
+  (capture, hostile clients, sharing, refinement, the Tauri shell under
+  Xvfb).
+- Nothing above runs on real hardware: see the first section.

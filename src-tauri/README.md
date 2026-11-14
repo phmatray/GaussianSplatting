@@ -22,6 +22,8 @@ Tout est conservé dans le dossier de données de l'application
 | (racine) | le certificat auto-signé de l'accès réseau, pour que le casque et l'iPhone continuent de lui faire confiance d'un lancement à l'autre |
 | `recordings/` | les enregistrements 4D (`.gsrec`) : ceux du bouton d'enregistrement et chaque capture terminée |
 | `captures/` | le flux brut de chaque capture d'iPhone (`.gscap`), pour pouvoir la retraiter plus tard |
+| `refined/` | les captures affinées hors ligne (`.ply`), chacune avec sa description (`.json`) |
+| `datasets/` | les captures exportées en jeux de données COLMAP ou nerfstudio, un dossier par export |
 | `exports/` | les fichiers exportés, seulement si le système n'a pas de dossier Téléchargements |
 
 ## Commandes Tauri
@@ -29,15 +31,18 @@ Tout est conservé dans le dossier de données de l'application
 | Commande | Arguments | Résultat |
 |---|---|---|
 | `server_info` | aucun | le même JSON que `GET /api/info` |
-| `export_recording` | `name` (le `name` de `GET /api/recordings`), `kind` : `"recording"` ou `"share"` | écrit le fichier `.gsrec`, ou l'archive de partage `.zip`, dans le dossier Téléchargements de l'utilisateur sans jamais écraser un fichier existant ; renvoie le chemin du fichier écrit, ou une phrase d'erreur en français |
-| `reveal` | `target` : `"recordings"`, `"captures"`, `"exports"`, ou un chemin renvoyé par `export_recording` | ouvre le gestionnaire de fichiers sur ce dossier ou ce fichier ; tout autre chemin est refusé |
+| `export_recording` | `name` (le `name` de `GET /api/recordings` ou de `GET /api/refined`), `kind` : `"recording"`, `"share"`, `"refined"` ou `"refined_share"` | écrit le fichier `.gsrec`, la capture affinée `.ply`, ou l'archive de partage `.zip` de l'un ou de l'autre, dans le dossier Téléchargements de l'utilisateur sans jamais écraser un fichier existant ; renvoie le chemin du fichier écrit, ou une phrase d'erreur en français |
+| `reveal` | `target` : `"recordings"`, `"captures"`, `"refined"`, `"datasets"`, `"exports"`, ou un chemin renvoyé par `export_recording` | ouvre le gestionnaire de fichiers sur ce dossier ou ce fichier ; tout autre chemin est refusé |
 
 Pourquoi `export_recording` : une vue web (WKWebView, WebKitGTK, WebView2)
 n'a pas de gestionnaire de téléchargements, un lien `download` vers
 `/recordings/<nom>.gsrec` ou `/api/share/<nom>.zip` n'y enregistre donc rien.
 Dans un navigateur ordinaire, ces deux adresses suffisent.
 
-Depuis l'interface :
+L'interface appelle ces deux commandes d'elle-même dès qu'elle tourne dans
+la fenêtre de l'application : pour télécharger un enregistrement ou une
+capture affinée, pour l'archive web du partage, et pour montrer le dossier
+d'un jeu de données exporté. À la main :
 
 ```js
 const { invoke } = window.__TAURI__.core;

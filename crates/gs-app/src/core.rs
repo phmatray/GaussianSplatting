@@ -4,6 +4,7 @@
 
 mod capture;
 mod record;
+mod refine;
 mod replay;
 
 use std::cell::{Cell, RefCell};
@@ -182,6 +183,14 @@ pub struct Core {
     auto_eye: Cell<Option<Vec3>>,
     /// A layer message was refused for its size (reported once per session).
     layer_overflow: Cell<bool>,
+    /// Timer ticks since the start, to pace the polls of the offline job.
+    refine_polls: Cell<u32>,
+    /// Id of the ended job whose summary the user closed.
+    dismissed_job: Cell<Option<u64>>,
+    /// Serial of the latest disk problem the user was told about.
+    problem_seen: Cell<Option<u64>>,
+    /// Bounds of the imported file on screen.
+    file_bounds: Cell<Option<gs_core::Aabb>>,
 }
 
 /// Creates the viewer on `canvas` and starts everything else. Called once,
@@ -234,6 +243,10 @@ pub fn start(canvas: HtmlCanvasElement, ui: Ui) {
         record_polls: Cell::new(0),
         auto_eye: Cell::new(None),
         layer_overflow: Cell::new(false),
+        refine_polls: Cell::new(0),
+        dismissed_job: Cell::new(None),
+        problem_seen: Cell::new(None),
+        file_bounds: Cell::new(None),
     });
     CORE.with(|c| *c.borrow_mut() = Some(core.clone()));
     if let Some(blend) = dom::stored(BLEND_KEY).and_then(|id| BlendChoice::from_id(&id)) {
@@ -406,6 +419,7 @@ impl Core {
         if link == Link::Connected && !was_connected && self.ui.source.get_untracked() == Some(SourceKind::Server) {
             self.refresh_server_info();
             self.refresh_takes();
+            self.refresh_captures();
         }
     }
 
@@ -613,11 +627,19 @@ impl Core {
         let Some(state) = session.as_ref() else { return };
         self.viewer.set_scene_hints(present::scene_hints(state));
         let capture = state.capture.is_some();
+        // A capture is looked at from outside: its own start view is where
+        // the phone stood, inside the room and often a step from a wall.
+        let capture_view = |state: &SessionState| {
+            let (capture, bounds) = (state.capture.as_ref()?, present::scene_hints(state).bounds?);
+            Some(present::capture_view(&bounds, present::capture_room(&capture.mode), self.viewer.fov_y(), self.aspect()))
+        };
         if reset_view {
             let nav = present::session_nav(state);
             self.saved_view.set(None);
             self.viewer.set_nav_mode(nav);
-            self.viewer.set_view(Vec3::from_array(state.viewer_start.eye), Vec3::from_array(state.viewer_start.target));
+            let (eye, target) =
+                capture_view(state).unwrap_or((Vec3::from_array(state.viewer_start.eye), Vec3::from_array(state.viewer_start.target)));
+            self.viewer.set_view(eye, target);
             // A capture grows: the camera follows it until the user takes over.
             self.auto_eye.set(capture.then(|| self.viewer.eye()));
             self.scale_custom.set(false);
@@ -627,8 +649,7 @@ impl Core {
             });
             self.overview_pending.set(state.config.scene == SceneKind::House && !capture);
         } else if capture && self.auto_eye.get().is_some_and(|eye| eye.distance(self.viewer.eye()) < AUTO_VIEW_TOLERANCE) {
-            if let Some(bounds) = present::scene_hints(state).bounds {
-                let (eye, target) = present::frame_view(&bounds, self.viewer.fov_y(), self.aspect());
+            if let Some((eye, target)) = capture_view(state) {
                 self.viewer.set_view(eye, target);
                 self.auto_eye.set(Some(self.viewer.eye()));
             }
@@ -678,7 +699,15 @@ impl Core {
         // the list is worth another look once it has had time to write it.
         let finished = |stats: Option<Stats>| stats.and_then(|s| s.capture).is_some_and(|c| c.finished);
         if finished(Some(stats)) && !finished(previous) && !self.is_replay() {
-            set_timeout(|| with_core(Core::refresh_takes), Duration::from_millis(1500));
+            set_timeout(
+                || {
+                    with_core(|core| {
+                        core.refresh_takes();
+                        core.refresh_captures();
+                    })
+                },
+                Duration::from_millis(1500),
+            );
         }
         let scan = stats.scan.map(|s| ScanView { state: s.state, progress: s.progress });
         let scan_changed = previous.and_then(|p| p.scan).map(|s| s.state) != stats.scan.map(|s| s.state);
@@ -795,7 +824,21 @@ impl Core {
         if self.ui.scene.get_untracked() != Some(scene) {
             self.ui.pending_scene.set(Some(scene));
         }
+        // Leaving a capture makes the server save an unfinished scan as a
+        // recording and close its raw file: the lists gain entries then.
+        let leaving_capture = self.ui.capture.with_untracked(Option::is_some);
         self.send(ControlMsg::SetScene { scene });
+        if leaving_capture {
+            set_timeout(
+                || {
+                    with_core(|core| {
+                        core.refresh_takes();
+                        core.refresh_captures();
+                    })
+                },
+                Duration::from_millis(2500),
+            );
+        }
     }
 
 
@@ -1050,6 +1093,7 @@ impl Core {
             return;
         }
         let bounds = present::robust_bounds(&splats);
+        self.file_bounds.set(bounds);
         self.viewer.set_gizmos(&GizmoScene::default());
         self.viewer.set_scene_hints(SceneHints {
             ceiling_height: None,
@@ -1071,6 +1115,18 @@ impl Core {
         self.apply_params();
         self.ui.file_error.set(None);
         self.ui.file.set(Some(FileInfo { name: name.to_string(), splats: splats.len() }));
+    }
+
+    /// Steps inside the imported file on screen, for a walk through it: a
+    /// refined room is best seen from where the phone filmed it.
+    pub fn walk_into_file(&self) {
+        let Some(bounds) = self.file_bounds.get().filter(|_| self.file.get().is_some()) else { return };
+        self.set_display(|d| {
+            d.dollhouse = false;
+            d.nav = NavMode::Fly;
+        });
+        let (eye, target) = present::inside_view(&bounds);
+        self.viewer.set_view(eye, target);
     }
 
     /// Leaves the imported file and shows the live reconstruction again.
@@ -1190,6 +1246,7 @@ impl Core {
         let smoothed = self.ui.transfer_rate.get_untracked() * 0.5 + rate as f32 * 0.5;
         Ui::set_if_changed(self.ui.transfer_rate, if smoothed < 1.0 { 0.0 } else { smoothed });
         self.tick_recording();
+        self.tick_refine();
         // `enter_xr` fails asynchronously and without a callback.
         if !self.viewer.xr_active() {
             Ui::set_if_changed(self.ui.xr_error, self.viewer.xr_error());

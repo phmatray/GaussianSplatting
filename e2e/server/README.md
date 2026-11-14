@@ -42,6 +42,14 @@
   capture, les imports, une capture 1920x1440 à dix images par seconde
   pendant que l'API est chronométrée, puis relit ce que le serveur a laissé
   sur le disque avec `tools/gscap.py` et `tools/gsrec.py`. Python seul.
+- `refine.py` : l'affinage hors ligne et les exports par le serveur. Envoie
+  une petite capture synthétique (`tools/gscap.py synth`), la retrouve dans
+  les captures conservées, l'affine avec le préréglage rapide réduit à
+  quelques dizaines d'itérations (`--refine-iterations`), annule un calcul,
+  exporte en COLMAP et en nerfstudio, puis liste, télécharge par plages
+  d'octets, emballe dans une archive de partage et supprime le résultat. Le
+  serveur doit répondre à `/api/info` pendant tout le calcul et s'arrêter
+  proprement avec un calcul en cours. Python seul.
 - `hostile.py` : les routes de capture, d'enregistrement et de partage face
   à un client malveillant. Un inconnu du réseau local (jeton absent, faux,
   tronqué, dans l'URL ; message de 9 Mio ; connexions muettes sur
@@ -72,6 +80,7 @@ e2e/server/tauri-smoke.sh
 cargo build --release -p gs-core --features par --example gscap_write   # facultatif : téléphone simulé
 python3 e2e/server/capture.py        # ports 7890 et 7891, environ 1 min
 python3 e2e/server/hostile.py        # ports 7940 et 7941, environ 3 min (--quick : 40 s)
+python3 e2e/server/refine.py         # ports 7960 et 7961, environ 20 s
 
 (cd crates/gs-app && trunk build --release)
 node e2e/server/real-frontend.cjs    # ports 7870 et 7871
@@ -83,7 +92,9 @@ Les tests d'intégration du serveur lui-même (sockets réels, sans navigateur)
 sont dans `crates/gs-server/tests` : `cargo test -p gs-server`. Ceux de la
 capture (`capture.rs`) utilisent le téléphone simulé des tests de gs-core ;
 ceux des enregistrements (`recordings.rs`) vérifient les plages d'octets,
-les noms de fichiers hostiles et l'archive de partage ; `hardening.rs`
+les noms de fichiers hostiles et l'archive de partage ; `refine.rs` vérifie
+l'affinage, son annulation, ses refus, les exports et l'état du disque ;
+`hardening.rs`
 vérifie la limite de connexions de l'accès réseau et le contrôle de
 l'en-tête `Host` sur l'accès local. Les mesures de
 charge se lancent avec

@@ -557,7 +557,10 @@ impl Loop<'_> {
         let title = capture_title(capture.session.name()).to_string();
         match FileRecording::start(&self.setup.store, &capture.stem, &title, self.setup.max_recording_bytes, snapshot) {
             Ok(recording) => capture.stream = Some(recording),
-            Err(err) => log::error!("la capture en direct ne sera pas enregistrée : {err}"),
+            Err(err) => {
+                log::error!("la capture en direct ne sera pas enregistrée : {err}");
+                self.setup.store.report_problem("recording_not_saved", &capture.stem, err);
+            }
         }
     }
 
@@ -580,7 +583,10 @@ impl Loop<'_> {
                     log::info!("capture saved as {} ({} bytes)", saved.file, saved.size);
                     capture.still = Some(saved.file);
                 }
-                Err(err) => log::error!("la capture n'a pas pu être enregistrée : {err}"),
+                Err(err) => {
+                    log::error!("la capture n'a pas pu être enregistrée : {err}");
+                    self.setup.store.report_problem("recording_not_saved", &capture.stem, err);
+                }
             }
         }
     }
@@ -616,6 +622,7 @@ impl Loop<'_> {
             Ok(raw) => Some(raw),
             Err(err) => {
                 log::error!("la capture ne sera pas conservée sur le disque : {err}");
+                self.setup.store.report_problem("capture_not_saved", stem, err);
                 None
             }
         }

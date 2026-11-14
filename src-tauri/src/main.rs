@@ -7,8 +7,9 @@
 //! itself:
 //!
 //! * `server_info`: where the embedded server listens;
-//! * `export_recording`: writes a recording, or its share archive, into
-//!   the user's download folder (a web view has no download manager);
+//! * `export_recording`: writes a recording, a refined capture, or the
+//!   share archive of either, into the user's download folder (a web view
+//!   has no download manager);
 //! * `reveal`: shows a folder or an exported file in the file manager.
 
 // No console window next to the application on Windows.
@@ -35,6 +36,21 @@ enum ExportKind {
     Recording,
     /// The share archive: the web build with the recording inside.
     Share,
+    /// A refined capture: the `.ply` file itself.
+    Refined,
+    /// The share archive of a refined capture.
+    RefinedShare,
+}
+
+impl ExportKind {
+    /// Extension of the file written.
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Recording => "gsrec",
+            Self::Refined => "ply",
+            Self::Share | Self::RefinedShare => "zip",
+        }
+    }
 }
 
 /// Where exported files go: the user's download folder, or a folder of
@@ -72,9 +88,10 @@ fn free_path(dir: &std::path::Path, stem: &str, ext: &str) -> PathBuf {
     path
 }
 
-/// Writes the recording `name` (as `GET /api/recordings` lists it) or its
-/// share archive into the download folder and returns the path of the new
-/// file. Errors are sentences for the user.
+/// Writes the recording `name` (as `GET /api/recordings` lists it), the
+/// refined capture `name` (as `GET /api/refined` lists it) or the share
+/// archive of either into the download folder and returns the path of the
+/// new file. Errors are sentences for the user.
 #[tauri::command]
 async fn export_recording(
     app: tauri::AppHandle,
@@ -83,16 +100,18 @@ async fn export_recording(
     kind: ExportKind,
 ) -> Result<String, String> {
     if !is_plain_name(&name) {
-        return Err("Nom d'enregistrement invalide.".to_string());
+        return Err("Nom de fichier invalide.".to_string());
     }
     let dir = export_dir(&app)?;
     let server = server.inner().clone();
     // Gigabytes may be copied: not on the thread that draws the window.
     let written = tauri::async_runtime::spawn_blocking(move || {
-        let path = free_path(&dir, &name, if kind == ExportKind::Share { "zip" } else { "gsrec" });
+        let path = free_path(&dir, &name, kind.extension());
         let result = match kind {
             ExportKind::Recording => server.export_recording(&name, &path),
             ExportKind::Share => server.export_share(&name, &path),
+            ExportKind::Refined => server.export_refined(&name, &path),
+            ExportKind::RefinedShare => server.export_refined_share(&name, &path),
         };
         match result {
             Ok(bytes) => {
@@ -103,7 +122,7 @@ async fn export_recording(
                 // Nothing half written is left in the user's folder.
                 let _ = std::fs::remove_file(&path);
                 Err(match err.kind() {
-                    std::io::ErrorKind::NotFound => "Cet enregistrement n'existe plus.".to_string(),
+                    std::io::ErrorKind::NotFound => "Ce fichier n'existe plus sur le serveur.".to_string(),
                     std::io::ErrorKind::ResourceBusy => "Cet enregistrement est encore en cours d'écriture.".to_string(),
                     _ => format!("L'export a échoué : {err}"),
                 })
@@ -115,15 +134,18 @@ async fn export_recording(
     Ok(written.display().to_string())
 }
 
-/// Shows something in the file manager: `recordings`, `captures` or
-/// `exports` (the folders), or the path of a file `export_recording`
-/// returned. Nothing else is opened, whatever the window asks.
+/// Shows something in the file manager: `recordings`, `captures`,
+/// `refined`, `datasets` or `exports` (the folders), or the path of a file
+/// `export_recording` returned. Nothing else is opened, whatever the
+/// window asks.
 #[tauri::command]
 fn reveal(app: tauri::AppHandle, server: State<'_, ServerHandle>, target: String) -> Result<(), String> {
     let missing = || "Ce dossier n'existe pas encore.".to_string();
     let (path, select) = match target.as_str() {
         "recordings" => (server.recordings_dir().ok_or_else(missing)?, false),
         "captures" => (server.captures_dir().ok_or_else(missing)?, false),
+        "refined" => (server.refined_dir().ok_or_else(missing)?, false),
+        "datasets" => (server.datasets_dir().ok_or_else(missing)?, false),
         "exports" => (export_dir(&app)?, false),
         file => {
             // Only a file that sits directly in the export folder.
@@ -356,6 +378,22 @@ mod tests {
         assert_eq!(free_path(&dir, "Salon", "zip"), dir.join("Salon (3).zip"));
         assert_eq!(free_path(&dir, "Salon", "gsrec"), dir.join("Salon.gsrec"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_kind_of_export_has_its_name_and_extension() {
+        let kind = |text: &str| serde::Deserialize::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(text));
+        let kinds: [(&str, ExportKind, &str); 4] = [
+            ("recording", ExportKind::Recording, "gsrec"),
+            ("share", ExportKind::Share, "zip"),
+            ("refined", ExportKind::Refined, "ply"),
+            ("refined_share", ExportKind::RefinedShare, "zip"),
+        ];
+        for (name, expected, extension) in kinds {
+            assert_eq!(kind(name).ok(), Some(expected), "{name}");
+            assert_eq!(expected.extension(), extension);
+        }
+        assert_eq!(kind("capture").ok(), None::<ExportKind>);
     }
 
     #[test]

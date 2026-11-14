@@ -17,7 +17,8 @@ use crate::logic::replay::{self, RecorderAnswer, RecordingList, SavedRecording, 
 use crate::logic::share::encode_query_value;
 use crate::logic::source::SourceKind;
 use crate::net::{self, Body};
-use crate::state::{ImportView, RecordingView, ReplayOrigin, Take, TakePlace, Ui};
+use crate::state::{ImportView, RecordingView, ReplayOrigin, Shared, Take, TakePlace, Ui};
+use crate::tauri;
 
 /// Where a recording started now would be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +228,10 @@ impl Core {
         spawn_local(async move {
             let Ok(answer) = net::request(&url, None, 4000).await else { return };
             let Some(parsed) = RecorderAnswer::parse(&answer.body).filter(|_| answer.ok()) else { return };
+            // The same answer tells the state of the server's disk.
+            let storage = crate::logic::refine::Storage::parse(&answer.body);
             with_core(|core| {
+                core.adopt_storage(storage);
                 if !core.ui.record_busy.get_untracked() {
                     core.adopt_recorder(parsed.recording, parsed.last);
                 }
@@ -332,6 +336,12 @@ impl Core {
                 Some(blob) => dom::download_blob(&take.file, blob),
                 None => return,
             },
+            // A web view has no download manager: the desktop shell writes
+            // the file into the download folder itself.
+            TakePlace::Server if tauri::is_tauri() => {
+                self.desktop_export(take.file.trim_end_matches(".gsrec").to_string(), "recording");
+                return;
+            }
             // `?download` makes the server send the file as an attachment.
             TakePlace::Server => match self.take_url(&take) {
                 Some(url) => dom::download_url(&take.file, &format!("{url}?download")),
@@ -380,7 +390,7 @@ impl Core {
                 });
             }
         }
-        if self.ui.share.with_untracked(|s| s.as_ref().is_some_and(|s| s.id == id)) {
+        if self.ui.share.with_untracked(|shared| matches!(shared, Some(Shared::Take(take)) if take.id == id)) {
             self.ui.share.set(None);
         }
     }
@@ -388,7 +398,7 @@ impl Core {
     /// Opens the share dialog of a recording of the server.
     pub fn share_take(&self, id: u32) {
         if let Some(take) = self.take(id).filter(|t| t.place == TakePlace::Server) {
-            self.ui.share.set(Some(take));
+            self.ui.share.set(Some(Shared::Take(take)));
         }
     }
 

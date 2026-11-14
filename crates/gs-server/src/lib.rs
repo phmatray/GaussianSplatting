@@ -36,6 +36,11 @@
 //! * **Sharing**: `GET /api/share/<name>.zip` is the web build with the
 //!   recording inside ([`ServerHandle::export_share`] writes the same
 //!   archive to a file).
+//! * **Offline refinement**: `POST /api/refine` (loopback) starts, on a
+//!   thread of its own, the optimisation of a kept capture by `gs_refine`
+//!   or its export as a dataset; `GET /api/refine` reports the progress,
+//!   `GET /api/refined` lists the results and `GET /refined/<name>.ply`
+//!   serves them with `Range` ([`ServerConfig::refined_dir`]).
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), gs_server::Error> {
@@ -83,6 +88,7 @@ mod logging;
 mod net;
 mod outbox;
 mod recording;
+mod refine;
 mod store;
 mod tls;
 mod ws;
@@ -107,7 +113,8 @@ pub use logging::log_to_stderr;
 pub use net::{lan_ipv4, qr_svg, qr_terminal};
 pub use outbox::QueueLimits;
 pub use recording::{EndReason, RecordState, RecordingStatus, Saved};
-pub use store::{CaptureEntry, RecordingEntry};
+pub use refine::{DatasetInfo, JobEnd, JobError, JobKind, JobStatus, Outcome as JobOutcome, RefineState};
+pub use store::{CaptureEntry, RecordingEntry, RefinedEntry, RefinedMeta, StorageProblem};
 pub use tls::fingerprint;
 
 use assets::Assets;
@@ -241,6 +248,20 @@ pub struct ServerConfig {
     pub max_lan_connections: usize,
     /// Reconstruction parameters for the captures of a phone.
     pub ingest: IngestParams,
+    /// Where the results of the offline refinement (`.ply`) are written
+    /// and served from. `None`: a directory `refined` next to
+    /// [`ServerConfig::recordings_dir`].
+    pub refined_dir: Option<PathBuf>,
+    /// Where a capture exported as a dataset (COLMAP, nerfstudio) is
+    /// written, one directory per export. `None`: a directory `datasets`
+    /// next to [`ServerConfig::recordings_dir`].
+    pub datasets_dir: Option<PathBuf>,
+    /// Worker threads of an offline refinement; 0: every processor but
+    /// one, which stays with the pipeline and the listeners.
+    pub refine_threads: usize,
+    /// Iterations of every refinement, whatever its preset: for tests and
+    /// demonstrations. `None`: what the preset and the capture call for.
+    pub refine_iterations: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -266,6 +287,10 @@ impl Default for ServerConfig {
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             max_lan_connections: DEFAULT_MAX_LAN_CONNECTIONS,
             ingest: IngestParams::default(),
+            refined_dir: None,
+            datasets_dir: None,
+            refine_threads: 0,
+            refine_iterations: None,
         }
     }
 }
@@ -454,6 +479,8 @@ pub(crate) struct Core {
     pub store: Arc<Store>,
     /// State of the record button, written by the pipeline thread.
     pub record: recording::SharedRecordState,
+    /// The one slot of offline jobs (refinement, dataset export).
+    pub refiner: Arc<refine::Refiner>,
     /// One capture is imported at a time.
     pub imports: Arc<Semaphore>,
     /// Share archives being laid out.
@@ -708,6 +735,10 @@ impl Core {
             // A tick may be in progress; joining must not block the runtime.
             let _ = tokio::task::spawn_blocking(move || thread.join()).await;
         }
+        // An offline job stops at its next iteration; its result would have
+        // been minutes away, the process is not kept waiting for it.
+        let refiner = self.refiner.clone();
+        let _ = tokio::task::spawn_blocking(move || refiner.stop(SHUTDOWN_GRACE)).await;
     }
 }
 
@@ -739,6 +770,7 @@ impl Drop for HandleGuard {
     fn drop(&mut self) {
         self.0.begin_shutdown();
         self.0.hub.stop();
+        self.0.refiner.cancel();
     }
 }
 
@@ -858,6 +890,47 @@ impl ServerHandle {
         api::export_share(&self.core, name, destination)
     }
 
+    /// Where refined results (`.ply`) are kept, if anywhere.
+    pub fn refined_dir(&self) -> Option<PathBuf> {
+        self.core.store.dir(Kind::Refined).map(PathBuf::from)
+    }
+
+    /// Where exported datasets are written, if anywhere.
+    pub fn datasets_dir(&self) -> Option<PathBuf> {
+        self.core.store.datasets_dir().map(PathBuf::from)
+    }
+
+    /// The offline job in progress and the latest that ended.
+    pub fn refine_state(&self) -> RefineState {
+        self.core.refiner.state()
+    }
+
+    /// The refined results on disk, newest first (blocking: reads the
+    /// description of each).
+    pub fn refined(&self) -> Vec<RefinedEntry> {
+        self.core.store.list_refined()
+    }
+
+    /// Copies the refined result `name` (as `GET /api/refined` lists it,
+    /// without `.ply`) to `destination` (blocking). Returns the bytes
+    /// written.
+    pub fn export_refined(&self, name: &str, destination: &std::path::Path) -> io::Result<u64> {
+        let file = format!("{name}{}", store::REFINED_EXT);
+        let source = self
+            .core
+            .store
+            .existing(Kind::Refined, &file)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such result"))?;
+        std::fs::copy(source, destination)
+    }
+
+    /// Writes the share archive of the refined result `name` to
+    /// `destination` (blocking): the same bytes as
+    /// `GET /api/share/refined/<name>.zip`.
+    pub fn export_refined_share(&self, name: &str, destination: &std::path::Path) -> io::Result<u64> {
+        api::export_refined_share(&self.core, name, destination)
+    }
+
     /// Stops the server: viewers receive a WebSocket close (1001), both
     /// listeners are closed and the pipeline thread is joined. Returns once
     /// all of that is done (a few seconds at most). Calling it again, or
@@ -889,8 +962,10 @@ async fn start_with(config: ServerConfig, addresses: AddressSource) -> Result<Se
         log::warn!("aucune interface web trouvée : une page d'explication est servie à la place");
     }
 
-    let store = Arc::new(Store::new(config.recordings_dir, config.captures_dir));
-    for kind in [Kind::Recording, Kind::Capture] {
+    let store = Arc::new(
+        Store::new(config.recordings_dir, config.captures_dir).with_work_dirs(config.refined_dir, config.datasets_dir),
+    );
+    for kind in [Kind::Recording, Kind::Capture, Kind::Refined] {
         if let Some(dir) = store.dir(kind) {
             log::info!("{kind:?} files are kept in {}", dir.display());
         }
@@ -930,6 +1005,10 @@ async fn start_with(config: ServerConfig, addresses: AddressSource) -> Result<Se
         assets,
         sessions: Sessions::default(),
         rejected_controls: AtomicU64::new(0),
+        refiner: refine::Refiner::new(
+            store.clone(),
+            refine::RefineSetup { threads: config.refine_threads, iterations: config.refine_iterations },
+        ),
         store,
         record,
         imports: Arc::new(Semaphore::new(1)),

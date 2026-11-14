@@ -914,13 +914,19 @@ def _pose_yaw(position, yaw: float) -> tuple:
 
 
 def synth_frames(count: int = 60, depth_size=(64, 48), color_size=(160, 120), fps: float = 10.0,
-                 room=(4.0, 2.6, 5.0), with_confidence: bool = True, compress: bool = True):
+                 room=(4.0, 2.6, 5.0), with_confidence: bool = True, compress: bool = True, grain: int = 0):
     """Yield Frame objects of a walk in a box room (floor y = -1.4, eye at 0).
 
     The room spans x in [-w/2, w/2], y in [-1.4, h - 1.4], z in [-d/2, d/2];
     as in ARKit the origin is where the session started, not the floor.
     Geometry is exact (depth along the camera axis), colours are flat per
     8x8 block and differ per wall, so that a reconstruction can be checked.
+
+    `grain` adds a pseudo-random offset of up to that many levels to every
+    block (the same for a given frame and block at every run). Flat walls
+    compress to almost nothing; with a grain of about 100 and a colour size
+    of 1920x1440 a frame weighs a few hundred kilobytes, like the frames of
+    a real phone, which is what readers and transports have to cope with.
     """
     import tinyjpeg  # local module, only needed for synthetic data
 
@@ -980,6 +986,14 @@ def synth_frames(count: int = 60, depth_size=(64, 48), color_size=(160, 120), fp
             hit = tuple(position[k] + direction[k] * t for k in range(3))
             checker = (int(math.floor(hit[0] * 2)) + int(math.floor(hit[1] * 2)) + int(math.floor(hit[2] * 2))) & 1
             base = wall_colors[wall]
+            if grain > 0:
+                # A hash of frame and block: no state, no `random` module.
+                h = (i * 0x9E3779B1 + bx * 0x85EBCA6B + by * 0xC2B2AE35) & 0xFFFFFFFF
+                h ^= h >> 15
+                h = (h * 0x2C1B3C6D) & 0xFFFFFFFF
+                h ^= h >> 12
+                noise = [((h >> shift) & 0xFF) * (2 * grain + 1) // 256 - grain for shift in (0, 8, 16)]
+                return tuple(min(255, max(0, c - 40 * checker + n)) for c, n in zip(base, noise))
             return tuple(max(0, c - 40 * checker) for c in base)
 
         yield Frame(
@@ -1198,7 +1212,7 @@ def _cmd_extract(args) -> int:
 def _cmd_synth(args) -> int:
     header = make_header(mode=args.mode, name=args.name, device="synthetic", floor={"y": -1.4})
     frames = synth_frames(count=args.frames, depth_size=(args.depth_width, args.depth_width * 3 // 4),
-                          color_size=(args.color_width, args.color_width * 3 // 4), fps=args.fps)
+                          color_size=(args.color_width, args.color_width * 3 // 4), fps=args.fps, grain=args.grain)
     count = write_gscap(args.out, header, frames)
     print("%s: %d frames, %.1f kB" % (args.out, count, os.path.getsize(args.out) / 1e3))
     return 0
@@ -1229,6 +1243,9 @@ def main(argv=None) -> int:
     p.add_argument("--name", default="Synthetic room")
     p.add_argument("--depth-width", type=int, default=64)
     p.add_argument("--color-width", type=int, default=160)
+    p.add_argument("--grain", type=int, default=0,
+                   help="noise per 8x8 block, in levels; 100 with --color-width 1920 --depth-width 256 "
+                        "gives frames as heavy as a real phone's")
     p.set_defaults(func=_cmd_synth)
     args = parser.parse_args(argv)
     if not args.command:

@@ -11,6 +11,7 @@ pub mod format;
 pub mod present;
 pub mod qr;
 pub mod rate;
+pub mod refine;
 pub mod render;
 pub mod replay;
 pub mod share;

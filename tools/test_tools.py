@@ -765,6 +765,79 @@ class GscapFileTests(unittest.TestCase):
                 self.assertTrue(on_wall, world)
 
 
+class PhoneSizedFrameTests(unittest.TestCase):
+    """Frames as heavy as a real iPhone's: 1920x1440 colour, 256x192 depth,
+    a few hundred kilobytes each. The fixtures and the other synthetic
+    captures are twenty times lighter, which once hid a reader that never
+    asked for more than 64 KiB. Nothing that size is kept in the repository:
+    the frames are generated here."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="splat-phone-sized-")
+        cls.frames = list(gscap.synth_frames(count=3, depth_size=(256, 192), color_size=(1920, 1440), grain=100))
+        cls.encoded = [gscap.encode_frame(frame) for frame in cls.frames]
+        cls.path = os.path.join(cls.tmp, "phone.gscap")
+        gscap.write_gscap(cls.path, gscap.make_header(mode="room", name="Salon", created="2026-11-14T10:00:00Z"),
+                          iter(cls.frames))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_frames_have_the_weight_of_a_phone(self):
+        for frame, data in zip(self.frames, self.encoded):
+            self.assertEqual((frame.color_width, frame.color_height, frame.depth_width, frame.depth_height),
+                             (1920, 1440, 256, 192))
+            self.assertGreater(len(data), 200_000)
+            self.assertLess(len(data), 4_000_000)
+            # The colour image is most of it, and it is a JPEG of that size.
+            self.assertGreater(len(frame.color), 150_000)
+            info = tinyjpeg.inspect(frame.color)
+            self.assertEqual((info["width"], info["height"]), (1920, 1440))
+        # The generator is deterministic: same frames at every run.
+        again = next(iter(gscap.synth_frames(count=3, depth_size=(256, 192), color_size=(1920, 1440), grain=100)))
+        self.assertEqual(gscap.encode_frame(again), self.encoded[0])
+
+    def test_round_trip_and_file(self):
+        for frame, data in zip(self.frames, self.encoded):
+            back = gscap.decode_frame(data)
+            self.assertEqual((back.index, back.color, back.depth, back.confidence),
+                             (frame.index, frame.color, frame.depth, frame.confidence))
+            self.assertEqual(len(back.depth), 256 * 192 * 2)
+        header, frames, truncated = gscap.read_gscap(self.path)
+        self.assertEqual((frames, truncated, header["mode"]), (self.encoded, False, "room"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gscap.main(["verify", self.path]), 0)
+        # Cut a hundred kilobytes before the end, inside the last frame: the
+        # complete frames stay.
+        cut = os.path.join(self.tmp, "cut.gscap")
+        with open(self.path, "rb") as source, open(cut, "wb") as target:
+            target.write(source.read()[:-100_000])
+        _, frames, truncated = gscap.read_gscap(cut)
+        self.assertEqual((frames, truncated), (self.encoded[:2], True))
+
+    def test_stream_and_upload_over_tls(self):
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl is not installed")
+        cert, key = fake_server.make_self_signed_cert(os.path.join(self.tmp, "cert"), ["127.0.0.1"])
+        save = os.path.join(self.tmp, "saved")
+        server = fake_server.FakeServer(certfile=cert, keyfile=key, save_dir=save, progress_interval=0.05).start()
+        self.addCleanup(server.stop)
+        stats = fake_phone.stream_capture(self.path, server.pairing_uri())
+        self.assertEqual((stats["frames_sent"], stats["acked"], stats["used"]), (3, 3, 3))
+        session = server.sessions[0]
+        self.assertTrue(session.done.wait(10.0))
+        self.assertEqual(session.frame_indices, [0, 1, 2])
+        self.assertIsNone(session.error)
+        # What the server kept is what the phone sent, byte for byte.
+        _, frames, truncated = gscap.read_gscap(session.saved_path)
+        self.assertEqual((frames, truncated), (self.encoded, False))
+        # The same file as one HTTP upload.
+        status, answer = fake_phone.upload_capture(self.path, server.pairing_uri())
+        self.assertEqual((status, answer["ok"], answer["frames"], answer["truncated"]), (200, True, 3, False))
+
+
 class PairingTests(unittest.TestCase):
     def test_fixture_cases(self):
         cases = load_json("pairing_uris.json")

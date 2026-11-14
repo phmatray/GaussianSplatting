@@ -145,6 +145,8 @@ pub(crate) fn router(core: Arc<Core>, listener: Listener, stop: watch::Receiver<
         // as it arrives: the handler enforces its own limit.
         .route("/api/captures", get(api::captures).post(api::import).layer(DefaultBodyLimit::disable()))
         .route("/api/captures/open", post(api::open))
+        .route("/api/refine", get(api::refine_status).post(api::refine))
+        .route("/api/refined", get(api::refined))
         .fallback(static_files)
         // The wasm and JavaScript of the web build shrink by a factor of
         // three or more; on the headset's Wi-Fi that is worth the CPU.
@@ -156,6 +158,8 @@ pub(crate) fn router(core: Arc<Core>, listener: Listener, stop: watch::Receiver<
         .route(INGEST_PATH, get(ingest::upgrade))
         .route("/recordings/{file}", get(api::recording_file).delete(api::delete_recording))
         .route("/captures/{file}", get(api::capture_file).delete(api::delete_capture))
+        .route("/refined/{file}", get(api::refined_file).delete(api::delete_refined))
+        .route("/api/share/refined/{file}", get(api::refined_share_zip))
         .route("/api/share/{file}", get(api::share_zip));
     if listener == Listener::Loopback {
         // Only the Tauri webview needs cross-origin access (its pages come

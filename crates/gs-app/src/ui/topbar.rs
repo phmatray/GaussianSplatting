@@ -88,9 +88,12 @@ pub fn TopBar() -> impl IntoView {
         Some((playing, _)) => !playing,
         None => ui.config.get().is_some_and(|c| c.paused),
     };
+    // A capture is paused on the phone: the server ignores the viewers'
+    // controls while one is shown, so the button would do nothing.
+    let capture = move || replay().is_none() && ui.capture.with(Option::is_some);
     let can_pause = move || match replay() {
         Some((_, ready)) => ready,
-        None => ui.config.get().is_some() && ui.file.get().is_none() && ui.link.get() == Link::Connected,
+        None => ui.config.get().is_some() && ui.file.get().is_none() && ui.link.get() == Link::Connected && !capture(),
     };
     let vr_ready = move || ui.xr_supported.get() == Some(true);
     view! {
@@ -110,6 +113,7 @@ pub fn TopBar() -> impl IntoView {
                     type="button"
                     id="btn-pause"
                     class="icon-btn"
+                    hidden=capture
                     class:active=paused
                     disabled=move || !can_pause()
                     aria-pressed=move || paused().to_string()

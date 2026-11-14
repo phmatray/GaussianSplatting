@@ -5,6 +5,7 @@ mod icons;
 mod overlays;
 mod panel;
 mod phone;
+mod refine;
 mod sections;
 mod takes;
 mod timeline;

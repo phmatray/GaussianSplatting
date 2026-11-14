@@ -4,6 +4,7 @@ description = "Pipeline thread, loopback HTTP + LAN HTTPS listeners and WebSocke
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "gs_server"
@@ -24,6 +25,8 @@ embed-dist = []
 
 [dependencies]
 gs-core = { workspace = true, features = ["par"] }
+# The offline refinement of a kept capture and its export as a dataset.
+gs-refine = { path = "../gs-refine" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs"] }
@@ -50,6 +53,10 @@ percent-encoding = "2"
 crc32fast = "1"
 miniz_oxide.workspace = true
 log = { version = "0.4", features = ["std"] }
+
+[target.'cfg(unix)'.dependencies]
+# Free space of a volume (`statvfs`), to say "the disk is full" in time.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["io-util"] }

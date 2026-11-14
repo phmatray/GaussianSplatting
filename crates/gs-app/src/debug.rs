@@ -41,7 +41,7 @@ fn state(core: &Core) -> Value {
             "controllers": info.controllers.len(),
         })
     });
-    json!({
+    let mut state = json!({
         "source": core.source().map(|s| s.id()),
         "channel": core.channel(),
         "link": link.id(),
@@ -159,7 +159,7 @@ fn state(core: &Core) -> Value {
             "durationS": t.duration_s,
             "scene": t.scene,
         })).collect::<Vec<_>>(),
-        "share": ui.share.get_untracked().map(|t| t.file),
+        "share": ui.share.get_untracked().map(|shared| shared.file().to_string()),
         "capture": ui.capture.get_untracked().map(|c| json!({
             "info": serde_json::to_value(&c.info).unwrap_or(Value::Null),
             "stats": c.stats.map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
@@ -175,7 +175,14 @@ fn state(core: &Core) -> Value {
         "panelOpen": ui.panel_open.get_untracked(),
         "uiHidden": ui.ui_hidden.get_untracked(),
         "errors": core.errors(),
-    })
+    });
+    // Added one by one: the macro above is at its recursion limit.
+    state["captures"] = json!(ui.captures.get_untracked().iter().map(|c| json!({ "file": c.file, "title": c.title, "mode": c.mode, "size": c.size, "capturing": c.capturing })).collect::<Vec<_>>());
+    state["refined"] = json!(ui.refined.get_untracked().iter().map(|r| json!({ "file": r.file, "title": r.title, "capture": r.capture, "preset": r.preset, "gaussians": r.gaussians, "size": r.size })).collect::<Vec<_>>());
+    state["job"] = json!(ui.job.get_untracked().map(|j| json!({ "id": j.id, "kind": j.kind, "capture": j.capture, "stage": j.stage, "iteration": j.iteration, "iterations": j.iterations, "cancelling": j.cancelling })));
+    state["jobEnd"] = json!(ui.job_end.get_untracked().map(|e| json!({ "id": e.id, "kind": e.kind, "outcome": e.outcome, "result": e.result.as_ref().map(|r| r.file.clone()), "dataset": e.dataset.as_ref().map(|d| d.dir.clone()) })));
+    state["storage"] = json!(ui.storage.get_untracked().map(|s| json!({ "freeBytes": s.free_bytes, "low": s.low })));
+    state
 }
 
 /// Installs `window.__splatLive`.

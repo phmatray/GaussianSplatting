@@ -128,6 +128,46 @@ de 200 caractères, vignettes d'un mégapixel au plus. La corbeille d'un
 enregistrement demande confirmation : un premier clic l'arme pour quatre
 secondes, le second supprime.
 
+Avant d'envoyer un fichier `.gscap` au serveur, la page en lit les huit
+premiers octets : un fichier qui n'est pas une capture est refusé sur
+place, avec un message clair, au lieu d'être envoyé en entier. Une capture
+s'affiche vue de l'extérieur, une pièce vue de haut
+(`logic::present::capture_view`), jamais depuis la dernière position du
+téléphone ; le bouton pause disparaît pendant une capture (le serveur
+l'ignore). Quand le disque du serveur est presque plein, ou qu'il a refusé
+une capture, la page le dit (`storage` de `GET /api/record`).
+
+## Captures conservées et affinage hors ligne
+
+Section « Captures et affinage » du panneau (`ui/refine.rs`,
+`core/refine.rs`, `logic/refine.rs`). Avec le serveur natif, sur son
+ordinateur :
+
+- la liste des captures que le serveur conserve (`GET /api/captures`) ;
+  chacune se rouvre (`POST /api/captures/open`), se supprime, ou s'affine ;
+- « Affiner cette capture » (`POST /api/refine`) : préréglage Rapide,
+  Standard ou Fin avec sa durée mesurée, choix « peindre d'après les
+  photos » ou « laisser les trous » là où le capteur n'a rien mesuré, et les
+  exports COLMAP et nerfstudio, écrits dans un dossier de l'ordinateur que
+  la page affiche ;
+- le calcul en cours, interrogé chaque seconde (`GET /api/refine`) : étape,
+  itération, temps écoulé et restant, « Annuler » (qui ne garde rien) ;
+- les captures affinées (`GET /api/refined`) : « Voir le résultat » charge
+  le `.ply` et l'affiche comme un fichier importé, en mélange trié (une
+  pièce depuis l'endroit où le téléphone a commencé, en vol libre) ;
+  téléchargement, partage (lien, `<iframe>`, archive) et suppression comme
+  pour un enregistrement.
+
+Un client du réseau local voit et ouvre les captures affinées, rien
+d'autre. Sans serveur, la section tient en une phrase qui dit pourquoi.
+Les textes disent ce que l'affinage apporte et ce qu'il n'apporte pas
+(mesuré sur des captures simulées, processeur seulement) ; le score sur les
+photos mises de côté n'est jamais affiché comme une qualité.
+
+Dans la fenêtre de l'application de bureau, tout téléchargement passe par
+la commande Tauri `export_recording`, puis `reveal` (une vue web n'a pas de
+gestionnaire de téléchargements).
+
 ## Rendu
 
 « Rendu » (section Affichage) : Auto, Doux, Net, Trié. Auto dessine les
@@ -166,7 +206,7 @@ Les touches de vol sont ignorées pendant la saisie dans un champ.
 | Module | Rôle |
 |---|---|
 | `src/logic` | Tout ce qui se calcule sans navigateur : choix de la source, correctifs de configuration, présentation de la scène (repères, vue maquette, cadrage), couleurs de profondeur, formats de fichiers, mise en forme des nombres, paramètres d'adresse et liens de partage (`share`), relecture et enregistrements (`replay`), capture (`capture`), choix du rendu (`render`), QR codes (`qr`) |
-| `src/core.rs` | Le viseur, le transport et le traitement des messages ; `src/core/replay.rs` (relecture), `record.rs` (enregistrement, liste, partage), `capture.rs` (appairage, import de capture) |
+| `src/core.rs` | Le viseur, le transport et le traitement des messages ; `src/core/replay.rs` (relecture), `record.rs` (enregistrement, liste, partage), `capture.rs` (appairage, import de capture), `refine.rs` (captures conservées, affinage, résultats) |
 | `src/transport` | `Transport::Server` (WebSocket, relayé par le worker ou ouvert par la page) et `Transport::Worker` (pipeline dans le Web Worker) : mêmes octets, mêmes commandes ; `ReplayLink`, le worker de relecture |
 | `src/state.rs` | Les signaux réactifs lus par les vues |
 | `src/ui` | Barre du haut, panneau latéral, éléments superposés |
@@ -181,7 +221,8 @@ Les modifications partent en `patch_config`, regroupées après un court délai.
 
 `window.__splatLive.state()` renvoie un objet JSON (entre autres `replay`
 avec l'état du lecteur et la latence des déplacements, `recording`,
-`takes`, `capture`, `import`, `pair`, `embed`, `viewer.blend`) : `source`, `channel`
+`takes`, `capture`, `import`, `pair`, `embed`, `viewer.blend`, `captures`,
+`refined`, `job`, `jobEnd`, `storage`) : `source`, `channel`
 (`worker`, `relay` ou `direct`), `link`, `connected`, `scene`, `config`,
 `layers`, `viewer`, `nav`, `eye`, `target`, `display`, `xr`, `pipelineHz`
 (cadence mesurée sur le compteur de ticks), `stats`, `counts`,

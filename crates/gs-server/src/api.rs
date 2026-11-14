@@ -8,6 +8,8 @@
 //! | `GET /api/captures`, `POST /api/captures/open`, `GET`/`DELETE /captures/<file>` | loopback | `Origin` on what changes something |
 //! | `GET /api/record`, `GET /api/recordings`, `GET /recordings/<file>`, `GET /api/share/<name>.zip` | both | read-only |
 //! | `POST /api/record`, `DELETE /recordings/<file>` | loopback | `Origin` |
+//! | `GET /api/refine`, `POST /api/refine`, `DELETE /refined/<file>` | loopback | `Origin` on what changes something |
+//! | `GET /api/refined`, `GET /refined/<file>`, `GET /api/share/refined/<name>.zip` | both | read-only |
 //!
 //! Errors are JSON `{"error": "<English sentence>", "code": "<stable code>"}`;
 //! an interface shows its own text for the code.
@@ -38,6 +40,7 @@ use crate::files;
 use crate::http::{json_error, no_store, origin_allowed, AppState, Listener};
 use crate::hub::{Command, RecordRefusal};
 use crate::net;
+use crate::refine::{Refusal, Task};
 use crate::store::{self, Kind};
 use crate::zip::{Part, ZipBuilder, ZipPlan};
 
@@ -53,6 +56,13 @@ const DRAIN_TIME: Duration = Duration::from_secs(10);
 /// names it.
 const SHARED_RECORDING: &str = "recording.gsrec";
 const SHARE_MANIFEST: &str = "share.json";
+/// Name of a refined result inside its share archive.
+const SHARED_SCENE: &str = "scene.ply";
+/// Below this much free space where captures are written the interface is
+/// told that the disk is nearly full: a phone sends up to 9 MB per second.
+const LOW_DISK_BYTES: u64 = 2 << 30;
+/// An upload is refused when the disk would be left with less than this.
+const UPLOAD_MARGIN_BYTES: u64 = 64 << 20;
 /// The web build of a share archive is held in memory while the archive
 /// is laid out; a "web build" larger than this is not one.
 const MAX_SHARED_ASSETS: u64 = 256 << 20;
@@ -229,7 +239,20 @@ pub(crate) async fn record(State(state): State<AppState>, request: Request) -> R
 
 pub(crate) async fn record_status(State(state): State<AppState>) -> Response {
     let record = state.core.record.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    no_store(Json(record).into_response())
+    let mut answer = serde_json::to_value(record).unwrap_or_default();
+    // The state of the disk is the business of the machine's own user: the
+    // interface there polls this route anyway, and learns from it that the
+    // disk is filling up or has refused a capture.
+    if state.listener == Listener::Loopback {
+        let store = &state.core.store;
+        let free = store.free_bytes(Kind::Capture).or_else(|| store.free_bytes(Kind::Recording));
+        answer["storage"] = json!({
+            "free_bytes": free,
+            "low": free.is_some_and(|free| free < LOW_DISK_BYTES),
+            "problem": store.problem(),
+        });
+    }
+    ok_json(answer)
 }
 
 // -- recordings -----------------------------------------------------------------
@@ -355,25 +378,38 @@ fn recording_sum(core: &crate::Core, file: &str, path: &Path) -> io::Result<(u64
     Ok((meta.len(), crc))
 }
 
-/// Lays out the share archive of one recording: the web build, the
-/// recording (its first `len` bytes, of checksum `crc`) under a fixed name
+/// Lays out a share archive: the web build, the shared file (the first
+/// `len` bytes of `file`, of checksum `crc`) under the fixed name `shared`
 /// and the `share.json` that names it.
+fn plan_archive(
+    assets: Vec<(String, Vec<u8>)>,
+    file: PathBuf,
+    (len, crc): (u64, u32),
+    shared: &str,
+    manifest: &serde_json::Value,
+) -> ZipPlan {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut zip = ZipBuilder::new(i64::try_from(now).unwrap_or(0));
+    for (name, data) in &assets {
+        // A web build that was itself unpacked from a share archive: its
+        // manifest and what it shared give way to the ones added below (two
+        // entries of one name would be unpacked in an order nobody chose).
+        if name != SHARE_MANIFEST && name != SHARED_RECORDING && name != SHARED_SCENE {
+            zip.add_bytes(name, data);
+        }
+    }
+    zip.add_bytes(SHARE_MANIFEST, format!("{manifest:#}\n").as_bytes());
+    zip.add_stored_file(shared, file, len, crc);
+    zip.finish()
+}
+
+/// Lays out the share archive of one recording.
 fn plan_share(
     assets: Vec<(String, Vec<u8>)>,
     recording: PathBuf,
     (len, crc): (u64, u32),
     entry: &store::RecordingEntry,
 ) -> io::Result<ZipPlan> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let mut zip = ZipBuilder::new(i64::try_from(now).unwrap_or(0));
-    for (name, data) in &assets {
-        // A web build that was itself unpacked from a share archive: its
-        // manifest and its recording give way to the ones added below (two
-        // entries of one name would be unpacked in an order nobody chose).
-        if name != SHARE_MANIFEST && name != SHARED_RECORDING {
-            zip.add_bytes(name, data);
-        }
-    }
     // The viewer reads this file when its URL names no recording: `file`
     // is what the `file` URL parameter would be, relative to the page, and
     // `autoplay` and `loop` are those parameters too (a visitor of a shared
@@ -388,9 +424,29 @@ fn plan_share(
         "duration_s": entry.duration_s,
         "size": len,
     });
-    zip.add_bytes(SHARE_MANIFEST, format!("{manifest:#}\n").as_bytes());
-    zip.add_stored_file(SHARED_RECORDING, recording, len, crc);
-    Ok(zip.finish())
+    Ok(plan_archive(assets, recording, (len, crc), SHARED_RECORDING, &manifest))
+}
+
+/// Lays out the share archive of one refined result: the web build, the
+/// result as `scene.ply` and the `share.json` that names it (the viewer
+/// shows a `.ply` as an imported scene, drawn sorted).
+fn plan_refined_share(assets: Vec<(String, Vec<u8>)>, result: PathBuf, (len, crc): (u64, u32), entry: &store::RefinedEntry) -> ZipPlan {
+    let mut manifest = json!({
+        "file": SHARED_SCENE,
+        "name": entry.meta.title,
+        "scene": "refined",
+        "created": entry.meta.created,
+        "size": len,
+    });
+    // A room is walked through: the viewer starts inside it, where the
+    // phone started when the result says where that was.
+    if entry.meta.mode == "room" {
+        manifest["nav"] = json!("fly");
+        if let Some(view) = entry.meta.view {
+            manifest["view"] = json!(view);
+        }
+    }
+    plan_archive(assets, result, (len, crc), SHARED_SCENE, &manifest)
 }
 
 /// The archive as a stream: the blocks held in memory, and the file read
@@ -486,21 +542,7 @@ pub(crate) fn export_share(core: &crate::Core, name: &str, destination: &Path) -
     let entry = core.store.recording(&recording).ok_or_else(missing)?;
     let sum = recording_sum(core, &recording, &path)?;
     let plan = plan_share(core.assets.collect(MAX_SHARED_ASSETS)?, path, sum, &entry)?;
-    let mut out = io::BufWriter::new(std::fs::File::create(destination)?);
-    for part in &plan.parts {
-        match part {
-            Part::Bytes(bytes) => io::Write::write_all(&mut out, bytes)?,
-            Part::File { path, len } => {
-                let copied = io::copy(&mut std::fs::File::open(path)?.take(*len), &mut out)?;
-                if copied != *len {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the recording became shorter"));
-                }
-            }
-        }
-    }
-    io::Write::flush(&mut out)?;
-    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-    Ok(plan.len)
+    write_plan(&plan, destination)
 }
 
 // -- captures -----------------------------------------------------------------------
@@ -518,6 +560,7 @@ pub(crate) async fn captures(State(state): State<AppState>) -> Response {
     ok_json(json!({
         "captures": list,
         "dir": state.core.store.dir(Kind::Capture).map(|dir| dir.display().to_string()),
+        "free_bytes": state.core.store.free_bytes(Kind::Capture),
     }))
 }
 
@@ -587,6 +630,27 @@ fn import_refusal(error: &ImportError) -> Response {
         ),
         ImportError::Io(error) => internal("lecture de la capture impossible", error),
     }
+}
+
+/// 507: the disk has no room for what was asked.
+fn disk_full(free: u64) -> Response {
+    no_store(
+        (
+            StatusCode::INSUFFICIENT_STORAGE,
+            Json(json!({ "error": "not enough free disk space", "code": "disk_full", "free_bytes": free })),
+        )
+            .into_response(),
+    )
+}
+
+/// The refusal that follows a failed write: a full disk has its own code,
+/// so that the interface can say what to do about it.
+fn write_refusal(context: &str, err: io::Error) -> Response {
+    if err.kind() == io::ErrorKind::StorageFull {
+        log::error!("{context} : {err}");
+        return disk_full(0);
+    }
+    internal(context, err)
 }
 
 fn capture_in_progress() -> Response {
@@ -691,6 +755,14 @@ pub(crate) async fn import(State(state): State<AppState>, request: Request) -> R
     if core.hub.metrics.capturing.load(Ordering::Relaxed) {
         return refuse_upload(request, capture_in_progress()).await;
     }
+    // A capture that will not fit is refused before the first byte is
+    // written, not after the disk has been filled with half of it.
+    let keeping = core.settings.keep_captures && core.store.dir(Kind::Capture).is_some();
+    if let (true, Some(length), Some(free)) = (keeping, announced, core.store.free_bytes(Kind::Capture)) {
+        if length.saturating_add(UPLOAD_MARGIN_BYTES) > free {
+            return refuse_upload(request, disk_full(free)).await;
+        }
+    }
     // One import at a time: each keeps a core busy for as long as it lasts.
     let Ok(_permit) = core.imports.clone().try_acquire_owned() else {
         let refusal = json_error(StatusCode::CONFLICT, "import_in_progress", "another capture is being imported");
@@ -743,7 +815,7 @@ pub(crate) async fn import(State(state): State<AppState>, request: Request) -> R
             break Some(too_large());
         }
         if let Err(err) = file.write_all(&chunk).await {
-            break Some(internal("écriture de la capture reçue impossible", err));
+            break Some(write_refusal("écriture de la capture reçue impossible", err));
         }
     };
     if let Some(refusal) = refusal {
@@ -762,7 +834,7 @@ pub(crate) async fn import(State(state): State<AppState>, request: Request) -> R
         return refusal;
     }
     if let Err(err) = file.flush().await {
-        return internal("écriture de la capture reçue impossible", err);
+        return write_refusal("écriture de la capture reçue impossible", err);
     }
     drop(file);
 
@@ -833,6 +905,219 @@ pub(crate) async fn open(State(state): State<AppState>, request: Request) -> Res
         Ok(ingested) => ingested.into_response(Some(&request.file)),
         Err(refusal) => refusal,
     }
+}
+
+// -- offline refinement ---------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum RefineRequest {
+    /// Refine the kept capture `capture` (a file name of the captures
+    /// directory).
+    Start {
+        capture: String,
+        /// `rapide`, `standard` (default) or `fin`.
+        #[serde(default)]
+        preset: Option<String>,
+        /// Paint from the photographs what the depth sensor did not
+        /// measure (default), or leave such places as holes.
+        #[serde(default)]
+        beyond_sensor: Option<bool>,
+    },
+    /// Write the capture as a dataset: `colmap` or `nerfstudio`.
+    Export { capture: String, format: String },
+    /// Stop the job in progress.
+    Cancel,
+}
+
+fn refine_refusal(refusal: Refusal) -> Response {
+    match refusal {
+        Refusal::Running(job) => no_store(
+            (StatusCode::CONFLICT, Json(json!({ "error": "another job is running", "code": "job_running", "job": job }))).into_response(),
+        ),
+        Refusal::NoDirectory => {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "no_refined_dir", "the server has no directory for refined results")
+        }
+        Refusal::NotFound => json_error(StatusCode::NOT_FOUND, "not_found", "no such capture"),
+        Refusal::InUse => json_error(StatusCode::CONFLICT, "in_use", "the capture is still being written"),
+        Refusal::Unsupported => {
+            json_error(StatusCode::BAD_REQUEST, "unsupported_mode", "a live capture shows a moving scene and cannot be refined")
+        }
+        Refusal::DiskFull { free } => disk_full(free),
+        Refusal::Disk(err) => {
+            log::error!("la tâche n'a pas pu démarrer : {err}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "disk_error", err.to_string())
+        }
+    }
+}
+
+/// `GET /api/refine`: the offline job in progress and the latest that ended.
+pub(crate) async fn refine_status(State(state): State<AppState>) -> Response {
+    // Names of captures: for the machine's own user.
+    if let Some(refusal) = loopback_only(&state) {
+        return refusal;
+    }
+    no_store(Json(state.core.refiner.state()).into_response())
+}
+
+/// `POST /api/refine`: starts a refinement or a dataset export of a kept
+/// capture, or stops the job in progress.
+pub(crate) async fn refine(State(state): State<AppState>, request: Request) -> Response {
+    if let Some(refusal) =
+        loopback_only(&state).or_else(|| origin_checked(&state, request.headers(), request.uri()))
+    {
+        return refusal;
+    }
+    let request: RefineRequest = match json_body(&state, request).await {
+        Ok(request) => request,
+        Err(refusal) => return refusal,
+    };
+    let (capture, task) = match request {
+        RefineRequest::Cancel => {
+            return match state.core.refiner.cancel() {
+                Some(job) => ok_json(json!({ "job": job })),
+                None => json_error(StatusCode::CONFLICT, "no_job", "no job is running"),
+            };
+        }
+        RefineRequest::Start { capture, preset, beyond_sensor } => {
+            let name = preset.as_deref().unwrap_or("standard");
+            let Some(preset) = gs_refine::job::Preset::from_name(name) else {
+                return json_error(StatusCode::BAD_REQUEST, "bad_request", "preset must be rapide, standard or fin");
+            };
+            (capture, Task::Refine { preset, beyond_sensor: beyond_sensor.unwrap_or(true) })
+        }
+        RefineRequest::Export { capture, format } => {
+            let Some(format) = gs_refine::export::DatasetFormat::from_name(&format) else {
+                return json_error(StatusCode::BAD_REQUEST, "bad_request", "format must be colmap or nerfstudio");
+            };
+            (capture, Task::Export(format))
+        }
+    };
+    // The start reads the header of the capture and asks the disk how much
+    // room it has: off the async threads.
+    let refiner = state.core.refiner.clone();
+    match tokio::task::spawn_blocking(move || refiner.start(&capture, task)).await {
+        Ok(Ok(job)) => ok_json(json!({ "job": job })),
+        Ok(Err(refusal)) => refine_refusal(refusal),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error"),
+    }
+}
+
+/// `GET /api/refined`: the refined results on disk.
+pub(crate) async fn refined(State(state): State<AppState>) -> Response {
+    let store = state.core.store.clone();
+    let Ok(list) = tokio::task::spawn_blocking(move || store.list_refined()).await else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error");
+    };
+    let mut answer = json!({ "results": list });
+    if state.listener == Listener::Loopback {
+        let store = &state.core.store;
+        answer["dir"] = json!(store.dir(Kind::Refined).map(|dir| dir.display().to_string()));
+        answer["datasets_dir"] = json!(store.datasets_dir().map(|dir| dir.display().to_string()));
+    }
+    ok_json(answer)
+}
+
+pub(crate) async fn refined_file(
+    State(state): State<AppState>,
+    UrlPath(file): UrlPath<String>,
+    Query(query): Query<FileQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    stored_file(&state, Kind::Refined, &file, &method, &headers, &query).await
+}
+
+pub(crate) async fn delete_refined(
+    State(state): State<AppState>,
+    UrlPath(file): UrlPath<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    delete_stored(&state, Kind::Refined, file, &headers, &uri).await
+}
+
+/// The key of a refined result in the table of share checksums (a
+/// recording may bear the same name).
+fn refined_sum_key(file: &str) -> String {
+    format!("refined/{file}")
+}
+
+/// `GET /api/share/refined/<name>.zip`: the web build with the refined
+/// result inside, to unpack onto any static web host.
+pub(crate) async fn refined_share_zip(State(state): State<AppState>, UrlPath(file): UrlPath<String>, method: Method) -> Response {
+    let Some(stem) = file.strip_suffix(".zip") else {
+        return json_error(StatusCode::NOT_FOUND, "not_found", "share archives are named <result>.zip");
+    };
+    let result = format!("{stem}{}", store::REFINED_EXT);
+    let core = &state.core;
+    let Some(path) = core.store.existing(Kind::Refined, &result) else {
+        return json_error(StatusCode::NOT_FOUND, "not_found", "no such result");
+    };
+    if !core.assets.has_index() {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "no_frontend", "there is no web build to share");
+    }
+    let head = method == Method::HEAD;
+    let Ok(_permit) = core.zips.clone().try_acquire_owned() else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "busy", "too many archives are being prepared; try again");
+    };
+    let shared = core.clone();
+    let plan = tokio::task::spawn_blocking(move || {
+        let entry = shared.store.refined(&result).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "gone"))?;
+        let sum = if head { (std::fs::metadata(&path)?.len(), 0) } else { recording_sum(&shared, &refined_sum_key(&result), &path)? };
+        Ok::<_, io::Error>(plan_refined_share(shared.assets.collect(MAX_SHARED_ASSETS)?, path, sum, &entry))
+    })
+    .await;
+    match plan {
+        Ok(Ok(plan)) => {
+            let mut response = Response::new(Body::empty());
+            let headers = response.headers_mut();
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from(plan.len));
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            if let Some(value) = files::attachment_header(&file) {
+                headers.insert(header::CONTENT_DISPOSITION, value);
+            }
+            if !head {
+                *response.body_mut() = plan_body(plan, core.settings.send_timeout);
+            }
+            response
+        }
+        Ok(Err(err)) if err.kind() == io::ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "not_found", "no such result"),
+        Ok(Err(err)) => internal("préparation de l'archive de partage impossible", err),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error"),
+    }
+}
+
+/// Writes a laid-out archive to `destination` (blocking).
+fn write_plan(plan: &ZipPlan, destination: &Path) -> io::Result<u64> {
+    let mut out = io::BufWriter::new(std::fs::File::create(destination)?);
+    for part in &plan.parts {
+        match part {
+            Part::Bytes(bytes) => io::Write::write_all(&mut out, bytes)?,
+            Part::File { path, len } => {
+                let copied = io::copy(&mut std::fs::File::open(path)?.take(*len), &mut out)?;
+                if copied != *len {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the shared file became shorter"));
+                }
+            }
+        }
+    }
+    io::Write::flush(&mut out)?;
+    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    Ok(plan.len)
+}
+
+/// Writes the share archive of the refined result `name` to `destination`
+/// (blocking). The same bytes as `GET /api/share/refined/<name>.zip`.
+pub(crate) fn export_refined_share(core: &crate::Core, name: &str, destination: &Path) -> io::Result<u64> {
+    let result = format!("{name}{}", store::REFINED_EXT);
+    let missing = || io::Error::new(io::ErrorKind::NotFound, "no such result");
+    let path = core.store.existing(Kind::Refined, &result).ok_or_else(missing)?;
+    let entry = core.store.refined(&result).ok_or_else(missing)?;
+    let sum = recording_sum(core, &refined_sum_key(&result), &path)?;
+    write_plan(&plan_refined_share(core.assets.collect(MAX_SHARED_ASSETS)?, path, sum, &entry), destination)
 }
 
 #[cfg(test)]

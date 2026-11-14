@@ -7,6 +7,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use super::{with_core, Core};
+use crate::dom;
 use crate::logic::capture::{self, UploadAnswer, MAX_CAPTURE_BYTES};
 use crate::logic::qr;
 use crate::logic::source::{ServerInfo, SourceKind};
@@ -128,6 +129,16 @@ impl Core {
                 let Some(url) = self.server_url("/api/captures") else { return };
                 self.ui.import.set(Some(ImportView { file: name, upload: true, progress }));
                 spawn_local(async move {
+                    // The server refuses what is not a capture after its
+                    // first bytes too, but its answer to a large upload may
+                    // reach the page as a broken connection: the eight
+                    // bytes are checked here, and the message is plain.
+                    let magic = gs_core::ingest::file::FILE_MAGIC;
+                    if dom::read_head(&file, magic.len() as u32).await.is_ok_and(|head| head.as_slice() != magic.as_slice()) {
+                        let refused = net::Answer { status: 400, body: r#"{"ok":false,"code":"bad_file_magic"}"#.to_string() };
+                        with_core(|core| core.on_upload_answer(size, Ok(refused)));
+                        return;
+                    }
                     let answer = net::send("POST", &url, Body::File(&file), UPLOAD_TIMEOUT_MS).await;
                     with_core(|core| core.on_upload_answer(size, answer));
                 });
@@ -148,7 +159,7 @@ impl Core {
         }
     }
 
-    fn on_upload_answer(&self, size: u64, answer: Result<net::Answer, String>) {
+    pub(super) fn on_upload_answer(&self, size: u64, answer: Result<net::Answer, String>) {
         let mut progress = CaptureProgress { total: size, bytes: size, done: true, ..CaptureProgress::default() };
         let outcome = match answer {
             Ok(answer) => {
@@ -177,6 +188,9 @@ impl Core {
             Ok(text) => self.notify(false, text),
             Err(text) => self.notify(true, text),
         }
+        // The server keeps what it imported, and saved it as a recording.
+        self.refresh_captures();
+        self.refresh_takes();
     }
 
     /// Stops a local import; what was fused stays on screen.

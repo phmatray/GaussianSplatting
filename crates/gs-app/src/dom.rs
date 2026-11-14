@@ -185,3 +185,11 @@ pub fn store(key: &str, value: &str) {
         let _ = storage.set_item(key, value);
     }
 }
+
+/// The first `count` bytes of a file (fewer when it is shorter), without
+/// reading the rest.
+pub async fn read_head(blob: &Blob, count: u32) -> Result<Vec<u8>, String> {
+    let head = blob.slice_with_i32_and_i32(0, count.min(i32::MAX as u32) as i32).map_err(describe)?;
+    let buffer = wasm_bindgen_futures::JsFuture::from(head.array_buffer()).await.map_err(describe)?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}

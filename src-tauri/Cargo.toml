@@ -4,6 +4,7 @@ description = "Splat Live desktop application: Tauri 2 shell around gs-server an
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish = false
 
 [build-dependencies]

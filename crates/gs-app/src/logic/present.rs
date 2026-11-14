@@ -79,6 +79,11 @@ pub fn session_nav(state: &SessionState) -> NavMode {
     }
 }
 
+/// Whether a capture of this mode is a room, looked at from above.
+pub fn capture_room(mode: &gs_core::protocol::CaptureMode) -> bool {
+    *mode == gs_core::protocol::CaptureMode::Room
+}
+
 /// Center of the scene on the floor.
 pub fn floor_center(bounds: &Aabb) -> Vec3 {
     let center = bounds.center();
@@ -244,6 +249,36 @@ pub fn frame_view(bounds: &Aabb, fov_y: f32, aspect: f32) -> (Vec3, Vec3) {
     let distance = fit_distance(radius, fov_y, aspect) * 1.05;
     let direction = Vec3::new(0.55, 0.42, 1.0).normalize();
     (target + direction * distance, target)
+}
+
+/// Camera a capture of the phone is first looked at from: outside what was
+/// filmed, whatever the phone's last position was (inside a room, a step
+/// from a wall). A room is seen from high up, a plan with some depth, since
+/// the viewer draws its walls and ceiling from their inner side only; an
+/// object or a person from the usual three-quarter view.
+/// Returns `(eye, target)`.
+pub fn capture_view(bounds: &Aabb, room: bool, fov_y: f32, aspect: f32) -> (Vec3, Vec3) {
+    if !room {
+        return frame_view(bounds, fov_y, aspect);
+    }
+    let target = bounds.center();
+    let radius = (bounds.size() * 0.5).length().max(0.05);
+    let distance = fit_distance(radius, fov_y, aspect) * 1.05;
+    // About 55 degrees above the horizon.
+    let direction = Vec3::new(0.3, 1.0, 0.63).normalize();
+    (target + direction * distance, target)
+}
+
+/// Camera for a walk through an imported room (a refined capture): in the
+/// middle of its floor plan at eye height, looking along its longer side
+/// and a little down. A refinement gains most near the phone's path, which
+/// is inside. Returns `(eye, target)`.
+pub fn inside_view(bounds: &Aabb) -> (Vec3, Vec3) {
+    let (center, size) = (bounds.center(), bounds.size());
+    // Eye height above the lowest splats, or lower in a low scene.
+    let eye = Vec3::new(center.x, bounds.min.y + (0.6 * size.y).min(1.5), center.z);
+    let along = if size.x >= size.z { Vec3::X } else { Vec3::NEG_Z };
+    (eye, eye + along * 2.0 - Vec3::Y * 0.25)
 }
 
 /// The view of a rig camera: its position, looking along its axis.
@@ -519,6 +554,44 @@ mod tests {
         // A degenerate box still gives a usable camera.
         let (eye, target) = frame_view(&Aabb::new(Vec3::ONE, Vec3::ONE), 0.9, 1.5);
         assert!(eye.is_finite() && (eye - target).length() > 0.05);
+    }
+
+    #[test]
+    fn a_capture_is_first_seen_from_outside() {
+        use gs_core::protocol::CaptureMode;
+        // A room the phone finished in, a step from a wall.
+        let bounds = Aabb::new(Vec3::new(-2.0, 0.0, -1.5), Vec3::new(2.0, 2.5, 3.5));
+        for aspect in [2.0, 1.0, 0.5] {
+            let fov_y = 50f32.to_radians();
+            let (eye, target) = capture_view(&bounds, true, fov_y, aspect);
+            assert_eq!(target, bounds.center());
+            // Above the ceiling and outside the walls, looking down.
+            assert!(eye.y > bounds.max.y + 1.0, "eye {eye}");
+            assert!(!(eye.x > bounds.min.x && eye.x < bounds.max.x && eye.z > bounds.min.z && eye.z < bounds.max.z && eye.y < bounds.max.y));
+            assert!((target - eye).normalize().y < -0.7);
+            for corner in corners(&bounds) {
+                let p = ndc(eye, target, fov_y, aspect, corner).expect("in front");
+                assert!(p.x.abs() <= 1.0 && p.y.abs() <= 1.0, "aspect {aspect}: {corner} at {p}");
+            }
+            // An object is framed like an imported file.
+            assert_eq!(capture_view(&bounds, false, fov_y, aspect), frame_view(&bounds, fov_y, aspect));
+        }
+        assert!(capture_room(&CaptureMode::Room) && !capture_room(&CaptureMode::Object) && !capture_room(&CaptureMode::Person) && !capture_room(&CaptureMode::Live));
+    }
+
+    #[test]
+    fn an_imported_room_is_walked_through_from_its_middle() {
+        let bounds = Aabb::new(Vec3::new(-2.0, 0.0, -1.5), Vec3::new(2.0, 2.5, 3.5));
+        let (eye, target) = inside_view(&bounds);
+        assert_eq!(eye, Vec3::new(0.0, 1.5, 1.0));
+        // Along the longer side (z here), a little down.
+        let look = (target - eye).normalize();
+        assert!(look.z < -0.9 && look.y < 0.0 && look.y > -0.3, "{look}");
+        let wide = Aabb::new(Vec3::new(-4.0, 0.2, -1.0), Vec3::new(4.0, 1.2, 1.0));
+        let (eye, target) = inside_view(&wide);
+        assert!((eye.y - 0.8).abs() < 1e-6 && (target - eye).normalize().x > 0.9);
+        let (eye, target) = inside_view(&Aabb::new(Vec3::ONE, Vec3::ONE));
+        assert!(eye.is_finite() && (target - eye).length() > 1.0);
     }
 
     #[test]

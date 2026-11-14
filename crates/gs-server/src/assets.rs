@@ -30,7 +30,7 @@ static EMBEDDED: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/embedded
 
 const INDEX: &str = "index.html";
 /// First path segments that never name a file or a route of the web build.
-const RESERVED: [&str; 3] = ["api", "recordings", "captures"];
+const RESERVED: [&str; 4] = ["api", "recordings", "captures", "refined"];
 /// The file a share archive carries next to `index.html`. The viewer asks
 /// for it at every start to learn whether it is such an archive.
 const SHARE_MANIFEST: &str = "share.json";

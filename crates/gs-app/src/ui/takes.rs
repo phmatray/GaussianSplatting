@@ -10,10 +10,12 @@ use super::widgets::Section;
 use crate::core::with_core;
 use crate::dom;
 use crate::logic::replay;
+use crate::logic::refine::lan_refined_link;
 use crate::logic::share::{iframe_snippet, lan_share_link};
 use crate::logic::source::{Link, SourceKind};
 use crate::logic::qr;
-use crate::state::{use_ui, Take, TakePlace, Ui};
+use crate::state::{use_ui, Shared, Take, TakePlace, Ui};
+use crate::tauri;
 
 /// How long the bin of a recording stays armed after the first click.
 const DELETE_CONFIRM: std::time::Duration = std::time::Duration::from_secs(4);
@@ -214,7 +216,7 @@ pub fn RecordSection() -> impl IntoView {
 
 /// A read-only text with a button that copies it.
 #[component]
-fn CopyField(id: &'static str, label: &'static str, #[prop(into)] text: Signal<String>, #[prop(optional)] multiline: bool) -> impl IntoView {
+pub(super) fn CopyField(id: &'static str, label: &'static str, #[prop(into)] text: Signal<String>, #[prop(optional)] multiline: bool) -> impl IntoView {
     let copied = RwSignal::new(false);
     let copy = move |_| {
         let text = text.get_untracked();
@@ -255,9 +257,9 @@ fn CopyField(id: &'static str, label: &'static str, #[prop(into)] text: Signal<S
     }
 }
 
-/// The share dialog of a recording of the server: the link on the local
-/// network with its QR code, the `<iframe>` snippet, the archive for a web
-/// host.
+/// The share dialog of a recording or of a refined result of the server:
+/// the link on the local network with its QR code, the `<iframe>` snippet,
+/// the archive for a web host.
 #[component]
 pub fn ShareDialog() -> impl IntoView {
     let ui = use_ui();
@@ -265,12 +267,38 @@ pub fn ShareDialog() -> impl IntoView {
     let lan = move || ui.server.with(|s| s.as_ref().map(|s| s.lan.clone()).unwrap_or_default());
     let lan_on = move || lan().enabled && !lan().urls.is_empty();
     let link = Signal::derive(move || match (take(), lan().urls.first()) {
-        (Some(take), Some(base)) => lan_share_link(base, &take.file),
+        (Some(Shared::Take(take)), Some(base)) => lan_share_link(base, &take.file),
+        (Some(Shared::Refined(result)), Some(base)) => lan_refined_link(base, &result),
         _ => String::new(),
     });
     let snippet = Signal::derive(move || iframe_snippet(&link.get()));
     let code = move || qr::data_url(&link.get());
-    let zip = move || take().and_then(|take| with_core_value(|core| core.share_zip_url(&take)));
+    let zip = move || {
+        take().and_then(|shared| {
+            with_core_value(|core| match &shared {
+                Shared::Take(take) => core.share_zip_url(take),
+                Shared::Refined(result) => core.refined_zip_url(result),
+            })
+        })
+    };
+    // File name of the archive, without `.zip`.
+    let zip_stem = move || {
+        take().map(|shared| match &shared {
+            Shared::Take(take) => take.file.trim_end_matches(".gsrec").to_string(),
+            Shared::Refined(result) => result.stem().to_string(),
+        })
+    };
+    // In the desktop shell a link cannot download: the shell writes the
+    // archive into the download folder.
+    let export_zip = move |ev: leptos::ev::MouseEvent| {
+        if !tauri::is_tauri() {
+            return;
+        }
+        ev.prevent_default();
+        let (Some(stem), Some(shared)) = (zip_stem(), take()) else { return };
+        let kind = if matches!(shared, Shared::Refined(_)) { "refined_share" } else { "share" };
+        with_core(|core| core.desktop_export(stem, kind));
+    };
     let close = move || ui.share.set(None);
     // The dialog takes the keyboard while it is open.
     Effect::new(move |_| {
@@ -293,15 +321,18 @@ pub fn ShareDialog() -> impl IntoView {
             }>
                 <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="share-title">
                     <header class="modal-head">
-                        <h2 id="share-title">{move || take().map(|t| format!("Partager «\u{a0}{}\u{a0}»", t.title))}</h2>
+                        <h2 id="share-title">{move || take().map(|t| format!("Partager «\u{a0}{}\u{a0}»", t.title()))}</h2>
                         <button type="button" id="share-close" class="icon-btn" title="Fermer" aria-label="Fermer" on:click=move |_| close()>
                             <Icon name="close" />
                         </button>
                     </header>
                     <p class="hint">
-                        {move || take().map(|t| {
-                            let length = replay::length_label(t.duration_s);
-                            format!("{length}, {}. La visionneuse s'ouvre dans tout navigateur récent, casque compris.", replay::size(t.bytes))
+                        {move || take().map(|shared| {
+                            let what = match &shared {
+                                Shared::Take(take) => format!("{}, {}", replay::length_label(take.duration_s), replay::size(take.bytes)),
+                                Shared::Refined(result) => format!("Capture affinée, {}", replay::size(result.size)),
+                            };
+                            format!("{what}. La visionneuse s'ouvre dans tout navigateur récent, casque compris.")
                         })}
                     </p>
                     <Show
@@ -334,12 +365,12 @@ pub fn ShareDialog() -> impl IntoView {
                     </Show>
                     <div class="field">
                         <span class="field-label">"Publier sur un site web"</span>
-                        <a id="share-zip" class="btn wide" href=move || zip().unwrap_or_default() download=move || take().map(|t| format!("{}.zip", t.file.trim_end_matches(".gsrec")))>
+                        <a id="share-zip" class="btn wide" href=move || zip().unwrap_or_default() download=move || zip_stem().map(|stem| format!("{stem}.zip")) on:click=export_zip>
                             <Icon name="download" />
                             "Télécharger l'archive web (.zip)"
                         </a>
                         <p class="hint">
-                            "L'archive contient la visionneuse et l'enregistrement. Décompressée sur n'importe quel hébergement web statique, elle s'ouvre directement sur lui."
+                            "L'archive contient la visionneuse et le fichier partagé. Décompressée sur n'importe quel hébergement web statique, elle s'ouvre directement sur lui."
                         </p>
                     </div>
 

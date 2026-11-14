@@ -4,6 +4,7 @@ description = "WebGL2 Gaussian splat viewer: renderer, gizmos, orbit/fly navigat
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 gs-core.workspace = true

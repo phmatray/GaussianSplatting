@@ -1804,3 +1804,28 @@ a.btn {
     transition: none !important;
   }
 }
+
+/* Captures and their offline refinement ---------------------------------- */
+
+.icon-btn[hidden] {
+  display: none;
+}
+
+/* The form of a capture opens under its row. */
+.refine-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+#refine-job,
+#refine-last {
+  margin-bottom: 4px;
+}
+
+#refine-job .capture-name {
+  margin: 0;
+}

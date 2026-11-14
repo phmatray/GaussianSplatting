@@ -9,6 +9,7 @@ use gs_render::{BlendStatus, NavMode, ViewerStats};
 use gs_worker::{CaptureProgress, ReplayStatus};
 use leptos::prelude::*;
 
+use crate::logic::refine::{Job, JobEnd, KeptCapture, Refined, Storage};
 use crate::logic::render::BlendChoice;
 use crate::logic::source::{Link, ServerInfo, SourceKind};
 
@@ -108,6 +109,32 @@ pub struct Take {
     pub bytes: u64,
     pub duration_s: f64,
     pub scene: String,
+}
+
+/// What the share dialog is open on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Shared {
+    /// A recording of the server.
+    Take(Take),
+    /// A refined result of the server: a still scene.
+    Refined(Refined),
+}
+
+impl Shared {
+    /// File name of what is shared.
+    pub fn file(&self) -> &str {
+        match self {
+            Self::Take(take) => &take.file,
+            Self::Refined(result) => &result.file,
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Take(take) => &take.title,
+            Self::Refined(result) => &result.title,
+        }
+    }
 }
 
 /// A recording in progress.
@@ -220,8 +247,24 @@ pub struct Ui {
     /// A start or stop of the recorder is under way.
     pub record_busy: RwSignal<bool>,
     pub takes: RwSignal<Vec<Take>>,
-    /// The recording whose share dialog is open.
-    pub share: RwSignal<Option<Take>>,
+    /// The recording or refined result whose share dialog is open.
+    pub share: RwSignal<Option<Shared>>,
+    /// Raw captures the native server keeps (loopback side only).
+    pub captures: RwSignal<Vec<KeptCapture>>,
+    /// Refined results the native server keeps.
+    pub refined: RwSignal<Vec<Refined>>,
+    /// The offline job running on the server.
+    pub job: RwSignal<Option<Job>>,
+    /// The latest job that ended, until it is dismissed.
+    pub job_end: RwSignal<Option<JobEnd>>,
+    /// A start or stop of a job is under way.
+    pub refine_busy: RwSignal<bool>,
+    /// File name of the capture whose refinement form is open.
+    pub refining: RwSignal<Option<String>>,
+    /// File name of the refined result being downloaded for display.
+    pub refined_loading: RwSignal<Option<String>>,
+    /// State of the server's disk, when it tells.
+    pub storage: RwSignal<Option<Storage>>,
     pub capture: RwSignal<Option<CaptureView>>,
     pub import: RwSignal<Option<ImportView>>,
     pub pair: RwSignal<PairView>,
@@ -268,6 +311,14 @@ impl Ui {
             record_busy: RwSignal::new(false),
             takes: RwSignal::new(Vec::new()),
             share: RwSignal::new(None),
+            captures: RwSignal::new(Vec::new()),
+            refined: RwSignal::new(Vec::new()),
+            job: RwSignal::new(None),
+            job_end: RwSignal::new(None),
+            refine_busy: RwSignal::new(false),
+            refining: RwSignal::new(None),
+            refined_loading: RwSignal::new(None),
+            storage: RwSignal::new(None),
             capture: RwSignal::new(None),
             import: RwSignal::new(None),
             pair: RwSignal::new(PairView::default()),

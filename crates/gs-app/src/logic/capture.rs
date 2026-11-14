@@ -132,6 +132,9 @@ pub fn upload_error_text(status: u16, code: &str) -> String {
         (_, "busy") => "Un téléphone est en train de capturer\u{a0}: l'import attendra la fin de sa capture.".to_string(),
         (_, "import_in_progress") => "Un autre import est déjà en cours sur le serveur.".to_string(),
         (413, _) | (_, "too_large") => "La capture est trop volumineuse pour ce serveur.".to_string(),
+        (507, _) | (_, "disk_full") => "Il n'y a pas assez de place sur le disque de l'ordinateur pour cette capture.".to_string(),
+        (_, "not_found") => "Cette capture n'existe plus sur le serveur.".to_string(),
+        (_, "in_use") => "Cette capture est encore en cours d'enregistrement.".to_string(),
         (408, _) | (_, "timeout") => "L'envoi de la capture a pris trop de temps.".to_string(),
         (401 | 403, _) => "Le serveur a refusé l'import depuis cet appareil.".to_string(),
         (400, "") => "Le serveur a refusé ce fichier\u{a0}: ce n'est pas une capture valide.".to_string(),
@@ -199,6 +202,8 @@ mod tests {
         assert!(upload_error_text(409, "busy").contains("téléphone"));
         assert!(upload_error_text(409, "import_in_progress").contains("import"));
         assert!(upload_error_text(413, "").contains("volumineuse"));
+        assert!(upload_error_text(507, "disk_full").contains("place sur le disque"));
+        assert!(upload_error_text(404, "not_found").contains("n'existe plus"));
         assert!(upload_error_text(500, "internal").contains("500"));
         assert!(upload_error_text(400, "").contains("capture valide"));
     }

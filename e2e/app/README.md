@@ -29,6 +29,7 @@ vient de `e2e/render` (`npm install` dans ce dossier, ou `GS_NPM_TOOLS`).
 | `subpath` | Hébergement statique sous un sous-dossier, `?source=`, navigateur sans WebGL2 |
 | `server` | Avec `gs-server` : WebSocket, configuration partagée entre deux clients, partage sur le réseau local, origine Tauri simulée, reconnexion. Ignorée si le binaire n'existe pas (`cargo build -p gs-server --release`) |
 | `studio` | Avec `gs-server` : enregistrement piloté par le bouton, liste, relecture, téléchargement, suppression ; boîte de partage (lien du réseau local, QR code, `<iframe>`, archive décompressée et servie telle quelle) ; lien ouvert depuis un autre appareil ; client du réseau local qui enregistre en mémoire ; appairage d'un iPhone et capture suivie pendant que `tools/fake_phone.py` en joue une ; fichier `.gscap` envoyé au serveur ; scan terminé enregistré |
+| `refine` | Avec `gs-server` (`--refine-iterations 150`) : « Affiner cette capture » de bout en bout sur une chambre filmée par le téléphone simulé de gs-core. Un fichier qui n'est pas une capture est refusé sans envoi ; la capture envoyée est conservée et listée ; une pièce terminée s'ouvre vue de haut, sans bouton pause ; le formulaire dit ce que l'affinage apporte et coûte ; un calcul est suivi puis annulé (rien n'est gardé), un autre mené à son terme ; le résultat s'affiche (fichier importé, mélange trié, de l'intérieur), se télécharge, se partage (lien du réseau local ouvert dans un autre contexte, archive), se supprime ; export COLMAP ; capture rouverte depuis la liste ; client du réseau local ; sans serveur, une phrase dit pourquoi la fonction est absente. Images `refine-*.png` |
 | `shared` | Avec `gs-server`, plusieurs clients : une page lente ou figée ne prend pas de retard sur le pipeline (relais du WebSocket par le worker), les commandes suivent l'état renvoyé par le pipeline quel que soit le client qui les change, arrivée en cours de scan, remplacement du serveur pendant un scan, repli sur un WebSocket ouvert par la page quand le worker relais ne démarre pas |
 | `lanvr` | Avec `gs-server --lan` : l'accès https du réseau local avec un Quest 3 émulé, entrée en VR, deux yeux, déplacement, maquette, sortie, maison en VR ; ordinateur doté de son propre casque |
 | `webkit` | Le même build dans WebKitGTK (MiniBrowser sous Xvfb), le moteur de l'application de bureau sous Linux : mode serveur par le relais, mode worker sur la scène et dans la maison. Ignorée si MiniBrowser, `xvfb-run` ou `import` manquent |
@@ -51,7 +52,7 @@ Variables d'environnement:
 | `ONLY=stage,vr` | Ne lance que ces suites |
 | `GS_APP_OUT=dossier` | Captures d'écran et `results.json` (par défaut `out/app-e2e`) |
 | `GS_APP_PORT=8110` | Premier port essayé par le serveur statique |
-| `GS_SERVER_BIN=chemin` | Binaire `gs-server` des suites `server`, `shared`, `lanvr` et `soak` (par défaut `target/release/gs-server`) |
+| `GS_SERVER_BIN=chemin` | Binaire `gs-server` des suites `server`, `studio`, `refine`, `shared`, `lanvr` et `soak` (par défaut `target/release/gs-server`) |
 | `SOAK_S=180` | Durée de la suite `soak`, en secondes |
 | `LONG_REPLAY=0` | Saute l'enregistrement d'une minute de la suite `replay` (120 Mo sur le disque) |
 | `GS_APP_SHOTS=dossier` | Où la suite `shots` écrit ses images |

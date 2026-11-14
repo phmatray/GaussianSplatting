@@ -147,6 +147,7 @@ impl FileRecording {
             Ok(_) => None,
             Err(WriteError::Sink(err)) => {
                 log::error!("écriture de l'enregistrement {} impossible : {err}", self.hold.file());
+                self.hold.report_problem("recording_not_saved", err);
                 Some(EndReason::DiskError)
             }
             Err(WriteError::Record(err)) => {

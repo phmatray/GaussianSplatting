@@ -4,6 +4,7 @@ description = "Trunk test page for gs-render: GPU vs CPU comparison, live layer,
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]

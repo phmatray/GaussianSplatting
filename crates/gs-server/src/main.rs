@@ -4,7 +4,8 @@
 //! gs-server [--port N] [--lan] [--lan-port N] [--dist DIR]
 //!           [--scene stage|house] [--light] [--cert-dir DIR]
 //!           [--recordings-dir DIR] [--captures-dir DIR] [--no-capture-files]
-//!           [--verbose]
+//!           [--refined-dir DIR] [--datasets-dir DIR] [--refine-threads N]
+//!           [--refine-iterations N] [--verbose]
 //! ```
 //!
 //! Prints the URLs to open and, with `--lan`, the QR code and the
@@ -42,6 +43,15 @@ Options :
   --captures-dir DIR dossier des captures brutes reçues d'un iPhone (.gscap)
                      (défaut : « captures » à côté des enregistrements)
   --no-capture-files ne conserve pas les captures brutes sur le disque
+  --refined-dir DIR  dossier des captures affinées (.ply)
+                     (défaut : « refined » à côté des enregistrements)
+  --datasets-dir DIR dossier des jeux de données exportés (COLMAP, nerfstudio)
+                     (défaut : « datasets » à côté des enregistrements)
+  --refine-threads N fils d'exécution d'un affinage (défaut : tous les
+                     processeurs sauf un, qui reste au direct)
+  --refine-iterations N
+                     impose le nombre d'itérations de chaque affinage, quel
+                     que soit le préréglage (essais et démonstrations)
   --verbose          journal détaillé (diagnostics en anglais)
   -h, --help         affiche cette aide
   -V, --version      affiche la version
@@ -61,6 +71,10 @@ struct Args {
     recordings_dir: Option<PathBuf>,
     captures_dir: Option<PathBuf>,
     keep_captures: bool,
+    refined_dir: Option<PathBuf>,
+    datasets_dir: Option<PathBuf>,
+    refine_threads: usize,
+    refine_iterations: Option<u32>,
     verbose: bool,
 }
 
@@ -82,6 +96,10 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> 
         recordings_dir: None,
         captures_dir: None,
         keep_captures: true,
+        refined_dir: None,
+        datasets_dir: None,
+        refine_threads: 0,
+        refine_iterations: None,
         verbose: false,
     };
     while let Some(arg) = argv.next() {
@@ -102,6 +120,20 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Parsed, String> 
             "--recordings-dir" => args.recordings_dir = Some(PathBuf::from(value("un dossier")?)),
             "--captures-dir" => args.captures_dir = Some(PathBuf::from(value("un dossier")?)),
             "--no-capture-files" => args.keep_captures = false,
+            "--refined-dir" => args.refined_dir = Some(PathBuf::from(value("un dossier")?)),
+            "--datasets-dir" => args.datasets_dir = Some(PathBuf::from(value("un dossier")?)),
+            "--refine-threads" => {
+                let text = value("un nombre de fils d'exécution")?;
+                args.refine_threads = text.parse().map_err(|_| format!("nombre de fils d'exécution invalide : {text}"))?;
+            }
+            "--refine-iterations" => {
+                let text = value("un nombre d'itérations")?;
+                let count: u32 = text.parse().map_err(|_| format!("nombre d'itérations invalide : {text}"))?;
+                if count == 0 {
+                    return Err("--refine-iterations attend au moins 1".to_string());
+                }
+                args.refine_iterations = Some(count);
+            }
             "--scene" => {
                 args.scene = match value("stage ou house")?.as_str() {
                     "stage" => SceneKind::Stage,
@@ -199,6 +231,9 @@ fn print_banner(server: &ServerHandle, args: &Args, dist: Option<&PathBuf>) {
         Some(dir) => println!("  Captures brutes  : {}", dir.display()),
         None => println!("  Captures brutes  : non conservées"),
     }
+    if let Some(dir) = server.refined_dir() {
+        println!("  Captures affinées: {}", dir.display());
+    }
     println!();
     println!("Ctrl-C pour arrêter.");
 }
@@ -245,6 +280,10 @@ async fn run(args: Args) -> Result<(), gs_server::Error> {
         recordings_dir: args.recordings_dir.clone().or_else(|| default_data_dir().map(|dir| dir.join("recordings"))),
         captures_dir: args.captures_dir.clone(),
         keep_captures: args.keep_captures,
+        refined_dir: args.refined_dir.clone(),
+        datasets_dir: args.datasets_dir.clone(),
+        refine_threads: args.refine_threads,
+        refine_iterations: args.refine_iterations,
         ..ServerConfig::default()
     };
     let server = gs_server::start(config).await?;
