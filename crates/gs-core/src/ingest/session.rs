@@ -268,7 +268,7 @@ impl CaptureSession {
         }
         let mut live = Self::new(&Hello { mode: CaptureMode::Live, ..hello.clone() }, self.params);
         live.fusion = self.fusion;
-        live.floor = Floor { guessed: None, ..self.floor };
+        live.floor = self.floor;
         live.sent_floor = live.floor.y();
         live.bounds = Aabb::from_points(live.fusion.splats().iter().map(Splat::position));
         live.seq = self.seq;

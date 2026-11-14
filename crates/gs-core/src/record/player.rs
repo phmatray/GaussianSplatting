@@ -93,7 +93,7 @@ pub struct Update {
 pub struct PlayerStats {
     /// Bytes of the file held in memory.
     pub cached_bytes: u64,
-    /// Records known (their positions, 32 bytes each).
+    /// Records known (their positions, 24 bytes each).
     pub records: u64,
     /// Keyframes known.
     pub keyframes: u64,
@@ -661,7 +661,7 @@ impl Player {
     /// bytes, from the play head on.
     pub fn buffered_until(&self) -> f64 {
         let offset = self.cursor.map_or(self.first_record, |c| c.offset);
-        let loaded = self.spans.iter().find(|s| s.reaches(offset)).and_then(|s| s.recs.last()).map(|r| r.time);
+        let loaded = self.span_for(offset).and_then(|s| s.recs.last()).map(|r| r.time);
         loaded.unwrap_or(0.0).max(self.cursor.map_or(0.0, |c| c.time))
     }
 
@@ -696,9 +696,12 @@ impl Player {
             self.head += dt * self.speed;
         }
         let mut stopping = false;
+        // Where a head that has to wait for data waits.
+        let mut hold = before;
         if let Some(end) = self.end_time.filter(|end| self.head >= *end) {
             if clock.is_some() && self.looping && end > 0.0 {
                 self.head %= end;
+                hold = self.head;
             } else {
                 self.head = end;
                 stopping = clock.is_some();
@@ -713,9 +716,10 @@ impl Player {
         }
         if self.starved && clock.is_some() {
             // Wait for the data: the head goes no further than what the
-            // viewer shows (or than where a seek put it).
-            let shown = self.cursor.map_or(0.0, |c| c.time);
-            self.head = self.head.min(before.max(shown));
+            // viewer shows, or stays where a seek (or the start of a new
+            // loop) put it until the keyframe for that place is there.
+            let shown = self.cursor.filter(|c| c.time <= self.head && !self.wants_resync(self.head)).map(|c| c.time);
+            self.head = shown.map_or(hold, |shown| self.head.min(hold.max(shown)));
         }
         let messages = self.materialize(batch);
         Update { messages, reset, buffering: self.starved, ended, time: self.head }
@@ -751,6 +755,13 @@ impl Player {
         Some((si, ri))
     }
 
+    /// The span that holds the byte at `offset`, or else the open span that
+    /// ends right before it (the one to extend).
+    fn span_for(&self, offset: u64) -> Option<&Span> {
+        let holding = self.spans.iter().find(|s| offset >= s.base && offset < s.end());
+        holding.or_else(|| self.spans.iter().find(|s| s.end() == offset && !s.closed))
+    }
+
     /// The offset lies inside parsed records (so if no record starts
     /// there, none ever will).
     fn inside_scanned(&self, offset: u64) -> bool {
@@ -763,11 +774,18 @@ impl Player {
         if target < cursor.time {
             return true;
         }
+        // The bytes behind the cursor are gone (dropped from the cache
+        // while the head was elsewhere, or cut off by damage found since):
+        // nothing can be read on from there, and it is no place a request
+        // may start at.
+        if self.records_end != Some(cursor.offset) && self.span_for(cursor.offset).is_none() {
+            return true;
+        }
         match self.key_at(target) {
             // A keyframe further on that is not after the target: take it
             // when the way there is long or has not been loaded.
             Some(key) if key.offset > cursor.offset => {
-                let loaded = self.spans.iter().any(|s| s.reaches(cursor.offset) && key.offset < s.scanned_end());
+                let loaded = self.span_for(cursor.offset).is_some_and(|s| key.offset < s.scanned_end());
                 target - cursor.time > self.options.jump_s || !loaded
             }
             _ => false,
@@ -1039,7 +1057,7 @@ impl Player {
         let limit = self.records_end.unwrap_or(total);
         let anchor = self.anchor();
         let block = self.options.fetch_block.max(1);
-        let start = match self.spans.iter().find(|s| s.reaches(anchor)) {
+        let start = match self.span_for(anchor) {
             None => anchor,
             Some(span) => {
                 if span.closed {
@@ -1204,6 +1222,9 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // What `PlayerStats::records` promises per record.
+    const _: () = assert!(std::mem::size_of::<Rec>() == 24);
     use crate::codec::{encode, encode_layer, Body as WireBody, LayerMode, Message};
     use crate::Splat;
 

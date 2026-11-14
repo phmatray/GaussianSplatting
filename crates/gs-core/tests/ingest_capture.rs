@@ -762,14 +762,16 @@ fn a_filmed_bedroom_is_reconstructed_like_the_simulated_scan() {
     let sim = PhoneSim { color_width: 384, color_height: 288, ..PhoneSim::default() };
     let (session, phone, exposures) = film_bedroom(sim, IngestParams::default(), 220, true);
     let (psnr, ssim, coverage, splats) = score_room(&session, &phone, &exposures, "bedroom", "ideal phone");
-    // Measured: 196 303 splats of 2 cm; where the phone has looked, PSNR
-    // 24.48 dB, SSIM 0.842, coverage 99.29 %. The simulated scan head with
-    // its exact, co-registered colour scores 23.97 dB and 99.96 % over the
-    // whole house with cells of 2.4 cm (`novel_view.rs`): the phone's finer
-    // cells make up for its coarser, averaged depth. What it has not looked
-    // at (the floor under the person, 3 to 12 % of these views) is missing.
-    assert!(psnr >= 24.0 && ssim >= 0.83 && coverage >= 0.99, "PSNR {psnr:.2} dB, SSIM {ssim:.3}, coverage {coverage:.4}");
-    assert!((150_000..250_000).contains(&splats), "{splats} splats");
+    // Measured: 141 898 splats of 2.4 cm; where the phone has looked, PSNR
+    // 25.79 dB, SSIM 0.833, coverage 99.79 %. The simulated scan head (five
+    // exact sensors with co-registered colour, the same cells) scores
+    // 25.50 dB, SSIM 0.868 and 99.83 % on these four views
+    // (`the_simulated_scan_scores_on_the_same_views`): the phone's finer
+    // depth map makes up for its averaged depth and its JPEG. Its SSIM is
+    // lower because it counts the whole picture, and 3 to 12 % of these
+    // views the phone never looked at (the floor under the person).
+    assert!(psnr >= 25.3 && ssim >= 0.82 && coverage >= 0.995, "PSNR {psnr:.2} dB, SSIM {ssim:.3}, coverage {coverage:.4}");
+    assert!((120_000..170_000).contains(&splats), "{splats} splats");
 
     // A realistic one: noise, jitter, drift, wandering exposure, and no
     // floor message.
@@ -780,10 +782,42 @@ fn a_filmed_bedroom_is_reconstructed_like_the_simulated_scan() {
     let ceiling = session.state().ceiling_height.unwrap();
     assert!((ceiling - house::CEILING_HEIGHT).abs() < 0.04, "ceiling at {ceiling}");
     let (noisy_psnr, noisy_ssim, noisy_coverage, _) = score_room(&session, &phone, &exposures, "bedroom", "realistic phone");
-    // Measured: 238 227 splats, PSNR 22.61 dB, SSIM 0.798, coverage 99.42 %.
-    // The 1.9 dB are mostly the colour cast of the first frame, which the
-    // exposure compensation spreads over the whole map (there is no
-    // absolute reference), and doubled fringes at 3 to 4 m, where the
-    // simulated depth noise (1.4 to 2.4 cm) exceeds a cell.
-    assert!(noisy_psnr >= 22.1 && noisy_ssim >= 0.78 && noisy_coverage >= 0.99, "PSNR {noisy_psnr:.2} dB, SSIM {noisy_ssim:.3}, coverage {noisy_coverage:.4}");
+    // Measured: 176 086 splats, PSNR 23.49 dB, SSIM 0.797, coverage 99.85 %.
+    // The 2.3 dB are the colour cast of the first frame, which the exposure
+    // compensation spreads over the whole map (there is no absolute
+    // reference), and doubled fringes at 3 to 4 m, where the simulated
+    // depth noise (1.4 to 2.4 cm) reaches the size of a cell: a quarter
+    // more splats than the ideal phone leaves.
+    assert!(noisy_psnr >= 23.0 && noisy_ssim >= 0.78 && noisy_coverage >= 0.995, "PSNR {noisy_psnr:.2} dB, SSIM {noisy_ssim:.3}, coverage {noisy_coverage:.4}");
+}
+
+/// The yardstick for the test above: the simulated home scan (five exact
+/// sensors, the default 2.4 cm cells), scored on the same bedroom views.
+/// Run it with `--ignored` to refresh the numbers quoted there.
+#[test]
+#[ignore = "reference numbers only: the whole simulated house scan"]
+fn the_simulated_scan_scores_on_the_same_views() {
+    use gs_core::pipeline::Pipeline;
+    use gs_core::protocol::PipelineConfig;
+    let mut config = PipelineConfig::for_scene(SceneKind::House);
+    config.scan.autostart = false;
+    config.preview.enabled = false;
+    let mut pipeline = Pipeline::new(config);
+    let mut client = Client::default();
+    common::run_full_scan(&mut pipeline, &mut client);
+    let snap = house();
+    let exposures = Exposures::of_scan(&snap, pipeline.config());
+    let mut scores = Vec::new();
+    for view in house_views().iter().filter(|v| v.name.starts_with("bedroom")) {
+        let mask = observed_mask(&snap, &exposures, &view.cam);
+        let score = evaluate(&snap, &client.layers, &view.cam, true, Some(&mask), Renderer::Normalized);
+        println!("scan head {}: PSNR {:.2} dB ({:.2} where seen), SSIM {:.3}, coverage where seen {:.2} %", view.name, score.psnr, score.psnr_observed, score.ssim, 100.0 * score.coverage_observed);
+        scores.push(score);
+    }
+    println!(
+        "scan head, bedroom: PSNR where seen {:.2} dB, SSIM {:.3}, coverage where seen {:.2} %",
+        mean(&scores.iter().map(|s| s.psnr_observed).collect::<Vec<_>>()),
+        mean(&scores.iter().map(|s| s.ssim).collect::<Vec<_>>()),
+        100.0 * mean(&scores.iter().map(|s| s.coverage_observed).collect::<Vec<_>>())
+    );
 }

@@ -317,6 +317,29 @@ fn a_recording_plays_from_range_requests() {
     viewer.assert_shows(&Viewer::live(&stream, end), TINY_TOLERANCE, "ranged play");
     assert!(player.stats().cached_bytes <= cache + 12_000, "{:?}", player.stats());
 
+    // Around the end and on, twice: the start was dropped from the small
+    // cache and is fetched again while the head waits at the new start.
+    player.set_looping(true);
+    player.seek(end - 0.5);
+    player.play();
+    let (mut wraps, mut waits) = (0, 0);
+    for frame in 0..500 {
+        if frame % 3 == 0 {
+            pump(&mut player, &file, &mut requests);
+        }
+        let before = player.time();
+        let update = player.advance(1.0 / 30.0);
+        viewer.apply_all(&update);
+        wraps += usize::from(update.time < before);
+        waits += usize::from(update.buffering);
+        assert!(!update.ended && player.is_playing());
+        if !update.buffering {
+            viewer.assert_shows(&Viewer::live(&stream, update.time), TINY_TOLERANCE, "looping over ranges");
+        }
+    }
+    assert!(wraps >= 2 && waits > 0, "{wraps} wraps, {waits} waits");
+    player.set_looping(false);
+
     // A slow network: one request answered every few frames. The head
     // waits, the picture never runs ahead of the data, the end is reached.
     let mut player = Player::ranged(file.len() as u64);

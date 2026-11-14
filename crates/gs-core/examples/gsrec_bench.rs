@@ -128,11 +128,11 @@ fn report(name: &str, stream: &Stream) {
     let opened = start.elapsed().as_secs_f64();
     let stats = player.stats();
     println!(
-        "  player from memory: opened in {:.2} ms; holds the file ({:.1} MB) plus {} records x 32 B = {:.0} KB",
+        "  player from memory: opened in {:.2} ms; holds the file ({:.1} MB) plus {} records x 24 B = {:.0} KB",
         opened * 1e3,
         mb(file.len() as u64),
         stats.records,
-        stats.records as f64 * 32.0 / 1e3
+        stats.records as f64 * 24.0 / 1e3
     );
     player.play();
     let start = Instant::now();

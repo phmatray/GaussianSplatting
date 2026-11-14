@@ -10,10 +10,11 @@
 //!   which refer to the colour image, are scaled to it;
 //! * the colour image, several times finer, is averaged over the footprint
 //!   of every depth pixel ([`super::image`]);
-//! * depth outside the range of the sensor, of low confidence, or within a
-//!   depth discontinuity (LiDAR depth is interpolated across silhouettes:
-//!   "flying pixels" that hang in mid-air between the object and what is
-//!   behind it) is removed before any surface is estimated;
+//! * depth outside the range of the sensor or of low confidence is removed
+//!   before any surface is estimated. LiDAR depth is interpolated across
+//!   silhouettes ("flying pixels" that hang in mid-air between the object
+//!   and what is behind it); ARKit gives those a low confidence, and for
+//!   frames without a confidence plane a depth-step filter stands in;
 //! * a pose that is not a rigid transform, or intrinsics that are not a
 //!   camera, make the frame unusable instead of poisoning the map.
 
@@ -63,15 +64,23 @@ pub struct IngestParams {
     /// Depth pixels with a confidence below this are dropped (ARKit: 0 low,
     /// 1 medium, 2 high). Frames without a confidence plane keep all.
     pub min_confidence: u8,
-    /// A depth pixel is dropped when one of its eight neighbours is nearer
-    /// or farther by more than this fraction of the nearer depth: it lies
-    /// on, or next to, a depth discontinuity. The limit is raised to what
-    /// a plane at the grazing limit steps per pixel (which depends on the
-    /// resolution of the depth map: 4 % for ARKit's 256x192), so that
+    /// Frames without a confidence plane only: a depth pixel is dropped
+    /// when one of its eight neighbours is nearer or farther by more than
+    /// this fraction of the nearer depth, because it lies on, or next to, a
+    /// depth discontinuity, where LiDAR depth hangs between the object and
+    /// what is behind it. The limit is raised to what a plane at the
+    /// grazing limit steps per pixel (4 % for ARKit's 256x192), so that
     /// floors and walls seen at a slant are never taken for edges. `0`
     /// keeps every pixel.
+    ///
+    /// With a confidence plane this filter is not applied: ARKit marks
+    /// exactly those pixels as low confidence, and removing the rim of
+    /// every silhouette on top of that costs 1 to 2 dB in held-out views
+    /// (`tests/ingest_capture.rs`).
     pub edge_jump: f32,
-    /// `room`: 2 cm cells, 0.25 to 5 m.
+    /// `room`: 2.4 cm cells (those of the simulated home scan: finer ones
+    /// gain nothing measurable at LiDAR resolution and a flat of 90 m2
+    /// would need more than a million of them), 0.25 to 5 m.
     pub room: ModeParams,
     /// `object`: 8 mm cells inside the region of interest.
     pub object: ModeParams,
@@ -114,8 +123,8 @@ impl Default for IngestParams {
     fn default() -> Self {
         Self {
             min_confidence: 1,
-            edge_jump: 0.05,
-            room: ModeParams { voxel_size: 0.02, near: 0.25, far: 5.0, default_radius: 0.0 },
+            edge_jump: 0.1,
+            room: ModeParams { voxel_size: 0.024, near: 0.25, far: 5.0, default_radius: 0.0 },
             object: ModeParams { voxel_size: 0.008, near: 0.15, far: 2.5, default_radius: 0.6 },
             person: ModeParams { voxel_size: 0.01, near: 0.25, far: 4.0, default_radius: 1.2 },
             live: ModeParams { voxel_size: 0.02, near: 0.25, far: 5.0, default_radius: 0.0 },
@@ -308,7 +317,7 @@ pub fn clean_depth(frame: &CaptureFrame, cam: &Camera, near: f32, far: f32, para
         })
         .collect();
     depth.resize(n, 0.0);
-    if params.edge_jump > 0.0 && w >= 3 && h >= 3 {
+    if confidence.is_none() && params.edge_jump > 0.0 && w >= 3 && h >= 3 {
         // Steps are measured on the raw map: a pixel next to one that the
         // range or the confidence removed is still next to an edge.
         let raw = |i: usize| frame.depth_mm.get(i).copied().unwrap_or(0) as f32 * 1.0e-3;
@@ -510,15 +519,19 @@ mod tests {
             let kept: Vec<bool> = (0..w).map(|x| depth[y * w + x] > 0.0).collect();
             assert_eq!(kept, [true, true, false, false, false, true, true, true], "row {y}");
         }
-        // Without the filter everything in range is kept.
+        // Without the filter everything in range is kept; and with a
+        // confidence plane it is the confidence that speaks for the edges.
         let lax = IngestParams { edge_jump: 0.0, ..params };
         assert_eq!(clean_depth(&step, 0.25, 5.0, &lax).1 as usize, w * h);
+        let mut rated = step.clone();
+        rated.confidence = Some((0..w * h).map(|i| if i % w == 3 { 0 } else { 2 }).collect());
+        assert_eq!(clean_depth(&rated, 0.25, 5.0, &params).1 as usize, (w - 1) * h);
         // A floor seen at a slant steps a few percent per pixel and stays.
         let slanted: Vec<u16> = (0..w * h).map(|i| 1000 + 25 * (i / w) as u16).collect();
         assert_eq!(clean_depth(&frame(slanted.clone(), w as u16, h as u16), 0.25, 5.0, &params).1 as usize, w * h);
-        // On a coarse depth map the same floor steps four times as much per
+        // On a coarse depth map a floor steps several times as much per
         // pixel: the limit follows the resolution.
-        let coarse: Vec<u16> = (0..w * h).map(|i| 1000 + 100 * (i / w) as u16).collect();
+        let coarse: Vec<u16> = (0..w * h).map(|i| 1000 + 150 * (i / w) as u16).collect();
         let mut coarse = frame(coarse, w as u16, h as u16);
         assert!((clean_depth(&coarse, 0.25, 5.0, &params).1 as usize) < w * h);
         coarse.intrinsics = [55.0, 55.0, 4.0, 3.0];

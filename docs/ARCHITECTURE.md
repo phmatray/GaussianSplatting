@@ -242,7 +242,8 @@ source in this order: Tauri command (then uses `http_url` as base), else
   (`Hard`, `Soft`), `cull_backfaces`, `layer_weights`, `sorted_surfel_scale`.
   `Auto` draws pipeline layers (`LayerContent::Surfels`) normalised and
   imported files (`LayerContent::Imported`) sorted; `Viewer::blend_status()`
-  reports the active mode and, when it fell back, why.
+  reports the active mode and, when it fell back, why. The status can change
+  from frame to frame, so a UI reads it regularly rather than once.
 - Desktop: orbit + zoom (stage), fly WASD + mouse look (house).
 - WebXR `immersive-vr`, `local-floor`: at most one sort per frame, one draw
   per eye.
@@ -281,7 +282,14 @@ reference and the WebGL2 viewer alike:
 Both modes use the same normalised screen-space low-pass filter (a small
 dilation of the projected covariance with the amplitude scaled so that the
 splat keeps its energy), which keeps distant and miniature views from
-turning to mush.
+turning to mush. Imported files are the exception: they were
+trained with the plain 3DGS dilation and keep it (`classic_dilation`).
+
+Only the ratio of the two layer weights matters; the viewer rescales them so
+that the half-float targets cannot overflow. When the off-screen targets
+cannot be allocated the viewer falls back to sorted blending and tries the
+normalised mode again when the views change size, a VR session starts or
+ends, or the context is restored.
 
 `gs_core::experimental::wblend` is the CPU reference for the normalised mode
 and for the filter; the viewer is compared against it pixel by pixel in
