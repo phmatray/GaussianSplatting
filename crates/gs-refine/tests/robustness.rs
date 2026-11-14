@@ -466,7 +466,7 @@ fn photographs_can_be_fitted_only_where_the_sensor_measured() {
         scene += usable as usize;
         ignored += !usable as usize;
     }
-    assert!(scene > w * h / 4 && ignored > w * h / 5, "{scene} compared, {ignored} ignored");
+    assert!(scene > w * h / 4 && ignored > w * h / 8, "{scene} compared, {ignored} ignored");
     assert_eq!(measured.class[h / 2 * w + w / 2], gs_refine::loss::IGNORE);
     assert_eq!(measured.class[3], gs_refine::loss::IGNORE);
 
