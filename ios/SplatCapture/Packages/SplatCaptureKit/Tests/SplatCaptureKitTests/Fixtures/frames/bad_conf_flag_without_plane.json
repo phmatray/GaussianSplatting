@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 504,
+ "note": "confidence flag set, confidence length 0",
+ "valid": false
+}

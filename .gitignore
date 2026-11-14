@@ -5,3 +5,11 @@ node_modules/
 .DS_Store
 /out/
 src-tauri/gen/schemas/
+
+# Phone companion (ios/SplatCapture) and capture tools (tools/)
+ios/SplatCapture/SplatCapture.xcodeproj/
+ios/SplatCapture/Packages/SplatCaptureKit/.build/
+ios/SplatCapture/Packages/SplatCaptureKit/.swiftpm/
+ios/**/xcuserdata/
+__pycache__/
+tools/.fake_server/

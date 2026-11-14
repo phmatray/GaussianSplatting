@@ -345,6 +345,60 @@ On the LAN listener that request must carry the pairing token
 (`Authorization: Bearer <token>`); on the loopback listener the usual
 `Origin` check applies.
 
+**Details fixed by the reference implementation.** `tools/gscap.py` is the
+reference for the frame and the file, and the fixtures under
+`ios/SplatCapture/Fixtures` (a symbolic link into the Swift test target;
+`Fixtures/README.md` describes every file) are shared by the Python, Swift
+and Rust tests. Where this section is silent, they decide:
+
+- Deflate: depth, confidence and mask are three independent raw-deflate
+  streams; header lengths are the stored sizes, inflated sizes follow from
+  the depth size (2 bytes per pixel for depth, 1 for the others). The JPEG is
+  never deflated. The phone may fall back to an uncompressed frame, so a
+  reader accepts both. Inflation stops one byte past the expected size.
+- Validation order and error codes: `too_short`, `bad_magic`, `bad_version`,
+  `bad_flags` (bits 3 to 7 set), `bad_tracking`, `bad_orientation`,
+  `bad_dimensions` (depth below 1x1 or above 2^22 pixels, checked before any
+  allocation), `bad_length` (flag and length agreement, plane sizes, total
+  size = 128 + the four lengths added without wrapping), `bad_deflate`. The
+  reserved field is ignored on read. A colour length of 0 is allowed.
+- Depth conversion on the phone: `floor(meters * 1000 + 0.5)`; values that
+  are not positive, not finite or above 65535 mm become 0.
+- Intrinsics refer to the colour image as sent; a reader scales them by depth
+  size over colour size to unproject the depth map.
+- The frame index starts at 0 at app launch, only grows, is never reset
+  (pause, reset, reconnection, new capture) and may have gaps. Acks are
+  matched by index. The timestamp is seconds since device boot: only
+  differences are meaningful.
+- `.gscap`: lengths are little-endian; the JSON header holds `protocol,
+  device, app, mode, name, created` and optionally `region`
+  (`{"center":[x,y,z],"radius":r}`) and `floor` (`{"y":h}` or a bare number),
+  never the token; it may be padded with spaces inside its declared length
+  (the phone rewrites it in place) and readers ignore unknown keys. A header
+  above 1 MiB, not UTF-8 or not a JSON object is `bad_header`. A file that
+  ends inside a record or inside a record length is a recording cut short:
+  readers keep the complete frames. A record below 128 bytes or above 64 MiB
+  is `bad_length`. Nothing is allocated from an announced length before the
+  bytes are known to be there. JSON with `NaN`, `Infinity` or pathological
+  nesting is invalid.
+- Pairing URI: the exact parsing rules are in the docstring of
+  `parse_pairing_uri` and in `pairing_uris.json`.
+- Stream behaviour the server must honour: `welcome` within 8 s of the
+  WebSocket opening; nothing but `hello` arrives before it; pings answered
+  with pongs (the phone pings every 5 s); no `Origin` check on `/ingest` nor
+  on the token-authenticated `POST /api/captures` (a native client sends no
+  `Origin`); frame intervals down to 96 ms accepted; error codes `bad_hello`,
+  `bad_protocol`, `bad_token`, `bad_message`, `bad_frame`, `flow_control`;
+  `finish` is answered with the outstanding acks and a last `progress`;
+  after `reset` the scan starts again from nothing (the phone drops older
+  frames and resets its world origin); on reconnection the phone sends the
+  same `hello`, then `region` and `floor` again, and the server continues the
+  scan if the `name` and `mode` match the current capture session. In the
+  fusing modes frames with tracking 0 never arrive and frames with tracking 1
+  are acknowledged with `used: false`; in `live` mode every frame is used.
+  `POST /api/captures` answers `{"ok":true,"frames":n,"truncated":bool,
+  "name":"…"}`, 400 for a damaged file, 401 for a missing or wrong token.
+
 ## 4D recording and sharing (binding for `gs-core::record`, `gs-server`, `gs-app`)
 
 **Recording file `.gsrec`.** A recording is the stream a viewer receives,

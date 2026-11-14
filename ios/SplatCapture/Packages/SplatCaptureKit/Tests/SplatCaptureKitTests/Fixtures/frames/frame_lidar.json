@@ -1,0 +1,89 @@
+{
+ "color": {
+  "height": 48,
+  "length": 589,
+  "sha256": "2daf144253beeb24e4a755d1ea9ba9135a86dba323a90b019bf1830ad93f9917",
+  "width": 64
+ },
+ "compressed": true,
+ "confidence": {
+  "height": 192,
+  "sha256": "79713bbf46130a1b1027f70a87cf00ece49ea23aa92685a32824f4907c525306",
+  "width": 256
+ },
+ "depth": {
+  "height": 192,
+  "sha256": "42bf4cb3b634aff242498f2a4495582b747293374443069ca9be0840aec3d44f",
+  "width": 256
+ },
+ "flags": 7,
+ "index": 1234,
+ "intrinsics": [
+  48.0,
+  48.0,
+  32.0,
+  24.0
+ ],
+ "intrinsics_bits": [
+  "42400000",
+  "42400000",
+  "42000000",
+  "41c00000"
+ ],
+ "length": 3072,
+ "mask": {
+  "height": 192,
+  "sha256": "3b6655e9f8bcc1c7016459fcb7803fca6170410b1a6337c34783c3b8c5c12cb7",
+  "width": 256
+ },
+ "note": "256x192 planes as ARKit delivers them, compressed",
+ "orientation": 1,
+ "reencode_identical": false,
+ "reserved": 0,
+ "stored_lengths": {
+  "color_length": 589,
+  "confidence_length": 252,
+  "depth_length": 1764,
+  "mask_length": 339
+ },
+ "timestamp": 86400.25,
+ "timestamp_bits": "40f5180400000000",
+ "tracking": 2,
+ "valid": true,
+ "world_from_cam": [
+  0.7316888570785522,
+  0.0,
+  -0.681638777256012,
+  0.0,
+  0.0,
+  1.0,
+  0.0,
+  0.0,
+  0.681638777256012,
+  0.0,
+  0.7316888570785522,
+  0.0,
+  1.25,
+  0.125,
+  -3.5,
+  1.0
+ ],
+ "world_from_cam_bits": [
+  "3f3b4ff6",
+  "00000000",
+  "bf2e7fe1",
+  "00000000",
+  "00000000",
+  "3f800000",
+  "00000000",
+  "00000000",
+  "3f2e7fe1",
+  "00000000",
+  "3f3b4ff6",
+  "00000000",
+  "3fa00000",
+  "3e000000",
+  "c0600000",
+  "3f800000"
+ ]
+}

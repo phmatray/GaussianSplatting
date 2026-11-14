@@ -1,0 +1,265 @@
+{
+ "client": [
+  {
+   "args": {
+    "app": "0.1.0",
+    "device": "iPhone17,2",
+    "mode": "room",
+    "name": "Salon",
+    "token": "0123456789abcdef0123456789abcdef"
+   },
+   "build": "hello",
+   "json": {
+    "app": "0.1.0",
+    "device": "iPhone17,2",
+    "mode": "room",
+    "name": "Salon",
+    "protocol": 1,
+    "token": "0123456789abcdef0123456789abcdef",
+    "type": "hello"
+   }
+  },
+  {
+   "args": {
+    "app": "0.1.0",
+    "device": "iPad13,8",
+    "mode": "person",
+    "name": "Zoé \"debout\" \\ essai 2",
+    "token": "0123456789abcdef0123456789abcdef"
+   },
+   "build": "hello",
+   "json": {
+    "app": "0.1.0",
+    "device": "iPad13,8",
+    "mode": "person",
+    "name": "Zoé \"debout\" \\ essai 2",
+    "protocol": 1,
+    "token": "0123456789abcdef0123456789abcdef",
+    "type": "hello"
+   }
+  },
+  {
+   "args": {
+    "center": [
+     0.5,
+     -0.25,
+     -1.5
+    ],
+    "radius": 0.75
+   },
+   "build": "region",
+   "json": {
+    "center": [
+     0.5,
+     -0.25,
+     -1.5
+    ],
+    "radius": 0.75,
+    "type": "region"
+   }
+  },
+  {
+   "args": {
+    "y": -1.25
+   },
+   "build": "floor",
+   "json": {
+    "type": "floor",
+    "y": -1.25
+   }
+  },
+  {
+   "args": {},
+   "build": "pause",
+   "json": {
+    "type": "pause"
+   }
+  },
+  {
+   "args": {},
+   "build": "resume",
+   "json": {
+    "type": "resume"
+   }
+  },
+  {
+   "args": {},
+   "build": "reset",
+   "json": {
+    "type": "reset"
+   }
+  },
+  {
+   "args": {},
+   "build": "finish",
+   "json": {
+    "type": "finish"
+   }
+  }
+ ],
+ "server": [
+  {
+   "expect": {
+    "kind": "welcome",
+    "max_inflight": 4,
+    "protocol": 1
+   },
+   "text": "{\"type\":\"welcome\",\"protocol\":1,\"max_inflight\":4}"
+  },
+  {
+   "expect": {
+    "kind": "welcome",
+    "max_inflight": 16,
+    "protocol": 1
+   },
+   "text": "{\"max_inflight\":16,\"protocol\":1,\"type\":\"welcome\",\"extra\":true}"
+  },
+  {
+   "expect": {
+    "kind": "welcome",
+    "max_inflight": 1,
+    "protocol": 1
+   },
+   "text": "{\"type\":\"welcome\",\"protocol\":1}"
+  },
+  {
+   "expect": {
+    "kind": "welcome",
+    "max_inflight": 1,
+    "protocol": 1
+   },
+   "text": "{\"type\":\"welcome\",\"protocol\":1,\"max_inflight\":0}"
+  },
+  {
+   "expect": {
+    "kind": "welcome",
+    "max_inflight": 4,
+    "protocol": 2
+   },
+   "text": "{\"type\":\"welcome\",\"protocol\":2,\"max_inflight\":4}"
+  },
+  {
+   "expect": {
+    "frame": 0,
+    "kind": "ack",
+    "used": true
+   },
+   "text": "{\"type\":\"ack\",\"frame\":0,\"used\":true}"
+  },
+  {
+   "expect": {
+    "frame": 17,
+    "kind": "ack",
+    "used": false
+   },
+   "text": "{\"type\":\"ack\",\"frame\":17,\"used\":false}"
+  },
+  {
+   "expect": {
+    "frame": 4294967295,
+    "kind": "ack",
+    "used": true
+   },
+   "text": "{\"type\":\"ack\",\"frame\":4294967295,\"used\":true}"
+  },
+  {
+   "expect": {
+    "frame": 5,
+    "kind": "ack",
+    "used": false
+   },
+   "text": "{\"type\":\"ack\",\"frame\":5}"
+  },
+  {
+   "expect": null,
+   "text": "{\"type\":\"ack\",\"used\":true}"
+  },
+  {
+   "expect": null,
+   "text": "{\"type\":\"ack\",\"frame\":-1,\"used\":true}"
+  },
+  {
+   "expect": null,
+   "text": "{\"type\":\"ack\",\"frame\":4294967296,\"used\":true}"
+  },
+  {
+   "expect": null,
+   "text": "{\"type\":\"ack\",\"frame\":1.5,\"used\":true}"
+  },
+  {
+   "expect": null,
+   "text": "{\"type\":\"ack\",\"frame\":\"3\",\"used\":true}"
+  },
+  {
+   "expect": {
+    "frames": 120,
+    "kind": "progress",
+    "splats": 654321
+   },
+   "text": "{\"type\":\"progress\",\"frames\":120,\"splats\":654321}"
+  },
+  {
+   "expect": {
+    "frames": 3,
+    "kind": "progress",
+    "splats": 5000000000
+   },
+   "text": "{\"type\":\"progress\",\"frames\":3,\"splats\":5000000000}"
+  },
+  {
+   "expect": {
+    "frames": 0,
+    "kind": "progress",
+    "splats": 0
+   },
+   "text": "{\"type\":\"progress\"}"
+  },
+  {
+   "expect": {
+    "code": "bad_token",
+    "kind": "error",
+    "message": "wrong pairing token"
+   },
+   "text": "{\"type\":\"error\",\"code\":\"bad_token\",\"message\":\"wrong pairing token\"}"
+  },
+  {
+   "expect": {
+    "code": "",
+    "kind": "error",
+    "message": ""
+   },
+   "text": "{\"type\":\"error\"}"
+  },
+  {
+   "expect": {
+    "kind": "unknown",
+    "type": "stats"
+   },
+   "text": "{\"type\":\"stats\",\"fps\":12}"
+  },
+  {
+   "expect": null,
+   "text": "{\"type\":5}"
+  },
+  {
+   "expect": null,
+   "text": "{\"frame\":1}"
+  },
+  {
+   "expect": null,
+   "text": "[]"
+  },
+  {
+   "expect": null,
+   "text": "\"welcome\""
+  },
+  {
+   "expect": null,
+   "text": "not json"
+  },
+  {
+   "expect": null,
+   "text": ""
+  }
+ ]
+}

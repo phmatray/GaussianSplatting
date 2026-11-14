@@ -1,0 +1,391 @@
+[
+ {
+  "captures_url": "https://192.168.1.20:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "192.168.1.20",
+  "ingest_url": "wss://192.168.1.20:7879/ingest",
+  "note": "canonical form, as in /api/pair",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://192.168.1.20:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "192.168.1.20",
+  "ingest_url": "wss://192.168.1.20:7879/ingest",
+  "note": "surrounding whitespace",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "  \tsplatlive://pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef\r\n"
+ },
+ {
+  "captures_url": "https://192.168.1.20:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "192.168.1.20",
+  "ingest_url": "wss://192.168.1.20:7879/ingest",
+  "note": "any order, unknown parameters ignored",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?token=0123456789abcdef0123456789abcdef&v=2&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&port=7879&extra&host=192.168.1.20"
+ },
+ {
+  "captures_url": "https://192.168.1.20:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "192.168.1.20",
+  "ingest_url": "wss://192.168.1.20:7879/ingest",
+  "note": "scheme and host of the URI in any case",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "SPLATLIVE://Pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://192.168.1.20:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "192.168.1.20",
+  "ingest_url": "wss://192.168.1.20:7879/ingest",
+  "note": "fingerprint in upper case with colons (as /api/info shows it), token in upper case",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=192.168.1.20&port=7879&fp=3F:5A:9C:0D:7E:2B:41:88:6A:1F:0C:9D:8E:7B:6A:5F:4E:3D:2C:1B:0A:99:88:77:66:55:44:33:22:11:00:FF&token=0123456789ABCDEF0123456789ABCDEF"
+ },
+ {
+  "captures_url": "https://192.168.1.20:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "192.168.1.20",
+  "ingest_url": "wss://192.168.1.20:7879/ingest",
+  "note": "percent-encoded colons",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=192.168.1.20&port=7879&fp=3F%3A5A%3A9C%3A0D%3A7E%3A2B%3A41%3A88%3A6A%3A1F%3A0C%3A9D%3A8E%3A7B%3A6A%3A5F%3A4E%3A3D%3A2C%3A1B%3A0A%3A99%3A88%3A77%3A66%3A55%3A44%3A33%3A22%3A11%3A00%3AFF&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://macbook-pro.local:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "macbook-pro.local",
+  "ingest_url": "wss://macbook-pro.local:7879/ingest",
+  "note": "host name, lowercased",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=MacBook-Pro.local&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://[fe80::1]:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "fe80::1",
+  "ingest_url": "wss://[fe80::1]:7879/ingest",
+  "note": "IPv6 literal in brackets",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=%5Bfe80%3A%3A1%5D&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://[fd00::12:34]:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "fd00::12:34",
+  "ingest_url": "wss://[fd00::12:34]:7879/ingest",
+  "note": "IPv6 literal without brackets",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=fd00::12:34&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://10.0.0.2:1/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "10.0.0.2",
+  "ingest_url": "wss://10.0.0.2:1/ingest",
+  "note": "",
+  "ok": true,
+  "port": 1,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=10.0.0.2&port=1&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://10.0.0.2:65535/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "10.0.0.2",
+  "ingest_url": "wss://10.0.0.2:65535/ingest",
+  "note": "",
+  "ok": true,
+  "port": 65535,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=10.0.0.2&port=65535&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://10.0.0.2:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "10.0.0.2",
+  "ingest_url": "wss://10.0.0.2:7879/ingest",
+  "note": "leading zero in the port",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?host=10.0.0.2&port=07879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "captures_url": "https://192.168.1.20:7879/api/captures",
+  "fp": "3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff",
+  "host": "192.168.1.20",
+  "ingest_url": "wss://192.168.1.20:7879/ingest",
+  "note": "empty items between ampersands",
+  "ok": true,
+  "port": 7879,
+  "token": "0123456789abcdef0123456789abcdef",
+  "uri": "splatlive://pair?&&host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef&"
+ },
+ {
+  "error": "bad_scheme",
+  "note": "empty",
+  "ok": false,
+  "uri": ""
+ },
+ {
+  "error": "bad_scheme",
+  "note": "a web address",
+  "ok": false,
+  "uri": "https://192.168.1.20:7879/"
+ },
+ {
+  "error": "bad_scheme",
+  "note": "no query",
+  "ok": false,
+  "uri": "splatlive://pair"
+ },
+ {
+  "error": "bad_scheme",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pairing?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_scheme",
+  "note": "path before the query",
+  "ok": false,
+  "uri": "splatlive://pair/?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_scheme",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive:pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_scheme",
+  "note": "",
+  "ok": false,
+  "uri": "splat://pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "missing_host",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "missing_port",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=192.168.1.20&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "missing_fp",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=192.168.1.20&port=7879&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "missing_token",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff"
+ },
+ {
+  "error": "missing_host",
+  "note": "empty query",
+  "ok": false,
+  "uri": "splatlive://pair?"
+ },
+ {
+  "error": "duplicate_parameter",
+  "note": "a second host",
+  "ok": false,
+  "uri": "splatlive://pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef&host=10.0.0.9"
+ },
+ {
+  "error": "duplicate_parameter",
+  "note": "a second token, even if equal",
+  "ok": false,
+  "uri": "splatlive://pair?host=192.168.1.20&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "empty host",
+  "ok": false,
+  "uri": "splatlive://pair?host=&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "slash",
+  "ok": false,
+  "uri": "splatlive://pair?host=192.168.1.20%2Fx&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "space",
+  "ok": false,
+  "uri": "splatlive://pair?host=my%20mac&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "leading dot",
+  "ok": false,
+  "uri": "splatlive://pair?host=.local&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "user info",
+  "ok": false,
+  "uri": "splatlive://pair?host=user@10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "IPv6 zone",
+  "ok": false,
+  "uri": "splatlive://pair?host=fe80::1%25en0&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "port glued to the host (one colon is not an IPv6 literal)",
+  "ok": false,
+  "uri": "splatlive://pair?host=192.168.1.20:7879&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_host",
+  "note": "one colon",
+  "ok": false,
+  "uri": "splatlive://pair?host=a:b&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=0&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=65536&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=123456&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "empty",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=-1&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=78.9&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=https&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_port",
+  "note": "a full-width digit",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=%EF%BC%97879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_fp",
+  "note": "63 digits",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100f&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_fp",
+  "note": "65 digits",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff0&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_fp",
+  "note": "not hex",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=gf5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_fp",
+  "note": "empty",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_token",
+  "note": "31 digits",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcde"
+ },
+ {
+  "error": "bad_token",
+  "note": "33 digits",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef0"
+ },
+ {
+  "error": "bad_token",
+  "note": "not hex",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=z123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_token",
+  "note": "colons are not accepted in the token",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef:0123456789abcde"
+ },
+ {
+  "error": "bad_encoding",
+  "note": "percent sign with one digit",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2%2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ },
+ {
+  "error": "bad_encoding",
+  "note": "bad escape in an ignored parameter",
+  "ok": false,
+  "uri": "splatlive://pair?host=10.0.0.2&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef&x=%zz"
+ },
+ {
+  "error": "bad_encoding",
+  "note": "not UTF-8",
+  "ok": false,
+  "uri": "splatlive://pair?host=%ff&port=7879&fp=3f5a9c0d7e2b41886a1f0c9d8e7b6a5f4e3d2c1b0a99887766554433221100ff&token=0123456789abcdef0123456789abcdef"
+ }
+]
