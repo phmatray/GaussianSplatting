@@ -352,12 +352,14 @@ async fn the_state_of_the_disk_is_told_at_the_machine() {
     assert_eq!(from_lan.status, 200);
     assert!(from_lan.json().get("storage").is_none());
 
-    // A capture that cannot fit is refused before a byte of it is written.
+    // A capture that cannot fit is refused as soon as its first bytes have
+    // shown that it is one, before the disk is filled with it.
     if cfg!(unix) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = common::tcp(loopback(port), None).await;
         let head = format!("POST /api/captures HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", 1u64 << 60);
         stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&bedroom()[..4096]).await.unwrap();
         // Nothing more will come: the server need not wait for the body.
         stream.shutdown().await.unwrap();
         let mut answer = Vec::new();

@@ -218,7 +218,7 @@ final class CaptureEngine: NSObject, ObservableObject, ARSessionDelegate {
                 device: CaptureEngine.deviceIdentifier(),
                 app: CaptureEngine.appVersion(),
                 mode: mode,
-                name: name))
+                name: captureName))
         } else if startFile() {
             phase = .running
             if pairing == nil && !offline {

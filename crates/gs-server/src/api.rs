@@ -755,14 +755,14 @@ pub(crate) async fn import(State(state): State<AppState>, request: Request) -> R
     if core.hub.metrics.capturing.load(Ordering::Relaxed) {
         return refuse_upload(request, capture_in_progress()).await;
     }
-    // A capture that will not fit is refused before the first byte is
-    // written, not after the disk has been filled with half of it.
+    // A capture that will not fit on the disk is refused once its first
+    // bytes have shown that it is one, not after the disk has been filled
+    // with half of it: the free space when it does not suffice.
     let keeping = core.settings.keep_captures && core.store.dir(Kind::Capture).is_some();
-    if let (true, Some(length), Some(free)) = (keeping, announced, core.store.free_bytes(Kind::Capture)) {
-        if length.saturating_add(UPLOAD_MARGIN_BYTES) > free {
-            return refuse_upload(request, disk_full(free)).await;
-        }
-    }
+    let short_of_room = match (keeping, announced, core.store.free_bytes(Kind::Capture)) {
+        (true, Some(length), Some(free)) if length.saturating_add(UPLOAD_MARGIN_BYTES) > free => Some(free),
+        _ => None,
+    };
     // One import at a time: each keeps a core busy for as long as it lasts.
     let Ok(_permit) = core.imports.clone().try_acquire_owned() else {
         let refusal = json_error(StatusCode::CONFLICT, "import_in_progress", "another capture is being imported");
@@ -813,6 +813,9 @@ pub(crate) async fn import(State(state): State<AppState>, request: Request) -> R
         received += chunk.len() as u64;
         if received > limit {
             break Some(too_large());
+        }
+        if let Some(free) = short_of_room.filter(|_| received >= FILE_MAGIC.len() as u64) {
+            break Some(disk_full(free));
         }
         if let Err(err) = file.write_all(&chunk).await {
             break Some(write_refusal("écriture de la capture reçue impossible", err));

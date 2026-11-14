@@ -301,7 +301,8 @@ frontend resolves its source in this order: Tauri command (then uses
 - **Uploads.** `POST /api/captures` is streamed to a hidden `.part` file.
   Its first 8 bytes are checked on arrival (400 `bad_file_magic`); the limit
   is `max_upload_bytes` (16 GiB, 413); an announced length that does not fit
-  on the disk, or a write the disk refuses, is 507 `disk_full`; a stalled
+  on the disk (told once the magic bytes have passed), or a write the disk
+  refuses, is 507 `disk_full`; a stalled
   body is 408 at `request_timeout`; 409 `busy` while a phone captures, 409
   `import_in_progress` (one import at a time). An early refusal over HTTP/1
   first discards up to 64 MiB of the body for at most 10 s so that the
@@ -347,6 +348,9 @@ frontend resolves its source in this order: Tauri command (then uses
   where captures are written, `low` under 2 GiB, and the latest `problem`
   (`serial`, `code` `capture_not_saved` or `recording_not_saved`, `file`)
   when the disk refused a capture or a recording. The capture itself goes on.
+  `GET /api/captures` carries `free_bytes` as well. A refinement is not
+  started with less than 256 MiB free, a dataset export with less than the
+  size of the capture plus that.
 - **Log.** The debug access log replaces the pairing token with `<token>`.
 
 ## Viewer

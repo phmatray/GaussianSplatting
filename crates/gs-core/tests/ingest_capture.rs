@@ -739,7 +739,7 @@ fn frames_the_size_of_a_real_phone_go_through_the_stream_and_the_file() {
         for piece in file.chunks(chunk) {
             importer.push(piece).unwrap();
         }
-        let (mut session, summary) = importer.finish().unwrap();
+        let (session, summary) = importer.finish().unwrap();
         assert_eq!((summary.frames, summary.frames_used, summary.truncated), (4, 4, false), "pieces of {chunk}");
         assert_eq!(session.static_splats(), streamed.static_splats(), "pieces of {chunk}");
     }

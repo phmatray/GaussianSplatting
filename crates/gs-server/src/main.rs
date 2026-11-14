@@ -388,6 +388,28 @@ mod tests {
     }
 
     #[test]
+    fn the_offline_job_is_configured_from_the_command_line() {
+        let parse = |line: &str| match parse_args(line.split_whitespace().map(String::from)) {
+            Ok(Parsed::Run(args)) => Ok(args),
+            Ok(_) => Err("not a run".to_string()),
+            Err(message) => Err(message),
+        };
+        let args = parse("").unwrap();
+        assert!(args.refined_dir.is_none() && args.datasets_dir.is_none());
+        assert_eq!((args.refine_threads, args.refine_iterations), (0, None));
+        let args = parse("--refined-dir /data/fin --datasets-dir=/data/jeux --refine-threads 6 --refine-iterations=150").unwrap();
+        assert_eq!(args.refined_dir, Some(PathBuf::from("/data/fin")));
+        assert_eq!(args.datasets_dir, Some(PathBuf::from("/data/jeux")));
+        assert_eq!((args.refine_threads, args.refine_iterations), (6, Some(150)));
+        for bad in ["--refine-iterations 0", "--refine-iterations beaucoup", "--refine-threads -1", "--refine-threads"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        for flag in ["--refined-dir", "--datasets-dir", "--refine-threads", "--refine-iterations"] {
+            assert!(USAGE.contains(flag), "{flag} is missing from the help");
+        }
+    }
+
+    #[test]
     fn user_facing_text_has_no_em_dash() {
         assert!(!USAGE.contains('\u{2014}') && !USAGE.contains('\u{2013}'));
     }
