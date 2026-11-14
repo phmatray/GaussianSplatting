@@ -28,7 +28,8 @@ first). Environment variables:
 
 - `GS_RENDER_OUT`: directory for screenshots, console logs and JSON reports
   (default `out/render-e2e` at the repository root, git-ignored).
-- `SKIP_BUILD=1`: reuse the existing `crates/gs-render-harness/dist`.
+- `SKIP_BUILD=1`: reuse the existing `crates/gs-render-harness/dist`
+  (`GS_RENDER_DIST=dir` serves a build from elsewhere).
 - `ONLY=compare,xr`: run a subset (`measure` only runs when named here).
 - `ADV=cases,stress`, `ADV_CYCLES=200`: parts and length of the adversarial suite.
 - `PERF_N=200000,1000000`: splat counts of the perf suite.

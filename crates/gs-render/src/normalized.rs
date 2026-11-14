@@ -351,6 +351,17 @@ mod gl {
         accumulate: WebGlFramebuffer,
     }
 
+    /// Empties the error queue of the context. Bounded: a context holds one
+    /// flag per error kind, and a lost one must not be able to hang the
+    /// frame if it kept reporting its loss.
+    fn clear_errors(gl: &GL) {
+        for _ in 0..16 {
+            if gl.get_error() == GL::NO_ERROR {
+                break;
+            }
+        }
+    }
+
     fn texture(gl: &GL, format: u32, width: u32, height: u32) -> Result<WebGlTexture, String> {
         let texture = gl.create_texture().ok_or("createTexture failed")?;
         gl.bind_texture(GL::TEXTURE_2D, Some(&texture));
@@ -368,7 +379,7 @@ mod gl {
         fn new(gl: &GL, width: u32, height: u32, soft: bool) -> Result<Self, String> {
             // Start from a clean error flag: an allocation failure below must
             // not be blamed on, or hidden by, an older error.
-            while gl.get_error() != GL::NO_ERROR {}
+            clear_errors(gl);
             let mut targets = Self {
                 width,
                 height,
@@ -443,7 +454,7 @@ mod gl {
             }
             // Probing an unsupported format may have raised an error.
             if result.is_ok() {
-                while gl.get_error() != GL::NO_ERROR {}
+                clear_errors(gl);
             }
             result
         }

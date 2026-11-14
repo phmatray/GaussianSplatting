@@ -1008,6 +1008,41 @@ impl Accum {
             self.rgb[c] += other.rgb[c];
         }
     }
+
+    /// The same averages carried by a weight of `count` instead of
+    /// `self.count`.
+    fn reweighted(&self, count: u32) -> Self {
+        let own = self.count.max(1);
+        let factor = count as f32 / own as f32;
+        let scale = |sum: u32| ((sum as u64 * count as u64 + own as u64 / 2) / own as u64) as u32;
+        Self {
+            normal: self.normal * factor,
+            height: self.height * factor,
+            rgb: self.rgb.map(scale),
+            count,
+            footprint: self.footprint,
+        }
+    }
+
+    /// Mean color, channels in `0.0..=255.0`.
+    fn mean_rgb(&self) -> [f32; 3] {
+        let count = self.count.max(1) as f32;
+        self.rgb.map(|sum| sum as f32 / count)
+    }
+
+    /// Multiplies the color by a gain per channel, without leaving the
+    /// 8-bit range. A channel near its ceiling is clipped: its true value
+    /// is unknown, only that it is bright, so a gain below one fades out
+    /// toward the ceiling instead of turning a window grey.
+    fn apply_gain(&mut self, gain: [f32; 3]) {
+        let count = self.count.max(1) as f32;
+        for (sum, g) in self.rgb.iter_mut().zip(gain) {
+            let mean = *sum as f32 / count;
+            let clipped = ((mean - 251.0) / 3.0).clamp(0.0, 1.0);
+            let g = if g < 1.0 { g + (1.0 - g) * clipped } else { g };
+            *sum = ((mean * g).min(255.0) * count).round() as u32;
+        }
+    }
 }
 
 /// Where a cell sits: facing class and column.
@@ -1028,6 +1063,23 @@ struct Pending {
     /// Index of the cell's splat.
     index: u32,
     accum: Accum,
+}
+
+/// What [`VoxelFusion::integrate_masked`] did with a frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameFusion {
+    /// Index of the first splat the frame created: the new ones are
+    /// `splats()[first_new..]`.
+    pub first_new: usize,
+    /// Surface cells seen for the first time.
+    pub created: usize,
+    /// Existing cells the frame was averaged into (rewritten in place).
+    pub updated: usize,
+    /// Pixels that were good enough to be fused.
+    pub observations: usize,
+    /// Color gain applied to the frame (see
+    /// [`VoxelFusion::exposure_compensation`]); `[1, 1, 1]` without it.
+    pub gain: [f32; 3],
 }
 
 /// Incremental surface fusion for the home scan.
@@ -1070,6 +1122,24 @@ struct Pending {
 /// counted by [`VoxelFusion::refined`] so that the owner can decide when to
 /// publish [`VoxelFusion::splats`] as a whole again.
 ///
+/// # Real sensors
+///
+/// The simulated head delivers the same exposure and an exact pose for
+/// every frame, so replacing a cell by a closer view is all gain. A phone
+/// does not: its exposure and white balance drift, its depth is noisy and
+/// its pose wanders by a centimeter. Two settings adapt the fusion to that
+/// (both off by default; `gs_core::ingest` turns them on):
+///
+/// * [`VoxelFusion::blend_frames`]: every frame counts once in a cell,
+///   however many of its samples fall into it, and a cell keeps averaging
+///   frames of comparable resolution until it holds that many. A clearly
+///   better view no longer replaces the cell outright: what is there is
+///   cut down to a quarter of a frame's weight and the new view is averaged
+///   in.
+/// * [`VoxelFusion::exposure_compensation`]: before a frame is merged its
+///   colors are scaled, per channel, so that the cells it shares with the
+///   map agree with the map on average.
+///
 /// # Memory
 ///
 /// At most [`VoxelFusion::max_voxels`] cells are created (about 100 bytes
@@ -1101,6 +1171,16 @@ pub struct VoxelFusion {
     pub refine_ratio: f32,
     /// Upper bound on the number of cells (and splats).
     pub max_voxels: usize,
+    /// `0` (the default): a cell is built from samples, the best view wins
+    /// (see "Refinement"). Otherwise the number of frames a cell averages,
+    /// each frame with the same weight (see "Real sensors").
+    pub blend_frames: u32,
+    /// Scale the colors of every frame to agree with the map where they
+    /// overlap (see "Real sensors").
+    pub exposure_compensation: bool,
+    /// Color gain applied to the last frame that overlapped the map; frames
+    /// that see only new surface inherit it.
+    gain: [f32; 3],
     cells: CellMap,
     splats: Vec<Splat>,
     /// Per splat: the samples it is built from.
@@ -1153,6 +1233,15 @@ impl VoxelFusion {
     /// A cell that has averaged this many samples only changes again for a
     /// clearly better view (bounds the work per cell).
     const SATURATION: u32 = 8;
+    /// Weight of one frame in a cell under [`VoxelFusion::blend_frames`].
+    const FRAME_UNIT: u32 = 16;
+    /// Largest accepted [`VoxelFusion::blend_frames`].
+    pub const MAX_BLEND_FRAMES: u32 = 256;
+    /// Cells a frame must share with the map for its exposure to be
+    /// measured against it.
+    const MIN_GAIN_CELLS: u32 = 64;
+    /// A frame is never brightened or darkened by more than this factor.
+    const MAX_GAIN: f32 = 3.0;
 
     /// An empty map with cells of `voxel_size` meters (clamped to
     /// [`VoxelFusion::MIN_VOXEL_SIZE`]`..=`[`VoxelFusion::MAX_VOXEL_SIZE`];
@@ -1166,6 +1255,9 @@ impl VoxelFusion {
             opacity: 1.0,
             refine_ratio: 0.7,
             max_voxels: Self::DEFAULT_MAX_VOXELS,
+            blend_frames: 0,
+            exposure_compensation: false,
+            gain: [1.0; 3],
             cells: CellMap::default(),
             splats: Vec::new(),
             accums: Vec::new(),
@@ -1208,6 +1300,55 @@ impl VoxelFusion {
         self.accums.clear();
         self.slots.clear();
         self.refined = 0;
+        self.gain = [1.0; 3];
+    }
+
+    /// No further cell can be created: [`VoxelFusion::max_voxels`] is
+    /// reached. Existing cells are still refined.
+    pub fn is_full(&self) -> bool {
+        self.splats.len() >= self.max_voxels.min(NO_SLOT as usize - 1)
+    }
+
+    /// The weight a cell stops averaging comparable views at.
+    fn saturation(&self) -> u32 {
+        match self.blend_frames.min(Self::MAX_BLEND_FRAMES) {
+            0 => Self::SATURATION,
+            frames => frames * Self::FRAME_UNIT,
+        }
+    }
+
+    /// Removes every cell for which `keep` returns `false` and returns how
+    /// many were removed. `keep` sees the cell's splat and how much went
+    /// into it: frames under [`VoxelFusion::blend_frames`], samples
+    /// otherwise. The remaining splats keep their order; their indices
+    /// change, so whoever mirrors [`VoxelFusion::splats`] must take them
+    /// again as a whole.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Splat, u32) -> bool) -> usize {
+        let unit = if self.blend_frames > 0 { Self::FRAME_UNIT } else { 1 };
+        let mut new_index = Vec::with_capacity(self.splats.len());
+        let mut next = 0u32;
+        for (splat, accum) in self.splats.iter().zip(&self.accums) {
+            if keep(splat, accum.count.div_ceil(unit)) {
+                new_index.push(next);
+                next += 1;
+            } else {
+                new_index.push(NO_SLOT);
+            }
+        }
+        let removed = self.splats.len() - next as usize;
+        if removed == 0 {
+            return 0;
+        }
+        self.cells.retain(|_, index| {
+            *index = new_index[*index as usize];
+            *index != NO_SLOT
+        });
+        let mut kept = new_index.iter().map(|&index| index != NO_SLOT);
+        self.splats.retain(|_| kept.next().unwrap_or(false));
+        let mut kept = new_index.iter().map(|&index| index != NO_SLOT);
+        self.accums.retain(|_| kept.next().unwrap_or(false));
+        self.slots.truncate(next as usize);
+        removed
     }
 
     /// Fuses one frame and returns the splats of the surface cells it
@@ -1220,14 +1361,31 @@ impl VoxelFusion {
     /// are not used: the splat size follows the voxel size, and the map has
     /// its own [`VoxelFusion::opacity`] and [`VoxelFusion::min_cos`].
     pub fn integrate(&mut self, frame: &RgbdFrame, cam: &Camera, params: &ReconstructParams) -> Vec<Splat> {
+        let fused = self.integrate_masked(frame, cam, params, None);
+        self.splats[fused.first_new..].to_vec()
+    }
+
+    /// [`VoxelFusion::integrate`] restricted to the pixels whose `mask` byte
+    /// is not [`MASK_SKIP`] (all of them without a mask; a mask of the wrong
+    /// length fuses nothing). Skipped pixels still serve their neighbours'
+    /// normals. The new splats are `splats()[first_new..]`.
+    pub fn integrate_masked(
+        &mut self,
+        frame: &RgbdFrame,
+        cam: &Camera,
+        params: &ReconstructParams,
+        mask: Option<&[u8]>,
+    ) -> FrameFusion {
+        let base = self.splats.len();
+        let nothing = FrameFusion { first_new: base, created: 0, updated: 0, observations: 0, gain: [1.0; 3] };
         let n = frame.width as usize * frame.height as usize;
-        if n == 0 || !frame_matches(frame, cam) {
-            return Vec::new();
+        if n == 0 || !frame_matches(frame, cam) || mask.is_some_and(|m| m.len() != n) {
+            return nothing;
         }
         let geo = FrameGeometry::new(frame, cam, params, self.min_cos);
-        let rows = self.observe(&geo, frame);
+        let rows = self.observe(&geo, frame, mask);
+        let observations = rows.iter().map(Vec::len).sum::<usize>();
 
-        let base = self.splats.len();
         let mut created = 0usize;
         let mut pending: Vec<Pending> = Vec::new();
         let voxel = self.voxel_size;
@@ -1336,6 +1494,8 @@ impl VoxelFusion {
             }
         }
 
+        let gain = if self.exposure_compensation { self.frame_gain(&pending, base) } else { [1.0; 3] };
+        let blend = self.blend_frames > 0;
         // New cells were numbered in the order they entered `pending`, so
         // pushing in that order puts every splat at its index.
         let alpha = opacity_byte(self.opacity);
@@ -1343,25 +1503,70 @@ impl VoxelFusion {
         for p in &pending {
             let index = p.index as usize;
             self.slots[index] = NO_SLOT;
+            let mut seen = p.accum;
+            if blend {
+                // One frame, one vote, however many of its samples fell
+                // into the cell.
+                seen = seen.reweighted(Self::FRAME_UNIT);
+            }
+            if gain != [1.0; 3] {
+                seen.apply_gain(gain);
+            }
             if index < base {
                 let stored = &mut self.accums[index];
-                if p.accum.footprint < self.refine_ratio * stored.footprint {
+                let better = seen.footprint < self.refine_ratio * stored.footprint;
+                if better && !blend {
                     // A clearly better view replaces what was there.
-                    *stored = p.accum;
+                    *stored = seen;
                 } else {
+                    if better && stored.count > Self::FRAME_UNIT / 4 {
+                        // A clearly better view of a real sensor: what was
+                        // there shrinks to a quarter of a frame's weight.
+                        // The cell takes the sharper view at once (four
+                        // fifths of it) without being repainted outright,
+                        // and the frames that follow average as usual.
+                        *stored = stored.reweighted(Self::FRAME_UNIT / 4);
+                    }
                     // A comparable view: averaging over frames takes the
                     // staircase out of color edges and tames sensor noise.
-                    stored.merge(&p.accum);
+                    stored.merge(&seen);
                 }
                 self.splats[index] = self.cell_splat(p.site, &self.accums[index], params.thickness, alpha);
                 self.refined += 1;
             } else {
                 debug_assert_eq!(index, self.splats.len());
-                self.accums[index] = p.accum;
-                self.splats.push(self.cell_splat(p.site, &p.accum, params.thickness, alpha));
+                self.accums[index] = seen;
+                self.splats.push(self.cell_splat(p.site, &seen, params.thickness, alpha));
             }
         }
-        self.splats[base..].to_vec()
+        FrameFusion { first_new: base, created, updated: pending.len() - created, observations, gain }
+    }
+
+    /// The color gain that makes this frame agree with the map: over the
+    /// cells both have, the ratio of the map's mean color to the frame's,
+    /// per channel. Cells near black or white are left out (a clipped
+    /// channel says nothing about the exposure). A frame that shares too
+    /// few cells with the map takes the gain of the last one that did:
+    /// exposure changes slowly from frame to frame.
+    fn frame_gain(&mut self, pending: &[Pending], base: usize) -> [f32; 3] {
+        let usable = |rgb: [f32; 3]| rgb.iter().all(|&c| (16.0..=239.0).contains(&c));
+        let (mut map, mut seen, mut cells) = ([0.0f64; 3], [0.0f64; 3], 0u32);
+        for p in pending.iter().filter(|p| (p.index as usize) < base) {
+            let (a, b) = (self.accums[p.index as usize].mean_rgb(), p.accum.mean_rgb());
+            if usable(a) && usable(b) {
+                for c in 0..3 {
+                    map[c] += a[c] as f64;
+                    seen[c] += b[c] as f64;
+                }
+                cells += 1;
+            }
+        }
+        if cells >= Self::MIN_GAIN_CELLS {
+            for c in 0..3 {
+                self.gain[c] = ((map[c] / seen[c]) as f32).clamp(1.0 / Self::MAX_GAIN, Self::MAX_GAIN);
+            }
+        }
+        self.gain
     }
 
     /// Finds the cell with key `primary`, or the one in the neighbouring slab
@@ -1380,7 +1585,7 @@ impl VoxelFusion {
                 f32::INFINITY
             } else {
                 let stored = &self.accums[index as usize];
-                stored.footprint * if stored.count >= Self::SATURATION { self.refine_ratio } else { accept }
+                stored.footprint * if stored.count >= self.saturation() { self.refine_ratio } else { accept }
             };
             *cached = Lookup { key: primary, index, limit };
         }
@@ -1423,12 +1628,15 @@ impl VoxelFusion {
     }
 
     /// The good observations of a frame, row by row.
-    fn observe(&self, geo: &FrameGeometry, frame: &RgbdFrame) -> Vec<Vec<Observation>> {
+    fn observe(&self, geo: &FrameGeometry, frame: &RgbdFrame, mask: Option<&[u8]>) -> Vec<Vec<Observation>> {
         let cam = geo.cam;
         let rotation = cam.world_from_cam.matrix3;
         let row = |y: usize| {
             let mut out = Vec::new();
             for x in 0..geo.w {
+                if mask.is_some_and(|m| m[y * geo.w + x] == MASK_SKIP) {
+                    continue;
+                }
                 let Some(s) = geo.surface(x, y) else { continue };
                 if s.cos < self.min_cos || s.z > self.max_range {
                     continue;

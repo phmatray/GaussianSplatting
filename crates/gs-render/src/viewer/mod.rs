@@ -712,6 +712,10 @@ impl Inner {
         if let Some(quality) = quality {
             match scene.draw_normalized(vp, params, clip_y, quality, output) {
                 Ok(()) => return,
+                // The context was lost and the event has not been delivered
+                // yet: nothing can be drawn, and nothing is wrong with the
+                // normalised mode.
+                Err(_) if gl.is_context_lost() => return,
                 Err(error) => {
                     // Announced when it happens, not on every retry.
                     if scene.suspend_normalized() {

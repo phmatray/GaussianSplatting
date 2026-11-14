@@ -687,6 +687,7 @@ impl Pipeline {
             loop_duration: self.scene.loop_duration(),
             ceiling_height,
             scan,
+            capture: None,
         }
     }
 
@@ -758,6 +759,7 @@ impl Pipeline {
                 Mode::Stage(_) => None,
                 Mode::House(house) => Some(house.stats(&self.config)),
             },
+            capture: None,
         }
     }
 

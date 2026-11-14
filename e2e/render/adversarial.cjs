@@ -8,6 +8,7 @@
 //   node e2e/render/adversarial.cjs        (BUILD=1 to rebuild the harness first)
 //   ADV=cases,stress,canvas,loss,live,temporal,fallback,xr   run a subset
 //   ADV_CYCLES=200                         length of the leak check
+//   ADV_FULL=1                             the default stage instead of the light preset
 const fs = require('fs');
 const path = require('path');
 const lib = require('./lib.cjs');
@@ -20,8 +21,8 @@ const BLEND = { sorted: 'sorted', hard: 'normalized-hard', soft: 'normalized-sof
 const ALL = ['sorted', 'hard', 'soft'];
 const NORMALIZED = ['hard', 'soft'];
 
-// ?test=adversarial: view -> renderings, and per-case bounds where the
-// general ones do not apply (see the comments).
+// ?test=adversarial: view -> renderings. Every case meets the general
+// bounds; none needs one of its own.
 const CASES = {
   near_plane_crossing: ALL, near_plane_crossing_both_faces: NORMALIZED,
   grazing_floor: ALL, grazing_floor_in_plane: ALL, floor_from_below: NORMALIZED, floor_from_below_both_faces: NORMALIZED,
@@ -32,7 +33,6 @@ const CASES = {
   weights_live_zero: NORMALIZED, weights_static_zero: NORMALIZED, weights_both_tiny: NORMALIZED,
   stage_live_layer_emptied: ALL,
 };
-const BOUNDS = {};
 
 function expectedCases() {
   const cases = new Map();
@@ -137,7 +137,9 @@ function instrument() {
 }
 
 // ---------------------------------------------------------------------------
-const PAGE = '?test=scene&scene=stage&light=1';
+// The light pipeline preset: these parts are about the viewer, and the
+// cloud is built in WASM in every page (ADV_FULL=1: the default stage).
+const PAGE = `?test=scene&scene=stage${process.env.ADV_FULL === '1' ? '' : '&light=1'}`;
 const VIEW = [3.0, 1.2, 4.5, 0, 0.8, 0];
 const state = (page) => page.evaluate(() => window.__scene.state());
 const cmd = (page, name, arg) => page.evaluate(([n, a]) => window.__scene.cmd(n, a), [name, arg]);
@@ -212,7 +214,7 @@ async function cases(browser, url) {
   check(`adversarial: all ${want.size} cases ran`, missing.length === 0 && results.length === want.size, `${results.length} cases${missing.length ? `, missing: ${missing.join(', ')}` : ''}`);
   for (const c of results) {
     const blend = want.get(c.name);
-    const min = BOUNDS[c.name] ?? MIN_PSNR[blend] ?? 45;
+    const min = MIN_PSNR[blend] ?? 45;
     check(`adversarial: ${c.name} is drawn ${blend || '?'} and matches its reference (PSNR >= ${min} dB)`, c.blend === blend && c.psnr >= min,
       `${c.blend}, PSNR ${c.psnr.toFixed(2)} dB, mean abs error ${c.mae.toFixed(3)}, ${c.splats} splats`);
     await page.locator(`[id="case-${c.name}"]`).screenshot({ path: path.join(OUT, `adversarial-${c.name}.png`) });
@@ -597,6 +599,10 @@ async function xrLoss(browser, url) {
     counts.push(JSON.stringify((await page.evaluate(() => window.__gl.live))));
   }
   check('adversarial: six VR sessions in a row leave the same GL objects behind each time', counts.every((c) => c === counts[0]), counts[0] === counts[5] ? counts[0] : counts.join(' / '));
+  // The viewer gives back everything it created, in whatever mode it is.
+  await lib.cmd(page, 'destroy');
+  const left = await page.evaluate(() => window.__gl.live);
+  check('adversarial: destroying the viewer frees every GL object', Object.values(left).every((n) => n === 0), JSON.stringify(left));
   const gl = await page.evaluate(() => JSON.parse(JSON.stringify(window.__gl)));
   // The emulator itself is not written for a lost context.
   const own = logs.filter((l) => !/thrown inside the IWER emulator/.test(l));

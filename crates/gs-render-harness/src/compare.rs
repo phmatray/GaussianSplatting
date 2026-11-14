@@ -116,6 +116,10 @@ fn degenerate_splats(center: Vec3) -> Vec<Splat> {
         Splat { pos: at(0.2, 0.0), scale: [f32::NAN, 0.05, 0.05], ..ok },
         Splat { pos: at(0.4, 0.0), scale: [f32::INFINITY, 0.05, 0.05], ..ok },
         Splat { pos: at(-0.2, 0.0), scale: [1.0e15, 1.0e15, 1.0e15], ..ok },
+        // Large enough for the determinant of the projected covariance to
+        // overflow while its eigenvalues do not.
+        Splat { pos: at(-0.3, 0.1), scale: [5.0e7, 5.0e7, 5.0e7], ..ok },
+        Splat { pos: at(0.3, 0.1), scale: [3.0e8, 3.0e8, 0.01], ..ok },
         Splat { pos: at(-0.4, 0.0), scale: [-0.05, 0.05, 0.05], ..ok },
         // A point: only the low-pass filter gives it a footprint.
         Splat { pos: at(0.0, 0.3), scale: [0.0; 3], ..ok },

@@ -196,6 +196,15 @@ pub struct RenderParams {
     /// layers lie on the same surface, the colour is their mean weighted by
     /// these (times the opacity byte of each splat). The default lets the
     /// live layer win 16 to 1 ([`LIVE_LAYER_WEIGHT`]).
+    ///
+    /// Only the ratio of the two matters: `[1, 16]` and `[10, 160]` give the
+    /// same picture. A layer of weight `0` is not simply hidden: it still
+    /// takes part in the visibility pass and adds no colour, which leaves
+    /// holes (hard) or lets only the next surface behind show (soft). Hide
+    /// a layer with [`RenderParams::show_static`] /
+    /// [`RenderParams::show_dynamic`] instead. Ratios up to 10 000 to 1 are
+    /// accepted; beyond about a thousand to one the weaker layer loses
+    /// colour precision in far views (the sums are kept in half floats).
     pub layer_weights: [f32; LAYER_COUNT],
     /// Sorted mode: extra factor on the standard deviations of surfel
     /// layers. The capture pipeline sizes its surfels for the normalised

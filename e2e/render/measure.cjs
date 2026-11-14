@@ -17,10 +17,15 @@
 // pic-xr-<scene>-<mode>.png (one stereo frame through the IWER emulator)
 // and measure.json.
 //
+// The timings (perf, xr) have a "before" row as well: the old cloud drawn as
+// imported content, which is the sorted path as it was before the blending
+// modes existed.
+//
 // Headless Chromium renders with SwiftShader, a software rasterizer on the
 // CPU: its frame times rank the modes by work done, they are not the frame
 // times of a GPU. The machine may be shared: every timing carries the load
-// average, and the fastest and median frames are reported next to the mean.
+// average and the CPU time all Chromium processes spent per frame, and the
+// fastest and median frames are reported next to the mean.
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -44,6 +49,46 @@ const MODES = [
   ['hard', 'normalized', 'hard', 'surfels'],
   ['soft', 'normalized', 'soft', 'surfels'],
 ];
+
+// The renderer of the product before the blending modes existed, on the
+// cloud of [`BEFORE_PATCH`]: what commit d1a8e3f drew.
+const BEFORE = ['before', 'sorted', 'soft', 'imported'];
+
+// CPU time of every running Chromium process so far, per process id, in
+// milliseconds (Linux; `null` elsewhere). The software rasterizer runs in
+// the GPU process on several threads: on a shared machine this says more
+// than the wall clock.
+function chromiumCpu() {
+  try {
+    const used = new Map();
+    for (const pid of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(pid)) continue;
+      let stat;
+      try {
+        stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      } catch {
+        continue;
+      }
+      const close = stat.lastIndexOf(')');
+      if (!/chrom|headless/i.test(stat.slice(stat.indexOf('(') + 1, close))) continue;
+      const fields = stat.slice(close + 2).split(' ');
+      used.set(pid, (Number(fields[11]) + Number(fields[12])) * 10); // utime + stime, in 10 ms ticks
+    }
+    return used;
+  } catch {
+    return null;
+  }
+}
+
+// CPU milliseconds spent since `before` by the processes still running (one
+// that exited in between, a page that was closed, is left out).
+function cpuSince(before) {
+  const now = chromiumCpu();
+  if (!before || !now) return null;
+  let ms = 0;
+  for (const [pid, used] of now) ms += used - (before.get(pid) || 0);
+  return ms;
+}
 
 const scene = (page, fn, ...args) => page.evaluate(([f, a]) => window.__scene[f](...a), [fn, args]);
 const sceneCmd = (page, name, arg) => page.evaluate(([n, a]) => window.__scene.cmd(n, a), [name, arg]);
@@ -217,28 +262,38 @@ async function loopTiming(page, frames) {
 }
 
 async function perf(browser, url, sceneName, report) {
-  const { ctx, page, logs, state: st } = await open(browser, url, sceneName);
   report.perf = [];
-  for (const [name, v] of Object.entries(views(sceneName, st)).slice(0, 2)) {
-    await setView(page, v);
-    for (const mode of MODES) {
-      await setMode(page, mode);
-      await drawn(page);
-      const before = load();
-      const snapshot = await scene(page, 'timing', FRAMES);
-      const loop = await loopTiming(page, FRAMES);
-      const fragments = await scene(page, 'fragments');
-      const row = { scene: sceneName, view: name, mode: mode[0], splats: st.splatsTotal, load: before, snapshot, loop, fragments };
-      report.perf.push(row);
-      console.log(
-        `      ${sceneName} ${name} ${mode[0].padEnd(6)} ${snapshot.width}x${snapshot.height}: snapshot min ${snapshot.minMs.toFixed(0)} / median ${snapshot.medianMs.toFixed(0)} ms; ` +
-          `loop ${loop.intervalMs.toFixed(0)} ms/frame, main thread ${loop.mainThreadMs.toFixed(2)} ms (sort ${loop.sortMs.toFixed(2)} ms, ${loop.sortsPerFrame.toFixed(2)} sorts/frame); ` +
-          `fragments/px ${fragments.visibilityPerPixel.toFixed(1)} + ${fragments.shadedPerPixel.toFixed(1)}; load ${before[0]}`,
-      );
+  report.perfErrors = [];
+  // The old cloud under the old renderer first, then today's cloud in the
+  // three renderings.
+  for (const [patch, modes] of [[BEFORE_PATCH[sceneName], [BEFORE]], [null, MODES]]) {
+    const { ctx, page, logs, state: st } = await open(browser, url, sceneName, { patch });
+    for (const [name, v] of Object.entries(views(sceneName, st)).slice(0, 2)) {
+      await setView(page, v);
+      for (const mode of modes) {
+        await setMode(page, mode);
+        await drawn(page);
+        const before = load();
+        const cpu0 = chromiumCpu();
+        const snapshot = await scene(page, 'timing', FRAMES);
+        // `timing` draws one warm-up frame before the ones it times.
+        const spent = cpuSince(cpu0);
+        const cpuMs = spent === null ? null : spent / (FRAMES + 1);
+        const loop = await loopTiming(page, FRAMES);
+        const fragments = mode === BEFORE ? null : await scene(page, 'fragments');
+        const row = { scene: sceneName, view: name, mode: mode[0], splats: st.splatsTotal, load: before, snapshot, cpuMsPerFrame: cpuMs, loop, fragments };
+        report.perf.push(row);
+        console.log(
+          `      ${sceneName} ${name} ${mode[0].padEnd(6)} ${st.splatsTotal} splats ${snapshot.width}x${snapshot.height}: snapshot min ${snapshot.minMs.toFixed(0)} / median ${snapshot.medianMs.toFixed(0)} ms` +
+            `${cpuMs === null ? '' : `, CPU ${cpuMs.toFixed(0)} ms/frame (all Chromium threads)`}; ` +
+            `loop ${loop.intervalMs.toFixed(0)} ms/frame, main thread ${loop.mainThreadMs.toFixed(2)} ms (sort ${loop.sortMs.toFixed(2)} ms, ${loop.sortsPerFrame.toFixed(2)} sorts/frame); ` +
+            `${fragments ? `fragments/px ${fragments.visibilityPerPixel.toFixed(1)} + ${fragments.shadedPerPixel.toFixed(1)}; ` : ''}load ${before[0]}`,
+        );
+      }
     }
+    report.perfErrors.push(...consoleErrors(logs));
+    await ctx.close();
   }
-  report.perfErrors = consoleErrors(logs);
-  await ctx.close();
 }
 
 async function popping(browser, url, sceneName, report) {
@@ -282,13 +337,22 @@ async function flicker(browser, url, report) {
 }
 
 async function xr(browser, url, sceneName, report) {
-  const { ctx, page, logs } = await open(browser, url, sceneName, { iwer: true });
+  report.xr = [];
+  report.xrErrors = [];
+  for (const [patch, modes] of [[BEFORE_PATCH[sceneName], [BEFORE]], [null, MODES]]) {
+    await xrSession(browser, url, sceneName, report, patch, modes);
+  }
+}
+
+async function xrSession(browser, url, sceneName, report, patch, modes) {
+  const { ctx, page, logs, state: st } = await open(browser, url, sceneName, { iwer: true, patch });
   await page.evaluate(`(${TIME_FRAME_CALLBACKS})(XRSession.prototype, 'requestAnimationFrame')`);
   await sceneCmd(page, 'enterXr');
   await page.waitForFunction(() => window.__scene.state().xrActive && window.__scene.state().xrFrames > 2, null, { timeout: 60000 });
-  report.xr = [];
-  for (const mode of MODES) {
+  for (const mode of modes) {
     await setMode(page, mode);
+    const cpu0 = chromiumCpu();
+    const frames0 = (await scene(page, 'state')).xrFrames;
     // Move the emulated head a little every frame, so that sorted frames sort.
     const row = await page.evaluate(async (frames) => {
       const frame = () => new Promise((r) => setTimeout(r, 0));
@@ -317,15 +381,21 @@ async function xr(browser, url, sceneName, report) {
         sortsPerFrame: (b.sorts - a.sorts) / Math.max(b.xrFrames - a.xrFrames, 1),
       };
     }, FRAMES);
+    // The session draws continuously: count the frames it actually drew
+    // since the CPU clock was read (warm-up included).
+    const spent = cpuSince(cpu0);
+    const drawnFrames = (await scene(page, 'state')).xrFrames - frames0;
+    const cpuMs = spent === null ? null : spent / Math.max(drawnFrames, 1);
     const file = path.join(OUT, `pic-xr-${sceneName}-${mode[0]}.png`);
     await page.screenshot({ path: file });
-    report.xr.push({ scene: sceneName, mode: mode[0], load: load(), ...row });
+    report.xr.push({ scene: sceneName, mode: mode[0], splats: st.splatsTotal, load: load(), cpuMsPerFrame: cpuMs, ...row });
     console.log(
-      `      xr ${sceneName} ${mode[0].padEnd(6)} 2 x ${row.eye[0]}x${row.eye[1]}: ${row.intervalMs.toFixed(0)} ms/frame, main thread ${row.mainThreadMs.toFixed(2)} ms (sort ${row.sortMs.toFixed(2)} ms, ${row.sortsPerFrame.toFixed(2)} sorts/frame), off-screen targets ${row.offscreen.join('x')}`,
+      `      xr ${sceneName} ${mode[0].padEnd(6)} ${st.splatsTotal} splats 2 x ${row.eye[0]}x${row.eye[1]}: ${row.intervalMs.toFixed(0)} ms/frame` +
+        `${cpuMs === null ? '' : `, CPU ${cpuMs.toFixed(0)} ms/frame`}, main thread ${row.mainThreadMs.toFixed(2)} ms (sort ${row.sortMs.toFixed(2)} ms, ${row.sortsPerFrame.toFixed(2)} sorts/frame), off-screen targets ${row.offscreen.join('x')}; load ${load()[0]}`,
     );
   }
   await sceneCmd(page, 'exitXr');
-  report.xrErrors = consoleErrors(logs).filter((l) => !/thrown inside the IWER emulator/.test(l));
+  report.xrErrors.push(...consoleErrors(logs).filter((l) => !/thrown inside the IWER emulator/.test(l)));
   await ctx.close();
 }
 

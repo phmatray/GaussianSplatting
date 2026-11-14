@@ -59,7 +59,9 @@
 //!   silhouettes) and needs `EXT_color_buffer_half_float` or
 //!   `EXT_color_buffer_float`; without them, or when its render targets
 //!   cannot be allocated, the viewer draws sorted and
-//!   [`Viewer::blend_status`] says why.
+//!   [`Viewer::blend_status`] says why. A failed allocation is tried again
+//!   when the views change size (a resized canvas, a VR session starting or
+//!   ending).
 //! * **Drawing**: one quad per splat, plain indexed triangles whose vertex
 //!   shader derives quad and corner from `gl_VertexID` — the same work as an
 //!   instanced draw on a GPU, but 25× faster on the software rasterizer of

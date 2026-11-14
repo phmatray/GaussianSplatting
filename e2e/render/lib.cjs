@@ -8,7 +8,9 @@ const path = require('path');
 
 const REPO = path.resolve(__dirname, '../..');
 const HARNESS = path.join(REPO, 'crates/gs-render-harness');
-const DIST = path.join(HARNESS, 'dist');
+// The built page: `trunk build --release` puts it in the crate's `dist`;
+// GS_RENDER_DIST serves another build instead (with SKIP_BUILD=1).
+const DIST = process.env.GS_RENDER_DIST ? path.resolve(process.env.GS_RENDER_DIST) : path.join(HARNESS, 'dist');
 // Screenshots and reports. `out/` at the repository root is git-ignored.
 const OUT = path.resolve(process.env.GS_RENDER_OUT || path.join(REPO, 'out/render-e2e'));
 

@@ -1308,4 +1308,43 @@ mod tests {
         let floored = WblendOptions { screen_floor_px: 0.7, ..planar };
         assert!(rasterize(&[edge_on], &cam, &floored).pixel(100, 80)[0] > 100);
     }
+
+    /// The viewer rescales the two layer weights before they reach its
+    /// half-float targets (`gs-render`): that is only right because the
+    /// picture depends on their ratio alone.
+    #[test]
+    fn only_the_ratio_of_the_layer_weights_matters() {
+        let cam = camera();
+        let mut rng = Rng::new(21);
+        let mut cloud = |n: usize| -> Vec<Splat> {
+            (0..n)
+                .map(|_| {
+                    let mut s = rng.splat(1.0, 0.01, 0.12);
+                    s.pos[2] -= 3.0;
+                    s.rgba[3] = s.rgba[3].max(40);
+                    s
+                })
+                .collect()
+        };
+        let (plate, live) = (cloud(300), cloud(200));
+        for opts in [WblendOptions::normalized_hard(), WblendOptions::normalized_soft()] {
+            let picture = |weights: [f32; 2]| {
+                let layers = [Layer { splats: &plate, weight: weights[0] }, Layer { splats: &live, weight: weights[1] }];
+                render(&layers, &cam, &opts)
+            };
+            let reference = picture([1.0, LIVE_LAYER_WEIGHT]);
+            for scale in [1.0e-3f32, 0.37, 625.0] {
+                let scaled = picture([scale, scale * LIVE_LAYER_WEIGHT]);
+                // The coverage never sees the weights; the colour sees them
+                // in a quotient.
+                assert_eq!(scaled.alpha, reference.alpha);
+                let worst = scaled.rgb.iter().zip(&reference.rgb).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                assert!(worst < 0.05, "weights x {scale}: colours differ by {worst} levels");
+            }
+            // And the ratio does matter.
+            let equal = picture([1.0, 1.0]);
+            let worst = equal.rgb.iter().zip(&reference.rgb).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(worst > 20.0, "equal weights change the picture by {worst} levels only");
+        }
+    }
 }

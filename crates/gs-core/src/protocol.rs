@@ -463,8 +463,14 @@ pub struct SessionState {
     /// Height of the ceiling above the floor (house). Lets a viewer clip the
     /// ceiling away for a dollhouse view.
     pub ceiling_height: Option<f32>,
-    /// The scan path (house).
+    /// The scan path (house); for a capture, the path the phone has taken.
     pub scan: Option<ScanInfo>,
+    /// Present when the session is a real capture from the phone companion
+    /// (`gs_core::ingest`) instead of a simulated scene. `scene` is then
+    /// `"capture"` and `config.scene` only tells which kind of session the
+    /// capture resembles (see [`CaptureInfo`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureInfo>,
 }
 
 impl Default for SessionState {
@@ -479,8 +485,114 @@ impl Default for SessionState {
             loop_duration: None,
             ceiling_height: None,
             scan: None,
+            capture: None,
         }
     }
+}
+
+/// What the phone companion is capturing (`docs/ARCHITECTURE.md`, "Real
+/// capture"). Travels as its lowercase name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    /// A walk through rooms, fused into layer 0.
+    #[default]
+    Room,
+    /// A walk around an object that holds still; the fusion is cropped to a
+    /// region of interest and uses finer cells.
+    Object,
+    /// The same around a person.
+    Person,
+    /// No fusion: every frame replaces layer 1 with the surfels of that one
+    /// view.
+    Live,
+}
+
+impl CaptureMode {
+    pub const ALL: [Self; 4] = [Self::Room, Self::Object, Self::Person, Self::Live];
+
+    /// The name used on the wire and in `.gscap` headers.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Room => "room",
+            Self::Object => "object",
+            Self::Person => "person",
+            Self::Live => "live",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.name() == name)
+    }
+
+    /// The fusion is cropped to a region of interest.
+    pub fn uses_region(self) -> bool {
+        matches!(self, Self::Object | Self::Person)
+    }
+
+    /// Frames are fused into layer 0 (every mode but `live`).
+    pub fn fuses(self) -> bool {
+        self != Self::Live
+    }
+}
+
+/// A sphere in viewer coordinates (meters, floor at `y = 0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegionInfo {
+    pub center: [f32; 3],
+    pub radius: f32,
+}
+
+/// Describes a real capture in [`SessionState::capture`].
+///
+/// A capture looks like an ordinary session to a viewer that does not know
+/// this field: `config.scene` is `house` for the `room` mode (a space to
+/// walk through; fly controls) and `stage` for `object`, `person` and
+/// `live` (a subject to look at from around; orbit controls), the fused
+/// cloud is layer 0, the single view of the `live` mode is layer 1, and the
+/// phone is reported like the handheld sensor of the home scan: its pose in
+/// [`ScanStats::camera`] (id 0, `config.scan.head` is `single`) and its
+/// picture as the preview of camera 0, turned upright.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureInfo {
+    pub mode: CaptureMode,
+    /// What the user called the capture.
+    pub name: String,
+    /// Hardware model of the phone, for example `iPhone17,2`.
+    pub device: String,
+    /// Version of the companion app.
+    pub app: String,
+    /// Region of interest of the `object` and `person` modes, once known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<RegionInfo>,
+    /// The floor height came from the phone or from the data. While `false`
+    /// the vertical origin is a guess (the phone held 1.3 m above the
+    /// floor) and layer 0 will be replaced when the floor is found.
+    pub floor_known: bool,
+    /// The capture was read from a `.gscap` file instead of a live stream.
+    pub imported: bool,
+}
+
+/// Capture section of [`Stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptureStats {
+    /// Frames received since the capture started or was last reset.
+    pub frames_received: u32,
+    /// How many of them went into the reconstruction.
+    pub frames_used: u32,
+    /// The phone paused the capture.
+    pub paused: bool,
+    /// The phone finished the capture: layer 0 is final.
+    pub finished: bool,
+    /// The fusion holds as many cells as it may: new surface is no longer
+    /// added, what is there is still refined.
+    pub full: bool,
+    /// ARKit's tracking state of the last frame: 0 not available, 1 limited,
+    /// 2 normal.
+    pub tracking: u8,
 }
 
 /// Progress of the home scan.
@@ -642,8 +754,11 @@ pub struct Stats {
     pub bytes: u32,
     /// Depth pixels captured this tick.
     pub pixels: u32,
-    /// Home scan progress (house only).
+    /// Home scan progress (house only). A capture reports the phone here.
     pub scan: Option<ScanStats>,
+    /// Counters of a real capture (see [`CaptureInfo`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureStats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +1000,47 @@ mod tests {
             assert!(!head.firing_order().is_empty());
             assert!(head.mounts().iter().all(|m| m.yaw_deg.abs() <= 180.0 && m.pitch_deg.abs() <= 90.0));
         }
+    }
+
+    #[test]
+    fn capture_fields_are_additive() {
+        // Without a capture the messages are what they were before the
+        // phone companion existed.
+        let state = serde_json::to_string(&SessionState::default()).unwrap();
+        let stats = serde_json::to_string(&Stats::default()).unwrap();
+        assert!(!state.contains("\"capture\"") && !stats.contains("\"capture\""), "{state} {stats}");
+
+        let info = CaptureInfo {
+            mode: CaptureMode::Person,
+            name: "Zoé".into(),
+            device: "iPhone17,2".into(),
+            app: "0.1.0".into(),
+            region: Some(RegionInfo { center: [0.5, 1.0, -1.5], radius: 0.75 }),
+            floor_known: true,
+            imported: false,
+        };
+        let state = SessionState { scene: "capture".into(), capture: Some(info.clone()), ..SessionState::default() };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains(r#""capture":{"mode":"person","name":"Zoé","device":"iPhone17,2""#), "{json}");
+        assert_eq!(serde_json::from_str::<SessionState>(&json).unwrap(), state);
+        let partial: SessionState = serde_json::from_str(r#"{"capture":{"mode":"live","later":1}}"#).unwrap();
+        assert_eq!(partial.capture, Some(CaptureInfo { mode: CaptureMode::Live, ..CaptureInfo::default() }));
+        assert!(serde_json::from_str::<SessionState>(r#"{"capture":{"mode":"fisheye"}}"#).is_err());
+
+        let counters = CaptureStats { frames_received: 12, frames_used: 9, paused: true, finished: false, full: false, tracking: 2 };
+        let stats = Stats { capture: Some(counters), ..Stats::default() };
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains(r#""capture":{"frames_received":12,"frames_used":9,"paused":true"#), "{json}");
+        assert_eq!(serde_json::from_str::<Stats>(&json).unwrap(), stats);
+        assert!(std::mem::size_of::<Stats>() < 1024);
+
+        for mode in CaptureMode::ALL {
+            assert_eq!(CaptureMode::from_name(mode.name()), Some(mode));
+            assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{}\"", mode.name()));
+            assert_eq!(mode.fuses(), mode != CaptureMode::Live);
+        }
+        assert_eq!(CaptureMode::from_name("Room"), None);
+        assert!(CaptureMode::Object.uses_region() && CaptureMode::Person.uses_region() && !CaptureMode::Room.uses_region());
     }
 
     #[test]

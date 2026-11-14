@@ -216,8 +216,11 @@ void main() {
     vec2 v1 = a >= c ? vec2(hd + rad, b) : vec2(b, rad - hd);
     float len = length(v1);
     v1 = len > 1e-12 ? v1 / len : vec2(1.0, 0.0);
-    // Not finite (NaN compares false): cull.
-    if (!(l1 > 0.0 && l1 < 1e30)) { gl_Position = CULLED; return; }
+    // Not finite (NaN compares false): cull. The determinant overflows long
+    // before the eigenvalue does (a splat of 10^7 m), and with it the gain
+    // and the minor axis; the reference rejects a determinant that is not
+    // finite.
+    if (!(l1 > 0.0 && l1 < 1e30 && det < 3.0e38)) { gl_Position = CULLED; return; }
     // The clamp shrinks a huge splat as a whole: the same factor whatever
     // part of it this pass draws.
     float s1 = sqrt(l1), s2 = sqrt(l2);
