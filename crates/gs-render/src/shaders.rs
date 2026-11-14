@@ -20,6 +20,7 @@
 //! | accumulation, hard | plain | [`ACCUMULATE_FS`] | `(Σ w·c, Σ w)` |
 //! | accumulation, soft | plain | [`ACCUMULATE_FS`] + `SOFT` | the same for two surfaces, and their coverage |
 //! | resolve | [`RESOLVE_VS`] | [`RESOLVE_FS`] (+ `SOFT`) | premultiplied colour, blended "over" |
+//! | lines | [`LINE_VS`] | [`line_fs`] (+ `OCCLUDED`) | premultiplied colour, blended "over" |
 //!
 //! # Fragments of the normalised mode
 //!
@@ -505,6 +506,7 @@ uniform float u_px_scale;    // device pixels per width unit
 out vec4 v_color;
 out float v_side;            // signed distance from the center line, pixels
 out float v_half_width;
+out float v_inv_depth;       // 1 / view depth: linear on screen, the quad has w = 1
 
 void main() {
   vec4 c0 = u_view_proj * vec4(a_p0, 1.0);
@@ -527,20 +529,45 @@ void main() {
   v_color = a_color;
   v_side = a_corner.y * reach;
   v_half_width = half_width;
+  // Clip-space w is the view depth for every perspective projection.
+  v_inv_depth = 1.0 / (a_corner.x < 0.0 ? c0.w : c1.w);
 }
 "#;
 
-pub(crate) const LINE_FS: &str = r#"#version 300 es
+/// Line fragment shader. With `OCCLUDED`, fragments behind the visible
+/// surface of the normalised mode are dropped: the shader samples the
+/// first-surface depth texture of the view that was just resolved (the
+/// destination framebuffer has no depth buffer in either mode).
+const LINE_FS_BODY: &str = r#"
 precision highp float;
+precision highp sampler2D;
 
 in vec4 v_color;
 in float v_side;
 in float v_half_width;
+in float v_inv_depth;
+#ifdef OCCLUDED
+uniform sampler2D u_surface;  // encoded depth of the visible surface
+uniform ivec2 u_origin;       // lower-left corner of the viewport in the framebuffer
+uniform vec2 u_occlusion;     // near plane, encoded depth tolerance
+#endif
 out vec4 o_color;
 
 void main() {
+#ifdef OCCLUDED
+  float surface = texelFetch(u_surface, ivec2(gl_FragCoord.xy) - u_origin, 0).r;
+  float e = -log2(v_inv_depth * u_occlusion.x) * (1.0 / DEPTH_OCTAVES);
+  if (surface < 1.0 && e > surface + u_occlusion.y) discard;
+#endif
   float coverage = clamp(v_half_width + 0.5 - abs(v_side), 0.0, 1.0);
   float alpha = v_color.a * coverage;
   o_color = vec4(v_color.rgb * alpha, alpha);
 }
 "#;
+
+/// Fragment shader of the lines; `occluded` hides what lies behind the
+/// splats of the normalised mode.
+pub(crate) fn line_fs(occluded: bool) -> String {
+    let defines = if occluded { "#define OCCLUDED\n" } else { "" };
+    format!("#version 300 es\n#define DEPTH_OCTAVES {DEPTH_OCTAVES:.1}\n{defines}{LINE_FS_BODY}")
+}

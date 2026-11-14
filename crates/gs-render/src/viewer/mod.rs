@@ -121,8 +121,9 @@ impl Viewer {
         // loss/restore cycle (`makeXRCompatible` is then a no-op).
         attrs.set_xr_compatible(true);
         // Splat quads have soft edges and the gizmo lines are anti-aliased in
-        // the shader: MSAA would only cost fill-rate. No depth: splats are
-        // sorted and blended, lines are drawn on top.
+        // the shader: MSAA would only cost fill-rate. No depth: sorted splats
+        // have none, and the normalised mode keeps its own in a texture,
+        // which is also what hides the lines behind the splats.
         attrs.set_antialias(false);
         attrs.set_depth(false);
         attrs.set_stencil(false);
@@ -644,20 +645,19 @@ impl Inner {
         let [r, g, b] = params.background;
         gl.clear_color(r, g, b, 1.0);
         gl.clear(GL::COLOR_BUFFER_BIT);
-        {
-            let mut scene = self.scene.borrow_mut();
-            let vp = ViewParams::from_projection(view, &proj, width as f32, height as f32);
-            let output = Output { framebuffer: None, viewport: [0, 0, width as i32, height as i32] };
-            let status = scene.blend_status(&params);
-            if self.prepare_order(&mut scene, status, &view, &params, clip_y, false) == SortOutcome::Deferred {
-                // The order on the GPU is one frame old: draw again next frame.
-                self.dirty.set(true);
-            }
-            self.draw_splats(&mut scene, status, &vp, &params, clip_y, output);
+        let viewport = [0, 0, width as i32, height as i32];
+        let mut scene = self.scene.borrow_mut();
+        let vp = ViewParams::from_projection(view, &proj, width as f32, height as f32);
+        let status = scene.blend_status(&params);
+        if self.prepare_order(&mut scene, status, &view, &params, clip_y, false) == SortOutcome::Deferred {
+            // The order on the GPU is one frame old: draw again next frame.
+            self.dirty.set(true);
         }
+        self.draw_splats(&mut scene, status, &vp, &params, clip_y, Output { framebuffer: None, viewport });
         if params.show_gizmos {
-            self.lines.borrow().draw(&(proj * view), [width as f32, height as f32], NEAR, px_scale, true);
+            self.lines.borrow().draw(&(proj * view), viewport, NEAR, px_scale, true, scene.occlusion());
         }
+        drop(scene);
         self.record_frame(interval, self.now() - start, Some((width, height)));
     }
 

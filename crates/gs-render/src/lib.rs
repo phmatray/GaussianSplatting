@@ -120,7 +120,8 @@ pub mod rig;
 mod glutil;
 #[cfg(target_arch = "wasm32")]
 mod lines;
-#[cfg(target_arch = "wasm32")]
+// Plain strings and constants: compiled everywhere so that the numbers the
+// shaders share with the Rust side can be unit-tested natively.
 mod shaders;
 #[cfg(target_arch = "wasm32")]
 mod splats;

@@ -582,14 +582,31 @@ fn opacity_byte(opacity: f32) -> u8 {
     (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Converts one image row into splats (appended to `out`).
+/// A splat together with the measurement it was made from: what
+/// [`crate::multiview`] needs to compare the observations of several cameras.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SourcedSplat {
+    pub splat: Splat,
+    /// Index of the source pixel in its frame (`y · width + x`).
+    pub pixel: u32,
+    /// Forward depth of the surface point in the source camera, after
+    /// smoothing (meters).
+    pub depth: f32,
+    /// Cosine between the surface normal and the direction to the camera.
+    pub cos: f32,
+    /// Unit surface normal in world space, facing the camera.
+    pub normal: Vec3,
+}
+
+/// Converts one image row into splats, handed to `emit` together with the
+/// pixel index, the pixel's surface and its world normal.
 fn row_to_splats(
     geo: &FrameGeometry,
     frame: &RgbdFrame,
     params: &ReconstructParams,
     mask: Option<&[u8]>,
     y: usize,
-    out: &mut Vec<Splat>,
+    emit: &mut impl FnMut(Splat, usize, &PixelSurface, Vec3),
 ) {
     let cam = geo.cam;
     let rotation = cam.world_from_cam.matrix3;
@@ -612,17 +629,18 @@ fn row_to_splats(
         let shrink = |a: bool, b: bool| if a || b { k * params.edge_shrink } else { k };
         let (ku, kv) = (shrink(s.open[0], s.open[1]), shrink(s.open[2], s.open[3]));
         let rgb = &frame.rgb[i * 3..i * 3 + 3];
+        let normal = rotation * s.n;
         let splat = tangent_splat(
             cam.world_from_cam.transform_point3(p),
             rotation * (s.pu * ku),
             rotation * (s.pv * kv),
-            rotation * s.n,
+            normal,
             params.thickness,
             params.max_anisotropy,
             [rgb[0], rgb[1], rgb[2], alpha],
         );
         if is_finite_splat(&splat) {
-            out.push(splat);
+            emit(splat, i, &s, normal);
         }
     }
 }
@@ -674,6 +692,39 @@ pub fn frame_to_splats(
     mask: Option<&[u8]>,
     out: &mut Vec<Splat>,
 ) -> usize {
+    frame_to(frame, cam, params, mask, out, |splat, _, _, _| splat)
+}
+
+/// [`frame_to_splats`] that keeps, with every splat, the pixel and the
+/// measurement it was made from: the input of the multi-view fusion of
+/// [`crate::multiview`]. The splats are the same, in the same order.
+pub fn frame_to_sourced_splats(
+    frame: &RgbdFrame,
+    cam: &Camera,
+    params: &ReconstructParams,
+    mask: Option<&[u8]>,
+    out: &mut Vec<SourcedSplat>,
+) -> usize {
+    frame_to(frame, cam, params, mask, out, |splat, pixel, surface, normal| SourcedSplat {
+        splat,
+        pixel: pixel as u32,
+        depth: surface.z,
+        cos: surface.cos,
+        normal,
+    })
+}
+
+/// The shared body of [`frame_to_splats`] and [`frame_to_sourced_splats`]:
+/// `make` turns a splat, its pixel index, surface and world normal into the
+/// output element.
+fn frame_to<T: Copy + Send>(
+    frame: &RgbdFrame,
+    cam: &Camera,
+    params: &ReconstructParams,
+    mask: Option<&[u8]>,
+    out: &mut Vec<T>,
+    make: impl Fn(Splat, usize, &PixelSurface, Vec3) -> T + Sync,
+) -> usize {
     let n = frame.width as usize * frame.height as usize;
     if n == 0 || !frame_matches(frame, cam) || mask.is_some_and(|m| m.len() != n) {
         return 0;
@@ -685,14 +736,16 @@ pub fn frame_to_splats(
         // Bands of rows keep the per-task overhead low; concatenating them in
         // order reproduces the serial output exactly.
         const BAND: usize = 8;
-        let bands: Vec<Vec<Splat>> = (0..geo.h.div_ceil(BAND))
+        let bands: Vec<Vec<T>> = (0..geo.h.div_ceil(BAND))
             .into_par_iter()
             .map(|band| {
-                let mut splats = Vec::new();
+                let mut part = Vec::new();
                 for y in band * BAND..((band + 1) * BAND).min(geo.h) {
-                    row_to_splats(&geo, frame, params, mask, y, &mut splats);
+                    row_to_splats(&geo, frame, params, mask, y, &mut |splat, pixel, surface, normal| {
+                        part.push(make(splat, pixel, surface, normal));
+                    });
                 }
-                splats
+                part
             })
             .collect();
         out.reserve(bands.iter().map(Vec::len).sum());
@@ -702,7 +755,9 @@ pub fn frame_to_splats(
     }
     #[cfg(not(feature = "par"))]
     for y in 0..geo.h {
-        row_to_splats(&geo, frame, params, mask, y, out);
+        row_to_splats(&geo, frame, params, mask, y, &mut |splat, pixel, surface, normal| {
+            out.push(make(splat, pixel, surface, normal));
+        });
     }
     out.len() - before
 }
@@ -1691,9 +1746,18 @@ mod tests {
         let geo = FrameGeometry::new(&frame, &cam, &params, params.min_cos);
         let mut serial = Vec::new();
         for y in 0..48 {
-            row_to_splats(&geo, &frame, &params, None, y, &mut serial);
+            row_to_splats(&geo, &frame, &params, None, y, &mut |splat, _, _, _| serial.push(splat));
         }
         assert_eq!(splats_of(&frame, &cam, &params), serial);
+        // The sourced variant yields the same splats with their pixels.
+        let mut sourced = Vec::new();
+        assert_eq!(frame_to_sourced_splats(&frame, &cam, &params, None, &mut sourced), serial.len());
+        assert!(sourced.iter().map(|s| s.splat).eq(serial.iter().copied()));
+        assert!(sourced.windows(2).all(|pair| pair[0].pixel < pair[1].pixel));
+        for s in &sourced {
+            assert!((s.depth - frame.depth[s.pixel as usize]).abs() < 0.05 * s.depth && s.cos > 0.0);
+            assert!((s.normal - s.splat.rotation() * Vec3::Z).length() < 1.0e-3);
+        }
     }
 
     // -- background subtraction ---------------------------------------------

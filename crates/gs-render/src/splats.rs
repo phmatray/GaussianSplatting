@@ -11,6 +11,7 @@ use web_sys::{WebGl2RenderingContext as GL, WebGlBuffer, WebGlProgram, WebGlText
 
 use crate::depth::{DepthWarp, RobustBounds};
 use crate::glutil::{link_program, uniform};
+use crate::lines::Occlusion;
 use crate::normalized::{LayerDraw, Normalized, Output, ViewDraw};
 use crate::pack::{pack_splats, TextureLayout, MIN_ROWS, WORDS_PER_SPLAT};
 use crate::params::{BlendQuality, BlendReason, BlendStatus, LayerContent, NormalizedSupport, RenderParams, LAYER_COUNT};
@@ -408,6 +409,17 @@ impl SplatScene {
         self.normalized.as_ref().ok().and_then(Normalized::target_size)
     }
 
+    /// The visible surface of the view drawn last, when it was drawn in the
+    /// normalised mode and showed any splats: what gizmo lines are hidden
+    /// behind.
+    pub fn occlusion(&self) -> Option<Occlusion<'_>> {
+        if self.detached {
+            return None;
+        }
+        let (depth, near) = self.normalized.as_ref().ok()?.surface()?;
+        Some(Occlusion { depth, near })
+    }
+
     /// Frees the off-screen targets of the normalised mode (they come back
     /// on demand). Cheap when there are none.
     pub fn release_normalized_targets(&mut self) {
@@ -659,6 +671,9 @@ impl SplatScene {
         if self.detached {
             return Ok(());
         }
+        if let Ok(normalized) = &mut self.normalized {
+            normalized.forget_surface();
+        }
         let shown = [params.show_static, params.show_dynamic];
         let mut layers = Vec::with_capacity(LAYER_COUNT);
         for (i, layer) in self.layers.iter().enumerate() {
@@ -683,6 +698,10 @@ impl SplatScene {
     /// `clip_y` is the height above which splats are hidden (`+∞` = none).
     pub fn draw(&mut self, vp: &ViewParams, params: &RenderParams, clip_y: f32) {
         self.drawn = 0;
+        // Whatever surface the normalised mode found last is not this view's.
+        if let Ok(normalized) = &mut self.normalized {
+            normalized.forget_surface();
+        }
         if self.sorted.instances == 0 || self.detached {
             return;
         }

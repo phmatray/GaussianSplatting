@@ -412,11 +412,12 @@ impl Inner {
             // Re-evaluated per eye: a failure in the first eye switches the
             // second one to the sorted fallback as well.
             let status = scene.blend_status(&params);
-            let output = Output { framebuffer: framebuffer.as_ref(), viewport: [viewport.x(), viewport.y(), width, height] };
-            self.draw_splats(&mut scene, status, &vp, &params, clip_y, output);
+            let rect = [viewport.x(), viewport.y(), width, height];
+            self.draw_splats(&mut scene, status, &vp, &params, clip_y, Output { framebuffer: framebuffer.as_ref(), viewport: rect });
             let px_scale = (height as f32 / LINE_REFERENCE_HEIGHT).max(1.0);
-            lines.draw(&(projection * view_matrix), [width as f32, height as f32], vp.near, px_scale, params.show_gizmos);
-            x.views.push(XrViewInfo { viewport: [viewport.x(), viewport.y(), width, height], view: view_matrix, projection });
+            // The off-screen depth still holds this eye's surface.
+            lines.draw(&(projection * view_matrix), rect, vp.near, px_scale, params.show_gizmos, scene.occlusion());
+            x.views.push(XrViewInfo { viewport: rect, view: view_matrix, projection });
             size = (width as u32, height as u32);
         }
         drop(scene);

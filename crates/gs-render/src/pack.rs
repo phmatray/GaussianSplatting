@@ -213,8 +213,15 @@ mod tests {
         // The plane: normal within a tenth of a millirad, reach = larger
         // tangential scale.
         let normal = splat.rotation() * Vec3::Z;
-        assert!(decode_normal(w[10]).angle_between(normal) < 1.0e-4);
+        assert!(angle(decode_normal(w[10]), normal) < 1.0e-4);
         assert_eq!(f32::from_bits(w[11]), 0.2);
+    }
+
+    /// Angle between two unit vectors that are almost equal, radians. (The
+    /// arc cosine of their dot product cannot resolve less than 5·10⁻⁴ rad
+    /// in 32-bit floats.)
+    fn angle(a: Vec3, b: Vec3) -> f32 {
+        a.cross(b).length().atan2(a.dot(b))
     }
 
     #[test]
@@ -236,7 +243,7 @@ mod tests {
                 _ => Vec3::new(unit(), unit(), unit()).normalize_or(Vec3::Z),
             };
             let decoded = decode_normal(encode_normal(n));
-            worst = worst.max(decoded.angle_between(n));
+            worst = worst.max(angle(decoded, n));
             // The side a surfel faces must never flip.
             for eye in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(0.3, -0.5, 0.8)] {
                 if n.dot(eye).abs() > 1.0e-3 {
@@ -247,7 +254,8 @@ mod tests {
         assert!(worst < 1.0e-4, "worst error {worst} rad");
         // Garbage in: a valid direction out.
         for bad in [Vec3::ZERO, Vec3::splat(f32::NAN), Vec3::new(f32::INFINITY, 0.0, 0.0)] {
-            assert_eq!(decode_normal(encode_normal(bad)), Vec3::Z);
+            // (Zero is half a step off the 16-bit grid, so not exactly +Z.)
+            assert!(angle(decode_normal(encode_normal(bad)), Vec3::Z) < 1.0e-4);
         }
     }
 

@@ -439,13 +439,16 @@ mod gl {
         hard: Level,
         soft: Level,
         targets: Option<Targets>,
+        /// Near plane of the view whose surface the first visibility
+        /// texture holds; `None` when it holds nothing usable.
+        surface_near: Option<f32>,
     }
 
     impl Normalized {
         /// Compiles the programs. Call only when the context can render to
         /// half-float targets ([`Self::float_targets`]).
         pub fn new(gl: &GL) -> Result<Self, JsValue> {
-            Ok(Self { hard: Level::new(gl, false)?, soft: Level::new(gl, true)?, targets: None })
+            Ok(Self { hard: Level::new(gl, false)?, soft: Level::new(gl, true)?, targets: None, surface_near: None })
         }
 
         /// Enables rendering to half-float targets. `false` when the context
@@ -459,6 +462,21 @@ mod gl {
         /// Size of the off-screen targets, if any are allocated.
         pub fn target_size(&self) -> Option<(u32, u32)> {
             self.targets.as_ref().map(|t| (t.width, t.height))
+        }
+
+        /// The visible surface of the view drawn last: its encoded depth
+        /// texture and the near plane of the encoding. `None` when the last
+        /// call of [`Self::draw`] drew nothing or [`Self::forget_surface`]
+        /// was called since.
+        pub fn surface(&self) -> Option<(&WebGlTexture, f32)> {
+            let near = self.surface_near?;
+            self.targets.as_ref().map(|t| (&t.depth[0].0, near))
+        }
+
+        /// Declares the surface of the last view stale (something else was
+        /// drawn into the destination since).
+        pub fn forget_surface(&mut self) {
+            self.surface_near = None;
         }
 
         /// The targets for a view of `width × height`; reallocated when the
@@ -478,7 +496,8 @@ mod gl {
         /// nothing was drawn into the output and the GL state is usable.
         pub fn draw(&mut self, gl: &GL, view: &ViewDraw) -> Result<(), String> {
             let [x, y, width, height] = view.output.viewport;
-            if width <= 0 || height <= 0 {
+            self.surface_near = None;
+            if width <= 0 || height <= 0 || view.layers.is_empty() {
                 return Ok(());
             }
             let soft = view.quality == BlendQuality::Soft;
@@ -544,11 +563,13 @@ mod gl {
             gl.active_texture(GL::TEXTURE0);
             gl.depth_mask(true);
             gl.bind_vertex_array(None);
+            self.surface_near = Some(view.vp.near);
             Ok(())
         }
 
         /// Frees the render targets (they are reallocated on demand).
         pub fn release_targets(&mut self, gl: &GL) {
+            self.surface_near = None;
             if let Some(targets) = self.targets.take() {
                 targets.destroy(gl);
             }
