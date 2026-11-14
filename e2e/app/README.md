@@ -26,6 +26,7 @@ vient de `e2e/render` (`npm install` dans ce dossier, ou `GS_NPM_TOOLS`).
 | `server` | Avec `gs-server` : WebSocket, configuration partagée entre deux clients, partage sur le réseau local, origine Tauri simulée, reconnexion. Ignorée si le binaire n'existe pas (`cargo build -p gs-server --release`) |
 | `shared` | Avec `gs-server`, plusieurs clients : une page lente ou figée ne prend pas de retard sur le pipeline (relais du WebSocket par le worker), les commandes suivent l'état renvoyé par le pipeline quel que soit le client qui les change, arrivée en cours de scan, remplacement du serveur pendant un scan, repli sur un WebSocket ouvert par la page quand le worker relais ne démarre pas |
 | `lanvr` | Avec `gs-server --lan` : l'accès https du réseau local avec un Quest 3 émulé, entrée en VR, deux yeux, déplacement, maquette, sortie, maison en VR ; ordinateur doté de son propre casque |
+| `webkit` | Le même build dans WebKitGTK (MiniBrowser sous Xvfb), le moteur de l'application de bureau sous Linux : mode serveur par le relais, mode worker sur la scène et dans la maison. Ignorée si MiniBrowser, `xvfb-run` ou `import` manquent |
 | `soak` | Mémoire sur la durée (`SOAK_S`, 40 s par défaut, 180 pour une vraie vérification) : tas JavaScript, mémoire WebAssembly de la page et du worker, nœuds du document, en mode worker (scène, maison scannée en boucle) et en mode serveur |
 | `perf` | Tailles du build, cadence du worker et de l'affichage, durée d'un scan complet |
 
@@ -39,6 +40,7 @@ Variables d'environnement:
 | `GS_APP_PORT=8110` | Premier port essayé par le serveur statique |
 | `GS_SERVER_BIN=chemin` | Binaire `gs-server` des suites `server`, `shared`, `lanvr` et `soak` (par défaut `target/release/gs-server`) |
 | `SOAK_S=180` | Durée de la suite `soak`, en secondes |
+| `WEBKIT_S=25`, `WEBKIT_MINIBROWSER=chemin` | Durée de chaque session de la suite `webkit` et emplacement de MiniBrowser |
 | `GS_NPM_TOOLS`, `IWER_BUNDLE` | Où trouver l'émulateur IWER |
 
 Chaque suite se lance aussi seule : `node e2e/app/house.cjs` (`BUILD=1` pour

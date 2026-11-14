@@ -34,7 +34,7 @@ pub fn Overlays() -> impl IntoView {
             <div class="pill" id="done-pill" data-state="done">
                 <Icon name="check" />
                 <span>"Scan terminé"</span>
-                <button type="button" id="visit-house" class="pill-action" on:click=move |_| with_core(|core| core.set_display(|d| d.dollhouse = false))>
+                <button type="button" id="visit-house" class="pill-action" on:click=move |_| with_core(|core| core.visit_house())>
                     "Visiter la maison"
                 </button>
             </div>

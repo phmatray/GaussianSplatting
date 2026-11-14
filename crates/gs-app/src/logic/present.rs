@@ -12,6 +12,11 @@ use gs_render::{FrustumGizmo, GizmoScene, GridGizmo, NavMode, SceneHints};
 /// margin (meters): the ceiling surfels and their fringe go, the walls stay.
 pub const DOLLHOUSE_CLIP_MARGIN: f32 = 0.15;
 
+/// The scan head and its path are not drawn while the viewer stands this
+/// close to the main sensor (meters): seen through a sensor, the outlines
+/// of the head and the path it stands on would cross the whole picture.
+pub const HEAD_HIDE_RADIUS: f32 = 0.4;
+
 const RIG_COLOR: [f32; 3] = [0.36, 0.72, 1.0];
 const HANDHELD_COLOR: [f32; 3] = [1.0, 0.5, 0.3];
 const GRID_COLOR: [f32; 3] = [0.3, 0.36, 0.46];
@@ -96,6 +101,13 @@ pub fn sensor_camera(scan: &ScanStats, id: u32) -> Option<CameraInfo> {
     }
 }
 
+/// True when a viewer at `eye` stands inside the scan head (there is one
+/// only while a scan is under way).
+pub fn inside_scan_head(scan: &ScanStats, eye: Vec3) -> bool {
+    let head = Vec3::from_slice(&scan.camera.world_from_cam[12..15]);
+    matches!(scan.state, ScanState::Scanning | ScanState::Paused) && eye.distance(head) < HEAD_HIDE_RADIUS
+}
+
 fn frustum(info: &CameraInfo, color: [f32; 3], size: f32) -> FrustumGizmo {
     let aspect = if info.height > 0 { info.width as f32 / info.height as f32 } else { 4.0 / 3.0 };
     FrustumGizmo { world_from_cam: Mat4::from_cols_array(&info.world_from_cam), fov_y: info.fov_y, aspect, color, size }
@@ -105,8 +117,9 @@ fn frustum(info: &CameraInfo, color: [f32; 3], size: f32) -> FrustumGizmo {
 /// the scan path and the sensor head in the house while it is being
 /// scanned (the sensor that looks ahead stands out, the others are drawn
 /// smaller). Once the scan is done the house is shown bare, for walking
-/// through it.
-pub fn gizmos(state: &SessionState, scan: Option<&ScanStats>) -> GizmoScene {
+/// through it, and so it is while the viewer looks through the head
+/// (`show_head` false, see [`inside_scan_head`]).
+pub fn gizmos(state: &SessionState, scan: Option<&ScanStats>, show_head: bool) -> GizmoScene {
     match state.config.scene {
         SceneKind::Stage => GizmoScene {
             grid: Some(GridGizmo { center: Vec3::ZERO, half_extent: 4.0, step: 0.5, color: GRID_COLOR }),
@@ -115,7 +128,7 @@ pub fn gizmos(state: &SessionState, scan: Option<&ScanStats>) -> GizmoScene {
         },
         SceneKind::House => {
             let scan_state = scan.map_or(ScanState::Idle, |s| s.state);
-            if scan_state == ScanState::Done {
+            if scan_state == ScanState::Done || !show_head {
                 return GizmoScene::default();
             }
             let path = state.scan.as_ref().map(|s| s.path.iter().map(|p| Vec3::from_array(*p)).collect()).unwrap_or_default();
@@ -271,7 +284,7 @@ mod tests {
     #[test]
     fn stage_shows_the_rig_and_a_grid() {
         let state = stage_state();
-        let scene = gizmos(&state, None);
+        let scene = gizmos(&state, None, true);
         assert_eq!(scene.frusta.len(), 5);
         assert!(scene.grid.is_some() && scene.path.is_empty() && scene.handheld.is_none());
         // The gizmo sits where the camera is.
@@ -288,20 +301,20 @@ mod tests {
     #[test]
     fn house_shows_the_path_until_the_scan_is_done() {
         let state = house_state();
-        let idle = gizmos(&state, None);
+        let idle = gizmos(&state, None, true);
         assert!(idle.path.len() > 10 && idle.handheld.is_none() && idle.grid.is_none() && idle.frusta.is_empty());
 
         let mut scan = ScanStats { state: ScanState::Scanning, progress: 0.3, ..ScanStats::default() };
         scan.camera.world_from_cam[12..15].copy_from_slice(&[1.0, 1.4, -2.0]);
         scan.camera.width = 144;
         scan.camera.height = 108;
-        let scanning = gizmos(&state, Some(&scan));
+        let scanning = gizmos(&state, Some(&scan), true);
         let handheld = scanning.handheld.expect("handheld camera while scanning");
         assert_eq!(handheld.world_from_cam.transform_point3(Vec3::ZERO), Vec3::new(1.0, 1.4, -2.0));
         assert_eq!(scanning.path.len(), idle.path.len());
 
         scan.state = ScanState::Done;
-        assert_eq!(gizmos(&state, Some(&scan)), GizmoScene::default());
+        assert_eq!(gizmos(&state, Some(&scan), true), GizmoScene::default());
         assert_eq!(default_nav(SceneKind::House), NavMode::Fly);
         assert!(default_splat_scale(SceneKind::House) > default_splat_scale(SceneKind::Stage));
         assert_eq!(default_splat_scale(SceneKind::Stage), 1.0);
@@ -356,17 +369,24 @@ mod tests {
         }
         assert_eq!(sensor_camera(&scan, 9), None);
 
-        let scene = gizmos(&state, Some(&scan));
+        let scene = gizmos(&state, Some(&scan), true);
         assert!(scene.handheld.is_some());
         assert_eq!(scene.frusta.len(), 4);
         assert!(scene.frusta.iter().all(|f| f.size < scene.handheld.unwrap().size));
+
+        // Seen through one of its sensors neither the head nor its path is drawn.
+        let (eye, _) = camera_view(&sensor_camera(&scan, 2).unwrap(), 1.0);
+        assert!(inside_scan_head(&scan, eye));
+        assert!(!inside_scan_head(&scan, eye + Vec3::new(0.0, 0.0, 1.0)));
+        assert!(!inside_scan_head(&ScanStats { state: ScanState::Idle, ..scan }, eye));
+        assert_eq!(gizmos(&state, Some(&scan), false), GizmoScene::default());
 
         // A head with one sensor is the mobile camera, alone.
         let (state, scan) = scanning_stats(ScanHead::Single);
         assert_eq!(camera_ids(&state), [0]);
         assert_eq!(sensor_label(ScanHead::Single, 0), "Caméra mobile");
         assert_eq!(sensor_label(ScanHead::Single, 3), "Capteur");
-        let scene = gizmos(&state, Some(&scan));
+        let scene = gizmos(&state, Some(&scan), true);
         assert!(scene.handheld.is_some() && scene.frusta.is_empty());
         // The stage lists its ring cameras.
         assert_eq!(camera_ids(&stage_state()), [0, 1, 2, 3, 4]);

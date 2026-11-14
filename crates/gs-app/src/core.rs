@@ -110,6 +110,8 @@ pub struct Core {
     overview_pending: Cell<bool>,
     /// Scan state and handheld pose the gizmos were last built for.
     handheld: Cell<Option<(ScanState, CameraInfo)>>,
+    /// The viewer stands inside the scan head, whose gizmos are hidden.
+    in_scan_head: Cell<bool>,
     errors: RefCell<Vec<String>>,
     notice_serial: Cell<u32>,
     /// RGBA pixels of the thumbnail being painted.
@@ -147,6 +149,7 @@ pub fn start(canvas: HtmlCanvasElement, ui: Ui) {
         saved_view: Cell::new(None),
         overview_pending: Cell::new(false),
         handheld: Cell::new(None),
+        in_scan_head: Cell::new(false),
         errors: RefCell::new(Vec::new()),
         notice_serial: Cell::new(0),
         scratch: RefCell::new(Vec::new()),
@@ -383,8 +386,6 @@ impl Core {
         let session = self.session.borrow();
         let Some(state) = session.as_ref() else { return };
         self.viewer.set_scene_hints(present::scene_hints(state));
-        let scan = self.last_stats.get().and_then(|s| s.scan);
-        self.viewer.set_gizmos(&present::gizmos(state, scan.as_ref()));
         if reset_view {
             let nav = present::default_nav(state.config.scene);
             self.saved_view.set(None);
@@ -398,7 +399,27 @@ impl Core {
             self.overview_pending.set(state.config.scene == SceneKind::House);
         }
         drop(session);
+        self.update_gizmos();
         self.apply_params();
+    }
+
+    /// Rebuilds the gizmos of the live session for the latest scan
+    /// statistics and the place the viewer stands at.
+    fn update_gizmos(&self) {
+        let session = self.session.borrow();
+        let Some(state) = session.as_ref() else { return };
+        if self.file.get().is_some() {
+            return;
+        }
+        let scan = self.last_stats.get().and_then(|s| s.scan);
+        let inside = self.viewer_in_scan_head();
+        self.in_scan_head.set(inside);
+        self.viewer.set_gizmos(&present::gizmos(state, scan.as_ref(), !inside));
+    }
+
+    fn viewer_in_scan_head(&self) -> bool {
+        let scan = self.last_stats.get().and_then(|s| s.scan);
+        scan.is_some_and(|scan| present::inside_scan_head(&scan, self.viewer.eye()))
     }
 
     fn on_stats(&self, json: &str) {
@@ -416,10 +437,8 @@ impl Core {
 
         // The handheld camera gizmo follows the scan.
         let handheld = stats.scan.map(|s| (s.state, s.camera));
-        if handheld != self.handheld.replace(handheld) && self.file.get().is_none() {
-            if let Some(state) = self.session.borrow().as_ref() {
-                self.viewer.set_gizmos(&present::gizmos(state, stats.scan.as_ref()));
-            }
+        if handheld != self.handheld.replace(handheld) {
+            self.update_gizmos();
         }
 
         // A scan is best watched from above: the rooms appear one after the
@@ -556,9 +575,9 @@ impl Core {
         } else if !new.dollhouse && old.dollhouse {
             if let Some((eye, target, nav)) = self.saved_view.take() {
                 new.nav = nav;
-                self.viewer.set_nav_mode(nav);
                 self.viewer.set_view(eye, target);
             }
+            self.viewer.set_nav_mode(new.nav);
         } else if new.nav != old.nav {
             self.viewer.set_nav_mode(new.nav);
         }
@@ -604,6 +623,20 @@ impl Core {
         });
     }
 
+    /// Leaves the overview for a visit of the scanned house: inside, at
+    /// the pose the scene proposes, whatever was looked at before.
+    pub fn visit_house(&self) {
+        let start = self.session.borrow().as_ref().map(|s| s.viewer_start);
+        self.saved_view.set(None);
+        self.set_display(|d| {
+            d.dollhouse = false;
+            d.nav = NavMode::Fly;
+        });
+        if let Some(start) = start {
+            self.viewer.set_view(Vec3::from_array(start.eye), Vec3::from_array(start.target));
+        }
+    }
+
     /// Looks at the scene from the camera of a thumbnail: a rig camera
     /// of the stage (in orbit around what it aims at), or a sensor of the
     /// scan head where the scan last saw it (in fly mode).
@@ -626,6 +659,7 @@ impl Core {
                 d.nav = nav;
             });
             self.viewer.set_view(eye, target);
+            self.update_gizmos();
         }
     }
 
@@ -839,6 +873,10 @@ impl Core {
     /// Twice per second: viewer statistics, data rate, VR errors.
     fn on_timer(&self) {
         Ui::set_if_changed(self.ui.viewer_stats, self.viewer.stats());
+        // The viewer walked into or out of a scan head that stands still.
+        if self.viewer_in_scan_head() != self.in_scan_head.get() {
+            self.update_gizmos();
+        }
         let now = dom::now_ms();
         let (start, bytes_then) = self.rate_window.get();
         let bytes_now = self.counters.get().bytes;
@@ -894,6 +932,11 @@ impl Core {
 
     pub fn last_stats(&self) -> Option<Stats> {
         self.last_stats.get()
+    }
+
+    /// The viewer looks through the scan head, whose gizmos are hidden.
+    pub fn in_scan_head(&self) -> bool {
+        self.in_scan_head.get()
     }
 
     pub fn is_file_mode(&self) -> bool {

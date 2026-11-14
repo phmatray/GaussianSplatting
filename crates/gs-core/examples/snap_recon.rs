@@ -13,7 +13,7 @@
 //!   --noise                      realistic sensor noise
 //!   --light                      start from PipelineConfig::light
 //!   --no-png                     numbers only
-//!   --half-res                   held-out views at 160x120 instead of 320x240
+//!   --half-res                   held-out views of the stage at 160x120 instead of 320x240
 //!   --previews-from <seconds>    where on the walk the preview strip starts (default 24)
 //! ```
 //!
@@ -278,7 +278,7 @@ fn house_previews(options: &Options) {
         client.apply(&out);
     }
     let mut rows = Vec::new();
-    for (k, strip) in strips.iter().enumerate() {
+    for (k, strip) in strips.iter().enumerate().filter(|(_, strip)| !strip.is_empty()) {
         println!(
             "  previews of sensor {k}: {} consecutive frames, walking time {:.2} s to {:.2} s",
             strip.len(),
@@ -286,6 +286,11 @@ fn house_previews(options: &Options) {
             spans[k].1
         );
         rows.extend(strip.chunks(STRIP_COLUMNS).map(|chunk| row_of(chunk, STRIP_COLUMNS)));
+    }
+    if rows.is_empty() {
+        // Previews switched off by a patch, or a start beyond the walk.
+        println!("  no previews after {:.1} s of walking: house_previews.png not written", options.previews_from);
+        return;
     }
     save_png(&options.out.join("house_previews.png"), &stack(&rows));
 }

@@ -318,14 +318,16 @@ fn the_scan_head_is_carried_calmly() {
          changing by at most {peak_change:.2} deg/s per tick; walks at up to {fastest:.2} m/s",
         path.duration()
     );
-    // Measured: mean 20.3 deg/s, peak 37.4 deg/s (the look-around sweep of
+    // Measured: mean 20.0 deg/s, peak 36.7 deg/s (the look-around sweep of
     // one camera that this head replaces averaged 133 deg/s and peaked at
     // 215). From one tick to the next the angular speed changes by at most
-    // 7.6 deg/s, at the one moment near the end of the walk where the head
-    // stops turning, and by less than 2 deg/s otherwise.
+    // 1.29 deg/s, which is 39 deg/s in a second. Before the head averaged
+    // the heading of the path over a second it jumped by 7.6 deg/s in one
+    // tick, a good second before the end of the walk, where that heading
+    // freezes.
     assert!(peak <= 40.0, "a sensor turns at {peak} deg/s");
     assert!(mean_rate <= 22.0, "the sensors turn at {mean_rate} deg/s on average");
-    assert!(peak_change <= 9.0, "the angular speed jumps by {peak_change} deg/s between two ticks");
+    assert!(peak_change <= 2.0, "the angular speed jumps by {peak_change} deg/s between two ticks");
     assert!(fastest <= scan.speed * 1.02, "the head moves at {fastest} m/s");
 
     // The frames each sensor takes (this is what its preview shows): the
@@ -344,8 +346,8 @@ fn the_scan_head_is_carried_calmly() {
         last[k] = Some(cam);
     }
     println!("scan head: at most {turn:.1?} degrees and {way:.2?} m between consecutive frames of each sensor");
-    // Measured: 12.4 degrees and 0.27 m for the forward sensor, which takes
-    // every other frame; 46.7 to 48.1 degrees and 1.07 m for the others, in
+    // Measured: 12.2 degrees and 0.27 m for the forward sensor, which takes
+    // every other frame; 46.6 to 47.7 degrees and 1.07 m for the others, in
     // the 1.33 s between their frames, always turning the way the walk
     // turns. The sweep threw its one camera up to 29 degrees between any
     // two frames, back and forth.
@@ -387,7 +389,7 @@ fn the_reported_scan_camera_moves_steadily_tick_after_tick() {
         assert!(ticks < 10_000, "the scan never finishes");
     }
     println!("reported scan cameras: at most {peak_turn:.2} degrees and {:.1} mm per tick, {ticks} ticks", 1e3 * peak_step);
-    // Measured: 1.25 degrees and 26.7 mm per tick (37.4 deg/s, 0.8 m/s).
+    // Measured: 1.22 degrees and 26.7 mm per tick (36.7 deg/s, 0.8 m/s).
     assert!(peak_turn <= 40.0 / 30.0, "a reported camera turns {peak_turn} degrees in one tick");
     assert!(peak_step <= 0.03, "a reported camera jumps {peak_step} m in one tick");
     // Every sensor delivered previews under its own id.
@@ -454,10 +456,10 @@ fn house_full_scan() {
         100.0 * mean(&coverages_observed),
         100.0 * min(&coverages_observed),
     );
-    // Measured: 423 762 splats; PSNR mean 21.79 dB (worst 19.37); coverage
-    // mean 99.87 % (worst 97.96 %). On the pixels whose surface point some
-    // scan frame has seen: PSNR mean 21.98 dB (worst 19.42), coverage mean
-    // 99.98 % (worst 99.85 %). What keeps the PSNR below 22 dB is the cell
+    // Measured: 423 672 splats; PSNR mean 21.79 dB (worst 18.95); coverage
+    // mean 99.86 % (worst 97.95 %). On the pixels whose surface point some
+    // scan frame has seen: PSNR mean 21.98 dB (worst 19.00), coverage mean
+    // 99.98 % (worst 99.79 %). What keeps the PSNR below 22 dB is the cell
     // size: 3.2 cm cells are 2 to 3 pixels wide in these views, which blurs
     // every color edge of the patterned rugs, tiles and pictures. The 0.4 %
     // of the pixels that the scan never saw (floor behind furniture, the
@@ -469,12 +471,53 @@ fn house_full_scan() {
     assert!(scan.cloud.len() <= 440_000, "{} splats", scan.cloud.len());
     assert!(scan.cloud.len() >= 380_000, "{} splats", scan.cloud.len());
     assert!(mean(&psnrs) >= 21.4, "mean PSNR {:.2} dB", mean(&psnrs));
-    assert!(min(&psnrs) >= 18.9, "worst PSNR {:.2} dB", min(&psnrs));
+    // The worst view (the kitchen seen from the dining room, past a lamp
+    // shade the scan sees edge-on) is touchy: turning the head by 2 degrees
+    // here and there moves it by 0.4 dB while the mean stays put, so its
+    // bound keeps that much distance.
+    assert!(min(&psnrs) >= 18.6, "worst PSNR {:.2} dB", min(&psnrs));
     assert!(mean(&coverages) >= 0.996, "mean coverage {:.4}", mean(&coverages));
     assert!(min(&coverages) >= 0.973, "worst coverage {:.4}", min(&coverages));
     assert!(mean(&psnrs_observed) >= 21.6, "mean observed PSNR {:.2} dB", mean(&psnrs_observed));
     assert!(mean(&coverages_observed) >= 0.998, "mean observed coverage {:.4}", mean(&coverages_observed));
     assert!(min(&coverages_observed) >= 0.993, "worst observed coverage {:.4}", min(&coverages_observed));
+}
+
+#[test]
+fn house_light_preset_scan() {
+    // What the WebAssembly worker runs on a laptop or a headset: sensors of
+    // 144x108 taking 5 frames per second into 4 cm cells, so each of the
+    // four side, up and down sensors fires only every 1.6 s.
+    let mut config = PipelineConfig::light(SceneKind::House);
+    config.scan.autostart = false;
+    config.preview.enabled = false;
+    let mut pipeline = Pipeline::new(config);
+    let mut client = Client::default();
+    let ticks = run_full_scan(&mut pipeline, &mut client);
+    let cloud = client.cloud();
+    let snap = make_scene(SceneKind::House).snapshot(0.0);
+    let (mut psnrs, mut coverages) = (Vec::new(), Vec::new());
+    // Every other standard view (one direction per spot) and the views at
+    // ceilings, corners and floors.
+    for view in house_views().into_iter().step_by(2).chain(house_look_around_views()) {
+        let score = evaluate(&snap, &cloud, &view.cam, config.shadows, None);
+        psnrs.push(score.psnr);
+        coverages.push(score.coverage);
+    }
+    println!(
+        "house light: {} splats in {ticks} ticks; PSNR mean {:.2} dB (worst {:.2}), \
+         coverage mean {:.2} % (worst {:.2})",
+        cloud.len(),
+        mean(&psnrs),
+        min(&psnrs),
+        100.0 * mean(&coverages),
+        100.0 * min(&coverages),
+    );
+    // Measured: 280 304 splats; PSNR mean 22.71 dB (worst 19.60), coverage
+    // mean 99.86 % (worst 97.90 %).
+    assert!((250_000..=300_000).contains(&cloud.len()), "{} splats", cloud.len());
+    assert!(mean(&psnrs) >= 22.3 && min(&psnrs) >= 19.1, "{psnrs:?}");
+    assert!(mean(&coverages) >= 0.996 && min(&coverages) >= 0.973, "{coverages:?}");
 }
 
 #[test]
@@ -494,7 +537,7 @@ fn house_ceilings_corners_and_floors_are_scanned() {
     }
     save_sheet("house_look_around.png", &scores);
     println!("look around: mean {:.2} dB, worst {:.2} dB", mean(&psnrs), min(&psnrs));
-    // Measured: every view fully covered; mean 25.78 dB, worst 21.04 dB (the
+    // Measured: every view fully covered; mean 25.73 dB, worst 20.94 dB (the
     // kitchen ceiling with its beams and lamp cords). A single sensor that
     // only looks ahead leaves holes over 5 to 8 % of three of these views,
     // which then score 14.6 to 16 dB.

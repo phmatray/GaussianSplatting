@@ -74,9 +74,10 @@ impl ScanHead {
         }
         // Three sensors 120 degrees apart around the vertical axis, so the
         // side ones also look back over the operator's shoulders: at 90
-        // degrees they leave a fifth more of the visible surface unscanned. Up and down are tilted 60 degrees, not 90: with a
-        // vertical field of view of 80 degrees they overlap the forward
-        // sensor and still reach past the zenith and the operator's feet.
+        // degrees they leave a fifth more of the visible surface unscanned.
+        // Up and down are tilted 60 degrees, not 90: with a vertical field
+        // of view of 80 degrees they overlap the forward sensor and still
+        // reach past the zenith and the operator's feet.
         const SURROUND: [SensorMount; 5] =
             [mount(0.0, 0.0), mount(120.0, 0.0), mount(-120.0, 0.0), mount(0.0, 60.0), mount(0.0, -60.0)];
         match self {
@@ -712,6 +713,68 @@ mod tests {
         assert_eq!((1..=9).map(cam).collect::<CameraList>(), list);
         assert!(serde_json::from_str::<CameraList>(r#"{"id":1}"#).is_err());
         assert!(serde_json::from_str::<CameraList>(r#"[{"id":"x"}]"#).is_err());
+    }
+
+    #[test]
+    fn messages_written_before_the_scan_head_still_parse() {
+        // Verbatim what protocol version 1 sent before the head existed: a
+        // configuration without `scan.head`, Stats without `extra_cameras`.
+        let config = r#"{"scene":"house","target_hz":30.0,"time_scale":1.0,"paused":false,"shadows":true,
+            "background_subtraction":true,
+            "scan":{"voxel_size":0.032,"speed":0.8,"fov_y_deg":90.0,"width":192,"height":144,"max_range":6.0,
+                    "frames_per_second":6.0,"autostart":true},
+            "preview":{"enabled":true,"max_width":96,"cameras_per_tick":1}}"#;
+        let config: PipelineConfig = serde_json::from_str(config).unwrap();
+        // The head is the new default; everything that was sent is kept.
+        assert_eq!(config.scan, ScanConfig { fov_y_deg: 90.0, ..ScanConfig::default() });
+        assert_eq!(config.sanitized(), config);
+        let control = r#"{"type":"set_config","config":{"scene":"house","scan":{"voxel_size":0.04}}}"#;
+        let ControlMsg::SetConfig { config } = serde_json::from_str(control).unwrap() else { panic!() };
+        assert_eq!((config.scan.head, config.scan.voxel_size), (ScanHead::Surround, 0.04));
+
+        let stats = r#"{"tick":12,"scene_time":1.5,"capture_ms":9.5,"reconstruct_ms":5.0,"encode_ms":0.2,
+            "total_ms":15.0,"tick_hz":30.0,"splats_static":1000,"splats_dynamic":0,"bytes":16000,"pixels":27648,
+            "scan":{"state":"scanning","progress":0.02,
+                    "camera":{"id":0,"world_from_cam":[1,0,0,0,0,1,0,0,0,0,1,0,-0.3,1.4,3.4,1],"fov_y":1.5707964,
+                              "width":192,"height":144}}}"#;
+        let stats: Stats = serde_json::from_str(stats).unwrap();
+        let scan = stats.scan.unwrap();
+        assert_eq!((stats.tick, scan.state, scan.camera.width), (12, ScanState::Scanning, 192));
+        assert!(scan.extra_cameras.is_empty());
+        // And the other way: a reader that ignores unknown fields, as every
+        // struct here does, loses nothing but the extra sensors.
+        let state = r#"{"version":1,"scene":"house","config":{"scene":"house","scan":{"head":"single"}},"cameras":[]}"#;
+        assert_eq!(serde_json::from_str::<SessionState>(state).unwrap().config.scan.head, ScanHead::Single);
+    }
+
+    #[test]
+    fn hostile_camera_lists_stay_bounded() {
+        let camera = serde_json::to_string(&CameraInfo::default()).unwrap();
+        let thousand = format!("[{}]", vec![camera.as_str(); 1000].join(","));
+        let list: CameraList = serde_json::from_str(&thousand).unwrap();
+        assert_eq!(list.len(), CameraList::CAPACITY);
+        assert!(std::mem::size_of::<Stats>() < 1024, "Stats is copied around every tick");
+        let json = format!(r#"{{"scan":{{"extra_cameras":{thousand}}}}}"#);
+        let stats: Stats = serde_json::from_str(&json).unwrap();
+        assert_eq!(stats.scan.unwrap().extra_cameras.len(), CameraList::CAPACITY);
+        assert_eq!(serde_json::from_str::<CameraList>("[]").unwrap(), CameraList::new());
+        // Cameras with missing or absurd numbers are data like any other;
+        // only something that is not a list of cameras is refused.
+        let odd: CameraList = serde_json::from_str(r#"[{}, {"id":4000000000,"fov_y":-1e30,"width":0}]"#).unwrap();
+        assert_eq!((odd.len(), odd[0], odd[1].id), (2, CameraInfo::default(), 4_000_000_000));
+        for bad in ["null", "7", r#""all""#, "[7]", "[null]", r#"[{"world_from_cam":[1,2,3]}]"#, r#"[{"id":-1}]"#] {
+            assert!(serde_json::from_str::<CameraList>(bad).is_err(), "{bad} was accepted");
+        }
+        // The head is a closed set of names: nothing numeric to clamp.
+        for bad in ["null", "0", "1000", r#""""#, r#""Surround""#, "[]", r#"{"sensors":0}"#] {
+            let json = format!(r#"{{"head":{bad}}}"#);
+            assert!(serde_json::from_str::<ScanConfig>(&json).is_err(), "head {bad} was accepted");
+        }
+        for head in [ScanHead::Single, ScanHead::Surround] {
+            assert!((1..=ScanHead::MAX_SENSORS).contains(&head.mounts().len()));
+            assert!(!head.firing_order().is_empty());
+            assert!(head.mounts().iter().all(|m| m.yaw_deg.abs() <= 180.0 && m.pitch_deg.abs() <= 90.0));
+        }
     }
 
     #[test]

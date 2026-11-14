@@ -256,6 +256,12 @@ pub const SCAN_TILT_AMPLITUDE: f32 = 0.052;
 pub const SCAN_TILT_PERIOD: f32 = 7.0;
 /// Phase of the pitch sway at the start of the walk, radians.
 const SCAN_TILT_PHASE: f32 = 0.6;
+/// The scan head faces the walking direction averaged over this many seconds
+/// of walking time, half of them ahead and half behind: hands do not follow
+/// every change of direction at once.
+const SCAN_HEADING_WINDOW: f32 = 1.0;
+/// Spacing of the heading samples that are averaged, seconds.
+const SCAN_HEADING_STEP: f32 = 0.125;
 
 /// When, and by which sensor of the head, a frame of the home scan is taken.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -267,8 +273,11 @@ pub struct ScanFrame {
 }
 
 /// Number of sensor frames of the whole walk along `path`.
+///
+/// The frame rate counts as [`ScanConfig::sanitized`] leaves it, which is
+/// how the pipeline uses it: the count is bounded whatever `scan` holds.
 pub fn scan_frame_count(path: &ScanPath, scan: &ScanConfig) -> u64 {
-    last_scan_frame(path.duration() as f64, scan) + 1
+    last_scan_frame(path.duration() as f64, scan).saturating_add(1)
 }
 
 /// Frame `index` of the home scan: the sensors fire one at a time in
@@ -283,14 +292,22 @@ pub fn scan_frame(path: &ScanPath, scan: &ScanConfig, index: u64) -> ScanFrame {
     }
 }
 
+/// Sensor frames per second of walking time. Sanitized, so that a
+/// configuration that never went through a pipeline (zero, negative or
+/// infinite rate, not a number) cannot ask for frames without end.
+fn scan_frame_rate(scan: &ScanConfig) -> f64 {
+    scan.sanitized().frames_per_second as f64
+}
+
 /// Index of the last frame of a walk of `duration` seconds.
 fn last_scan_frame(duration: f64, scan: &ScanConfig) -> u64 {
-    (duration * scan.frames_per_second as f64).ceil() as u64
+    // The cast saturates; a duration that is not a number gives frame 0.
+    (duration * scan_frame_rate(scan)).ceil() as u64
 }
 
 /// Walking time of frame `index` of a walk of `duration` seconds.
 fn scan_frame_time(duration: f64, scan: &ScanConfig, index: u64) -> f64 {
-    (index as f64 / scan.frames_per_second as f64).min(duration)
+    (index as f64 / scan_frame_rate(scan)).min(duration)
 }
 
 /// The sensor that takes frame `index`.
@@ -307,16 +324,19 @@ pub fn scan_camera(path: &ScanPath, time: f32, scan: &ScanConfig) -> Camera {
 
 /// Pose of sensor `sensor` of the scan head at walking time `time` (seconds,
 /// clamped to the path; a time that is not a number counts as 0, a sensor
-/// the head does not have as sensor 0).
+/// the head does not have as sensor 0). Field of view and image size are
+/// taken from `scan` as they are.
 ///
 /// The head rides along `path` at eye height and faces the walking direction
 /// ([`ScanPath::heading_at`], which the walker keeps from swinging faster
-/// than about 35 degrees per second), with the slow, small sway of something
-/// carried by hand: [`SCAN_PAN_AMPLITUDE`] of yaw and [`SCAN_TILT_AMPLITUDE`]
-/// of pitch. Every sensor is rigidly mounted on it at its
-/// [`ScanHead::mounts`] angles, so all of them turn at the same, calm rate:
-/// 20 degrees per second on average and never more than 38 on the house
-/// tour.
+/// than about 35 degrees per second, averaged over one second so that the
+/// head also starts and stops turning gently), with the slow, small sway of
+/// something carried by hand: [`SCAN_PAN_AMPLITUDE`] of yaw and
+/// [`SCAN_TILT_AMPLITUDE`] of pitch. Every sensor is rigidly mounted on it
+/// at its [`ScanHead::mounts`] angles, so all of them turn at the same, calm
+/// rate: 20 degrees per second on average and never more than 37 on the
+/// house tour, and that rate changes by at most 43 degrees per second in a
+/// second.
 ///
 /// The coverage comes from the number of sensors, not from sweeping one
 /// camera about: [`ScanHead::Surround`] sees floor, ceiling and both side
@@ -324,20 +344,80 @@ pub fn scan_camera(path: &ScanPath, time: f32, scan: &ScanConfig) -> Camera {
 /// sweep of some 200 degrees per second to scan as much, which no one
 /// filming a house would do.
 pub fn scan_sensor(path: &ScanPath, time: f32, scan: &ScanConfig, sensor: u32) -> Camera {
-    use std::f32::consts::{PI, TAU};
-    let t = if time.is_finite() { time.clamp(0.0, path.duration()) } else { 0.0 };
-    let heading = path.heading_at(t);
-    let pan = SCAN_PAN_AMPLITUDE * (TAU * t / SCAN_PAN_PERIOD).sin();
-    let tilt = SCAN_TILT_AMPLITUDE * (TAU * t / SCAN_TILT_PERIOD + SCAN_TILT_PHASE).sin();
-    // A camera looks along its -Z axis; half a turn brings that to +Z, where
-    // `atan2(x, z)` measures the heading from. Positive tilt looks up.
-    let head = Quat::from_rotation_y(heading.x.atan2(heading.z) + pan + PI) * Quat::from_rotation_x(tilt);
-    let mounts = scan.head.mounts();
-    let mount = mounts.get(sensor as usize).unwrap_or(&mounts[0]);
-    let rotation =
-        head * Quat::from_rotation_y(mount.yaw_deg.to_radians()) * Quat::from_rotation_x(mount.pitch_deg.to_radians());
-    let world_from_cam = Affine3A::from_rotation_translation(rotation, path.position_at(t));
-    Camera::from_pose(world_from_cam, scan.fov_y_deg.to_radians(), scan.width, scan.height)
+    ScanHeadPose::at(path, time).sensor(scan, sensor)
+}
+
+/// Where the scan head is and which way it faces.
+#[derive(Clone, Copy)]
+struct ScanHeadPose {
+    position: Vec3,
+    /// Head-to-world rotation. The head looks along its -Z axis, like a
+    /// camera.
+    rotation: Quat,
+}
+
+impl ScanHeadPose {
+    /// The head at walking time `time` (see [`scan_sensor`]).
+    fn at(path: &ScanPath, time: f32) -> Self {
+        use std::f32::consts::{PI, TAU};
+        // `max` and `min` rather than `clamp`, which panics on a path whose
+        // duration is not a number.
+        let t = if time.is_finite() { time.max(0.0).min(path.duration()) } else { 0.0 };
+        let heading = smoothed_heading(path, t);
+        let pan = SCAN_PAN_AMPLITUDE * (TAU * t / SCAN_PAN_PERIOD).sin();
+        let tilt = SCAN_TILT_AMPLITUDE * (TAU * t / SCAN_TILT_PERIOD + SCAN_TILT_PHASE).sin();
+        // A camera looks along its -Z axis; half a turn brings that to +Z,
+        // where `atan2(x, z)` measures the heading from. Positive tilt looks
+        // up.
+        let rotation = Quat::from_rotation_y(heading.x.atan2(heading.z) + pan + PI) * Quat::from_rotation_x(tilt);
+        Self { position: path.position_at(t), rotation }
+    }
+
+    /// Sensor `sensor` of the head (sensor 0 for one it does not have).
+    fn sensor(&self, scan: &ScanConfig, sensor: u32) -> Camera {
+        let mounts = scan.head.mounts();
+        let mount = mounts.get(sensor as usize).unwrap_or(&mounts[0]);
+        let rotation = self.rotation
+            * Quat::from_rotation_y(mount.yaw_deg.to_radians())
+            * Quat::from_rotation_x(mount.pitch_deg.to_radians());
+        let world_from_cam = Affine3A::from_rotation_translation(rotation, self.position);
+        Camera::from_pose(world_from_cam, scan.fov_y_deg.to_radians(), scan.width, scan.height)
+    }
+}
+
+/// [`ScanPath::heading_at`] averaged over [`SCAN_HEADING_WINDOW`] seconds
+/// centered on `t` (the path counts as standing still before its start and
+/// after its end).
+///
+/// The heading of the path has kinks: it freezes all at once a step before
+/// the end of the walk, for one. Averaging turns every sudden change of the
+/// turning rate into a ramp over the window.
+///
+/// The average is the exact integral of the heading interpolated linearly
+/// between samples at fixed times (multiples of [`SCAN_HEADING_STEP`]), not
+/// a sum of samples that move along with `t`: such a sum would jump a
+/// little whenever one of its samples passes a kink.
+fn smoothed_heading(path: &ScanPath, t: f32) -> Vec3 {
+    let (from, to) = (t - 0.5 * SCAN_HEADING_WINDOW, t + 0.5 * SCAN_HEADING_WINDOW);
+    let first = (from / SCAN_HEADING_STEP).floor() as i32;
+    let last = (to / SCAN_HEADING_STEP).ceil() as i32;
+    let sample = |cell: i32| path.heading_at(cell as f32 * SCAN_HEADING_STEP);
+    let mut sum = Vec3::ZERO;
+    let mut left = sample(first);
+    for cell in first..last {
+        let right = sample(cell + 1);
+        let start = cell as f32 * SCAN_HEADING_STEP;
+        let (lo, hi) = (start.max(from), (start + SCAN_HEADING_STEP).min(to));
+        if hi > lo {
+            // A linear piece integrates to its length times its midpoint.
+            let mid = (0.5 * (lo + hi) - start) / SCAN_HEADING_STEP;
+            sum += (hi - lo) * left.lerp(right, mid);
+        }
+        left = right;
+    }
+    // The sum only vanishes if the path turns back on itself within the
+    // window, which the walker's turn limit rules out.
+    Vec3::new(sum.x, 0.0, sum.z).try_normalize().unwrap_or_else(|| path.heading_at(t))
 }
 
 impl Stage {
@@ -458,8 +538,9 @@ impl House {
         self.time.min(self.frame_time(self.next_frame, config))
     }
 
-    fn sensor(&self, sensor: u32, time: f64, config: &PipelineConfig) -> Camera {
-        scan_sensor(&self.path, time as f32, &config.scan, sensor)
+    /// The scan head at walking time `time`.
+    fn head(&self, time: f64) -> ScanHeadPose {
+        ScanHeadPose::at(&self.path, time as f32)
     }
 
     /// Splats were rewritten in place since layer 0 was last sent whole.
@@ -473,7 +554,8 @@ impl House {
             ScanState::Done => 1.0,
             _ => (cursor / self.duration().max(1e-9)).clamp(0.0, 1.0) as f32,
         };
-        let info = |sensor: u32| CameraInfo::from_camera(sensor, &self.sensor(sensor, cursor, config));
+        let head = self.head(cursor);
+        let info = |sensor: u32| CameraInfo::from_camera(sensor, &head.sensor(&config.scan, sensor));
         ScanStats {
             state: self.state,
             progress,
@@ -750,7 +832,7 @@ impl Pipeline {
             let frame_start = Instant::now();
             let time = h.frame_time(h.next_frame, &config);
             let sensor = firing_sensor(config.scan.head, h.next_frame);
-            let cam = h.sensor(sensor, time, &config);
+            let cam = h.head(time).sensor(&config.scan, sensor);
             let frame = render_rgbd(&h.snapshot, &cam, &capture_options(&config, h.next_frame as u32));
             let captured = ms_since(frame_start);
             work.capture_ms += captured;
@@ -1499,7 +1581,9 @@ mod tests {
         let scan = ScanConfig::default();
         assert_eq!(scan.head, ScanHead::Surround);
         let mounts = scan.head.mounts();
-        let sway = (SCAN_PAN_AMPLITUDE + SCAN_TILT_AMPLITUDE + 1e-3).cos();
+        // The head follows the heading averaged over a second: up to 2.4
+        // degrees off the momentary one on this tour, on top of the sway.
+        let sway = (SCAN_PAN_AMPLITUDE + SCAN_TILT_AMPLITUDE + 3.0f32.to_radians()).cos();
         let steps = 2000;
         for i in 0..=steps {
             let t = path.duration() * i as f32 / steps as f32;
@@ -1618,6 +1702,289 @@ mod tests {
             let Body::Stats(json) = codec::decode(&out[2].bytes).unwrap().body else { panic!() };
             assert!(!json.contains("extra_cameras"), "{json}");
         }
+    }
+
+    #[test]
+    fn scan_head_starts_and_stops_turning_gently() {
+        // The heading of the path has a kink: it freezes all at once when
+        // the walker is one look-ahead (0.9 m) short of the end, a good
+        // second before the walk is over, and the turning rate drops from
+        // about 9 degrees per second to nothing. The head must not pass
+        // that jolt on, nor any other: its angular velocity never changes
+        // by more than 60 degrees per second in a second (measured: 43, and
+        // 15 in the last three seconds; 612 before the head averaged the
+        // heading), sampled far finer than any tick. The last tenth of a
+        // second is left out: there the walk itself stops dead.
+        let path = ScanPath::house_default();
+        let scan = ScanConfig::default();
+        let end = path.duration();
+        let dt = 1.0 / 240.0;
+        let velocity = |t: f32| {
+            let (a, b) = (scan_sensor(&path, t, &scan, 0), scan_sensor(&path, t + dt, &scan, 0));
+            let facing = |cam: &Camera| Quat::from_mat3a(&cam.world_from_cam.matrix3);
+            let turn = facing(&b) * facing(&a).conjugate();
+            // `turn` and `-turn` are the same rotation; take the short way.
+            (turn * turn.w.signum()).to_scaled_axis() / dt
+        };
+        let (mut worst, mut at, mut near_end) = (0.0f32, 0.0f32, 0.0f32);
+        let mut before = velocity(0.0);
+        for i in 1..((end - 0.1) / dt) as usize {
+            let t = i as f32 * dt;
+            let now = velocity(t);
+            let change = (now - before).length().to_degrees() / dt;
+            if change > worst {
+                (worst, at) = (change, t);
+            }
+            if t > end - 3.0 {
+                near_end = near_end.max(change);
+            }
+            before = now;
+        }
+        println!("scan head: angular acceleration at most {worst:.1} deg/s2 (t = {at:.2} s), {near_end:.1} in the last 3 s");
+        assert!(worst <= 60.0, "the head jerks by {worst} deg/s2 at t = {at}");
+        assert!(near_end <= 30.0, "the head jerks by {near_end} deg/s2 near the end of the walk");
+
+        // It still faces the walk: never more than 3 degrees of yaw off the
+        // momentary heading plus the sway.
+        for i in 0..=2000 {
+            let t = end * i as f32 / 2000.0;
+            let forward = scan_camera(&path, t, &scan).forward();
+            let level = Vec3::new(forward.x, 0.0, forward.z).normalize();
+            let off = level.angle_between(path.heading_at(t)).to_degrees();
+            assert!(off <= SCAN_PAN_AMPLITUDE.to_degrees() + 3.0, "{off} degrees off the walk at t = {t}");
+        }
+        // A path too short to average over is no problem.
+        let short = ScanPath::new(vec![Vec3::new(0.0, 1.4, 0.0), Vec3::new(0.05, 1.4, 0.0)], 0.8);
+        assert!(short.duration() < 0.5 * SCAN_HEADING_WINDOW);
+        for t in [0.0, 0.03, short.duration(), 5.0] {
+            let cam = scan_camera(&short, t, &scan);
+            assert!(cam.forward().is_finite() && cam.forward().x > 0.9, "{:?}", cam.forward());
+        }
+    }
+
+    #[test]
+    fn scan_frames_are_bounded_whatever_the_frame_rate() {
+        // These functions are public and may be given a configuration that
+        // never went through a pipeline.
+        let path = ScanPath::house_default();
+        let most = (path.duration() * 60.0).ceil() as u64 + 1;
+        for rate in [0.0, -3.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0e30, 1.0e-30, f32::MAX] {
+            let scan = ScanConfig { frames_per_second: rate, ..ScanConfig::default() };
+            let count = scan_frame_count(&path, &scan);
+            assert!((2..=most).contains(&count), "{rate} frames per second: {count} frames");
+            // What the pipeline would do with it.
+            assert_eq!(count, scan_frame_count(&path, &scan.sanitized()), "{rate}");
+            assert_eq!(scan_frame(&path, &scan, 0).time, 0.0, "{rate}");
+            assert_eq!(scan_frame(&path, &scan, count - 1).time, path.duration(), "{rate}");
+            let mut before = 0.0;
+            for index in 0..count {
+                let frame = scan_frame(&path, &scan, index);
+                assert_eq!(frame, scan_frame(&path, &scan.sanitized(), index));
+                assert!(frame.time >= before && frame.time <= path.duration() && frame.sensor < 5, "{rate}: {frame:?}");
+                before = frame.time;
+            }
+        }
+        // Odd optics are the caller's business, but never a panic.
+        let odd = ScanConfig { fov_y_deg: f32::NAN, width: 0, height: 0, ..ScanConfig::default() };
+        let cam = scan_sensor(&path, 1.0, &odd, 3);
+        assert!(cam.position().is_finite() && cam.forward().is_finite());
+    }
+
+    #[test]
+    fn extreme_scan_settings_run_to_the_end() {
+        // The corners of what `sanitized` lets through, with the five-sensor
+        // head: the scan must end, stay within its memory bound and report
+        // finite poses all the way.
+        #[rustfmt::skip]
+        let corners = [
+            // voxel, speed, fov, range, frames per second
+            (1.0e-9, 1.0e9, 1.0e9, 1.0e-9, 1.0e9),
+            (1.0e9, 1.0e-9, 1.0e-9, 1.0e9, 1.0e-9),
+            (1.0e9, 1.0e9, 179.9, 1.0e9, 1.0e9),
+        ];
+        for (voxel_size, speed, fov_y_deg, max_range, frames_per_second) in corners {
+            let mut config = PipelineConfig::for_scene(SceneKind::House);
+            config.scan =
+                ScanConfig { voxel_size, speed, fov_y_deg, max_range, frames_per_second, width: 1, height: 1, ..config.scan };
+            let mut pipeline = Pipeline::new(config);
+            let scan = pipeline.config().scan;
+            assert_eq!((scan.width, scan.height, scan.head), (16, 16, ScanHead::Surround));
+            let frames = scan_frame_count(&ScanPath::house_default().with_speed(scan.speed), &scan);
+            assert!(frames < 30_000, "{frames} frames");
+            let mut client_splats = 0;
+            let mut ticks = 0u64;
+            pipeline.handle_control(ControlMsg::ScanFinish);
+            while pipeline.scan_state() == Some(ScanState::Scanning) {
+                let out = pipeline.tick(0.05);
+                let stats = stats_of(&out);
+                let head = stats.scan.unwrap();
+                assert!(head.progress.is_finite() && head.extra_cameras.len() == 4);
+                for camera in std::iter::once(&head.camera).chain(head.extra_cameras.iter()) {
+                    assert!(camera.world_from_cam.iter().all(|v| v.is_finite()) && camera.fov_y > 0.0, "{camera:?}");
+                }
+                assert!(preview_ids(&out).len() <= ScanHead::MAX_SENSORS);
+                client_splats = stats.splats_static;
+                ticks += 1;
+                assert!(ticks <= frames + 1, "the scan never finishes");
+            }
+            assert_eq!(client_splats as usize, pipeline.static_splats().len());
+            assert!(pipeline.static_splats().len() <= VoxelFusion::DEFAULT_MAX_VOXELS);
+        }
+    }
+
+    /// The camera ids of the previews among `messages`.
+    fn preview_ids(messages: &[Outgoing]) -> Vec<u8> {
+        messages
+            .iter()
+            .filter(|m| codec::peek_kind(&m.bytes) == Ok(Kind::Preview))
+            .map(|m| m.slot - SLOT_PREVIEW_BASE)
+            .collect()
+    }
+
+    #[test]
+    fn interruptions_in_the_middle_of_a_multi_sensor_scan_change_nothing() {
+        let walk = |pipeline: &mut Pipeline| {
+            let mut ticks = 0;
+            while pipeline.scan_state() == Some(ScanState::Scanning) {
+                pipeline.tick(0.1);
+                ticks += 1;
+                assert!(ticks < 10_000, "the scan never finishes");
+            }
+            pipeline.static_splats().to_vec()
+        };
+        let mut pipeline = Pipeline::new(small_house());
+        assert_eq!(pipeline.config().scan.head, ScanHead::Surround);
+        pipeline.handle_control(ControlMsg::ScanStart);
+        let reference = walk(&mut pipeline);
+        assert!(!reference.is_empty());
+        let order = ScanHead::Surround.firing_order();
+
+        // Pause, global pause and resume, at a point where the next sensor
+        // to fire is not the first of the order.
+        let mut pipeline = Pipeline::new(small_house());
+        pipeline.handle_control(ControlMsg::ScanStart);
+        let mut ids = Vec::new();
+        for _ in 0..7 {
+            ids.extend(preview_ids(&pipeline.tick(0.25)));
+        }
+        let before_pause = ids.len();
+        assert!(before_pause % order.len() != 0, "{ids:?}");
+        let (time, splats) = (pipeline.scene_time(), pipeline.static_splats().len());
+        let poses = stats_of(&pipeline.snapshot()).scan.unwrap();
+        pipeline.handle_control(ControlMsg::ScanPause);
+        for _ in 0..3 {
+            let out = pipeline.tick(0.5);
+            assert_eq!(kinds(&out), [Kind::Stats], "a paused scan captures nothing");
+            let scan = stats_of(&out).scan.unwrap();
+            // The head, all five sensors of it, waits where it was.
+            assert_eq!(scan.state, ScanState::Paused);
+            assert_eq!((scan.camera, scan.extra_cameras), (poses.camera, poses.extra_cameras));
+        }
+        pipeline.handle_control(ControlMsg::ScanStart);
+        pipeline.handle_control(ControlMsg::SetPaused { paused: true });
+        assert_eq!(kinds(&pipeline.tick(0.5)), [Kind::Stats]);
+        assert_eq!((pipeline.scene_time(), pipeline.static_splats().len()), (time, splats));
+        pipeline.handle_control(ControlMsg::SetPaused { paused: false });
+        // Switching the previews off and on drops previews, not frames.
+        pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"preview":{"enabled":false}}}"#).unwrap();
+        let mut unseen = 0;
+        for _ in 0..4 {
+            let out = pipeline.tick(0.25);
+            assert!(preview_ids(&out).is_empty());
+            unseen += (stats_of(&out).pixels / (64 * 48)) as usize;
+        }
+        assert!(unseen >= 1);
+        pipeline.handle_control_json(r#"{"type":"patch_config","patch":{"preview":{"enabled":true}}}"#).unwrap();
+        for _ in 0..12 {
+            ids.extend(preview_ids(&pipeline.tick(0.25)));
+        }
+        // The sensors went on firing in their order, as if nothing happened.
+        let fired = ids.len() + unseen;
+        assert!(fired > order.len(), "{ids:?}");
+        let expected: Vec<u8> = (0..fired).map(|i| order[i % order.len()]).collect();
+        assert_eq!(ids[..before_pause], expected[..before_pause]);
+        assert_eq!(ids[before_pause..], expected[before_pause + unseen..]);
+        // Finish from the middle: the same map as the uninterrupted walk.
+        pipeline.handle_control(ControlMsg::ScanFinish);
+        assert!(walk(&mut pipeline) == reference, "pausing and finishing changed the map");
+
+        // Reset in the middle: back to an empty map and to the first sensor.
+        let mut pipeline = Pipeline::new(small_house());
+        pipeline.handle_control(ControlMsg::ScanStart);
+        for _ in 0..9 {
+            pipeline.tick(0.1);
+        }
+        let out = pipeline.handle_control(ControlMsg::ScanReset);
+        assert!(layer_of(&out[0]).splats.is_empty());
+        let scan = stats_of(&out).scan.unwrap();
+        assert_eq!((scan.state, scan.progress, scan.extra_cameras.len()), (ScanState::Idle, 0.0, 4));
+        pipeline.handle_control(ControlMsg::ScanStart);
+        assert_eq!(preview_ids(&pipeline.tick(0.1)), [order[0]]);
+        assert!(walk(&mut pipeline) == reference, "a reset left something behind");
+
+        // To the stage and back in the middle, then another head and back.
+        let mut config = small_house();
+        config.rig = small_stage().rig;
+        let mut pipeline = Pipeline::new(config);
+        pipeline.handle_control(ControlMsg::ScanStart);
+        for _ in 0..9 {
+            pipeline.tick(0.1);
+        }
+        pipeline.handle_control(ControlMsg::SetScene { scene: SceneKind::Stage });
+        assert_eq!(preview_ids(&pipeline.tick(0.1)), [0], "the stage previews its ring cameras again");
+        pipeline.handle_control(ControlMsg::SetScene { scene: SceneKind::House });
+        assert_eq!(pipeline.scan_state(), Some(ScanState::Idle), "autostart is off");
+        pipeline.handle_control(ControlMsg::ScanStart);
+        for _ in 0..9 {
+            pipeline.tick(0.1);
+        }
+        let head = |name: &str| format!(r#"{{"type":"patch_config","patch":{{"scan":{{"head":"{name}"}}}}}}"#);
+        let out = pipeline.handle_control_json(&head("single")).unwrap();
+        assert!(stats_of(&out).scan.unwrap().extra_cameras.is_empty());
+        assert_eq!(pipeline.scan_state(), Some(ScanState::Scanning), "a new head starts the walk over");
+        let mut single_ids = Vec::new();
+        for _ in 0..9 {
+            single_ids.extend(preview_ids(&pipeline.tick(0.1)));
+        }
+        assert!(!single_ids.is_empty() && single_ids.iter().all(|&id| id == 0), "{single_ids:?}");
+        let out = pipeline.handle_control_json(&head("surround")).unwrap();
+        assert!(layer_of(&out[1]).splats.is_empty());
+        assert_eq!(stats_of(&out).scan.unwrap().extra_cameras.len(), 4);
+        assert!(walk(&mut pipeline) == reference, "the scene or head switch left something behind");
+    }
+
+    #[test]
+    fn hostile_head_settings_are_rejected_and_change_nothing() {
+        let mut pipeline = Pipeline::new(small_house());
+        pipeline.handle_control(ControlMsg::ScanStart);
+        pipeline.tick(0.5);
+        let (config, splats) = (*pipeline.config(), pipeline.static_splats().len());
+        #[rustfmt::skip]
+        let heads = [
+            "null", "0", "5", "1000", "-1", "1e400", "true", r#""""#, r#""Surround""#, r#""quad""#, "[]", "{}",
+            r#"["surround"]"#, r#"{"sensors":1000}"#,
+        ];
+        for head in heads {
+            let patch = format!(r#"{{"type":"patch_config","patch":{{"scan":{{"head":{head}}}}}}}"#);
+            assert!(pipeline.handle_control_json(&patch).is_err(), "head {head} was accepted");
+            let set = format!(r#"{{"type":"set_config","config":{{"scene":"house","scan":{{"head":{head}}}}}}}"#);
+            assert!(pipeline.handle_control_json(&set).is_err(), "head {head} was accepted");
+        }
+        assert_eq!((*pipeline.config(), pipeline.static_splats().len()), (config, splats));
+        assert_eq!(pipeline.scan_state(), Some(ScanState::Scanning));
+        // A client written before the head existed sends none: the scan
+        // keeps its head and goes on.
+        let old = r#"{"type":"patch_config","patch":{"scan":{"max_range":4.0},"preview":{"max_width":64}}}"#;
+        assert_eq!(kinds(&pipeline.handle_control_json(old).unwrap()), [Kind::State]);
+        assert_eq!((pipeline.config().scan.head, pipeline.static_splats().len()), (ScanHead::Surround, splats));
+        // With `set_config` the missing field takes its default, like every
+        // other one.
+        let mut single = config;
+        single.scan.head = ScanHead::Single;
+        pipeline.handle_control(ControlMsg::SetConfig { config: single });
+        let old = r#"{"type":"set_config","config":{"scene":"house","scan":{"width":64,"height":48,"voxel_size":0.1}}}"#;
+        pipeline.handle_control_json(old).unwrap();
+        assert_eq!(pipeline.config().scan.head, ScanHead::Surround);
     }
 
     #[test]

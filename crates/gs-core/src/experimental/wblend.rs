@@ -69,6 +69,12 @@
 //!   path.
 //! * Per-layer weight is a uniform; per-splat weight rides in the opacity
 //!   byte of the 16-byte wire splat.
+//! * The coverage of a pixel is accumulated without the layer weights (a
+//!   layer with a high priority would otherwise get a fat outline). With
+//!   soft silhouettes that is one more accumulated value per surface: the
+//!   two `RGBA16F` attachments hold `Σ w·colour` and `Σ w`, a third `RG16F`
+//!   one the two coverages. With hard silhouettes and no fringe coverage
+//!   ([`Coverage::None`]) the coverage is not needed at all.
 
 #[cfg(feature = "par")]
 use rayon::prelude::*;
@@ -329,6 +335,9 @@ struct Draw {
     color: [f32; 3],
     /// Opacity (over) or blending weight (normalised).
     weight: f32,
+    /// The same without the layer's weight: what the splat adds to the
+    /// coverage of a pixel.
+    cover: f32,
     /// Depth of the center.
     depth: f32,
     /// Larger standard deviation in meters (for the depth tolerance).
@@ -531,6 +540,7 @@ fn prepare(splat: &Splat, layer_weight: f32, view: &View, opts: &WblendOptions) 
         plane,
         color: [splat.rgba[0] as f32, splat.rgba[1] as f32, splat.rgba[2] as f32],
         weight: weight * layer_weight.max(0.0),
+        cover: weight,
         depth,
         sigma,
         x0,
@@ -697,7 +707,11 @@ fn band_normalized(
     }
     let floor = if params.taper { (-0.5 * sh.cutoff2).exp() } else { 0.0 };
     let gain = 1.0 / (1.0 - floor);
-    // `alpha` holds the weight sum until the resolve.
+    // `alpha` holds the weight sum until the resolve. The coverage is
+    // accumulated apart, without the layer weights: a layer's priority must
+    // not fatten its outline.
+    let mut cover = vec![0.0f32; alpha.len()];
+    let mut back_cover = vec![0.0f32; back_weight.len()];
     for &index in bin {
         let d = &draws[index as usize];
         let slack = params.depth_tol_sigma * d.sigma;
@@ -705,7 +719,8 @@ fn band_normalized(
             let (m, z) = sh.fragment(d, dx, dy);
             if m <= sh.cutoff2 {
                 stats.shaded += 1;
-                let w = d.weight * ((-0.5 * m).exp() - floor) * gain;
+                let kernel = ((-0.5 * m).exp() - floor) * gain;
+                let w = d.weight * kernel;
                 if on_surface(z, nearest[i], params, slack) {
                     stats.blended += 1;
                     let dst = &mut rgb[i * 3..i * 3 + 3];
@@ -713,6 +728,7 @@ fn band_normalized(
                     dst[1] += d.color[1] * w;
                     dst[2] += d.color[2] * w;
                     alpha[i] += w;
+                    cover[i] += d.cover * kernel;
                 } else if two_layers && on_surface(z, second[i], params, slack) {
                     stats.blended += 1;
                     let dst = &mut back_rgb[i * 3..i * 3 + 3];
@@ -720,6 +736,7 @@ fn band_normalized(
                     dst[1] += d.color[1] * w;
                     dst[2] += d.color[2] * w;
                     back_weight[i] += w;
+                    back_cover[i] += d.cover * kernel;
                 }
             }
         });
@@ -731,7 +748,7 @@ fn band_normalized(
         } else if params.silhouette == Silhouette::Hard && nearest[i].is_finite() {
             1.0
         } else {
-            params.coverage.alpha(weight)
+            params.coverage.alpha(cover[i])
         };
         let scale = if weight > 0.0 { front / weight } else { 0.0 };
         let mut coverage = front;
@@ -741,7 +758,7 @@ fn band_normalized(
         }
         if two_layers && back_weight[i] > 0.0 && front < 1.0 {
             // The surface behind is opaque where its own discs reach.
-            let back = if second[i].is_finite() { 1.0 } else { params.coverage.alpha(back_weight[i]) };
+            let back = if second[i].is_finite() { 1.0 } else { params.coverage.alpha(back_cover[i]) };
             let through = (1.0 - front) * back;
             for (c, v) in pixel.iter_mut().enumerate() {
                 *v += through * back_rgb[i * 3 + c] / back_weight[i];
@@ -919,7 +936,6 @@ mod tests {
         let image = rasterize(&[wall, front], &cam, &two_sided);
         assert_eq!(image.pixel(112, 80), [0, 255, 0]);
         assert_eq!(image.pixel(108, 80), [255, 0, 0]);
-        let image = rasterize(&[wall, front], &cam, &opts);
         // A second surface inside the tolerance blends, outside it does not.
         let close = disc(cam.unproject(100.5, 80.5, 2.01), Vec3::Z, 0.05, [0, 0, 255, 255]);
         let both = rasterize(&[front, close], &cam, &opts);
@@ -995,6 +1011,20 @@ mod tests {
         let level = |r: &Rendered| r.over([0; 3]).pixel(100, 80)[0];
         assert!(level(&equal).abs_diff(120) <= 2, "{}", level(&equal));
         assert!(level(&heavy).abs_diff(49) <= 2, "{}", level(&heavy));
+    }
+
+    #[test]
+    fn a_layer_weight_does_not_fatten_the_outline() {
+        let cam = camera();
+        let s = disc(cam.unproject(100.5, 80.5, 2.0), Vec3::Z, 0.05, [200, 100, 50, 255]);
+        for silhouette in [Silhouette::Hard, Silhouette::SoftOverBackground, Silhouette::SoftOverNextSurface] {
+            let opts = normalized(Normalized { silhouette, ..Default::default() });
+            let light = render(&[Layer { splats: &[s], weight: 1.0 }], &cam, &opts);
+            let heavy = render(&[Layer { splats: &[s], weight: 16.0 }], &cam, &opts);
+            for (a, b) in light.alpha.iter().zip(&heavy.alpha) {
+                assert!((a - b).abs() < 1e-5, "{silhouette:?}: {a} vs {b}");
+            }
+        }
     }
 
     #[test]

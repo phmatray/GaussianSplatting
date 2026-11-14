@@ -267,7 +267,13 @@ async fn house(binary: &PathBuf, port: u16) {
     let start = Instant::now();
     let mut appends = 0u32;
     let splats = loop {
-        let Some(Ok(Message::Binary(bytes))) = ws.next().await else { panic!("stream ended during the scan") };
+        let bytes = match ws.next().await {
+            Some(Ok(Message::Binary(bytes))) => bytes,
+            // The server's keepalive: a scan that takes more than ten
+            // seconds sees at least one ping.
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            other => panic!("stream ended during the scan: {other:?}"),
+        };
         match codec::peek_kind(&bytes) {
             Ok(Kind::Layer) if bytes.get(codec::HEADER_SIZE + 1) == Some(&1) => appends += 1,
             Ok(Kind::Stats) => {

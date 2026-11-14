@@ -9,6 +9,7 @@
 //!   c1         normalised depth-tested blending: sweeps on the stage and the house
 //!   c2         planar splats and the mip filter; then the best combinations
 //!   combo      sensors x fusion x renderer on the stage
+//!   shadow     weight of the live layer under normalised blending (shadows)
 //!   headline   today against the best combinations at the three resolutions
 //!   capture    foreground fraction per camera and capture cost estimates
 //!   sheets     the comparison pictures
@@ -44,6 +45,7 @@ fn main() {
         "c1" => experiments::c1(&lab),
         "c2" => experiments::c2(&lab),
         "combo" => experiments::combo(&lab),
+        "shadow" => experiments::shadow(&lab),
         "headline" => experiments::headline(&lab),
         "capture" => experiments::capture(&lab),
         "sheets" => experiments::sheets(&lab),

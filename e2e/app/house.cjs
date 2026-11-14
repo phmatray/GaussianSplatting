@@ -58,9 +58,18 @@ async function run({ browser, url }) {
   s = await waitState(page, (s) => s.nav === 'fly' && !s.display.dollhouse);
   check('house: a thumbnail click looks through the sensor of the scan head', dist(s.eye, sensor) < 0.01 && s.display.clipY === null && (await page.locator('#toggle-dollhouse').getAttribute('aria-checked')) === 'false', `eye ${s.eye.map((x) => x.toFixed(2)).join(', ')}, sensor ${sensor.map((x) => x.toFixed(2)).join(', ')}`);
   await sleep(300);
-  await viewShot(page, 'house-through-sensor.png');
+  // From inside the head its own outlines would cross the picture: with
+  // and without the "Repères" switch the picture is the same.
+  const through = await viewShot(page, 'house-through-sensor.png');
+  await page.click('#toggle-gizmos');
+  await waitState(page, (s) => !s.display.gizmos);
+  const bare = await viewShot(page, 'house-through-sensor-bare.png');
+  await page.click('#toggle-gizmos');
+  const overdraw = await diff(page, through, bare);
+  check('house: seen through a sensor, the scan head and its path are not drawn over the picture', s.display.inScanHead && overdraw.changed === 0, `changed ${(overdraw.changed * 100).toFixed(3)} %`);
   await page.click('#toggle-dollhouse');
-  await waitState(page, (s) => s.display.dollhouse && s.nav === 'orbit');
+  s = await waitState(page, (s) => s.display.dollhouse && s.nav === 'orbit' && !s.display.inScanHead);
+  check('house: back above the house the scan head is drawn again', !s.display.inScanHead);
   await page.click('#scan-start');
   await waitState(page, (s, n) => s.scan.state === 'scanning' && s.layers.static > n, 30000, paused);
   check('house: Reprendre continues from where it stopped', true);

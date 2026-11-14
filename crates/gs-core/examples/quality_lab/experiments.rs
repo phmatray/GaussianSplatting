@@ -684,19 +684,22 @@ pub fn capture(lab: &Lab) {
     println!(
         "### Foreground per camera over the dance loop ({instants} instants)\n\nFractions of a camera's pixels. \"nearer\" differs from the plate in depth, \
          \"changed\" only in colour (shadows); the boxes are the bounding boxes of the marked pixels grown by 2 px.\n\n\
-         | ring | nearer mean / max % | changed mean / max % | box of nearer mean / max % | box of all marked mean / max % | per-tick mean over the 8 cameras: marked %, box of all % (worst tick) |\n|---|---|---|---|---|---|"
+         \"Tiles\" are squares of 1/20 of the image width that hold a marked pixel, grown by one tile on every side.\n\n\
+         | ring | nearer mean / max % | changed mean / max % | box of nearer mean / max % | box of all marked mean / max % | per-tick mean over the 8 cameras: marked %, box of all % (worst tick) | dirty tiles mean / max % | dirty tiles, worst tick % |\n|---|---|---|---|---|---|---|---|"
     );
     let mut box_fraction = [(0.0f64, 0.0f64); 3];
+    let mut tile_fraction = [(0.0f64, 0.0f64); 3];
     for (slot, scale) in [1u32, 2, 4].into_iter().enumerate() {
         let recipe = StageRecipe { scale, ..StageRecipe::default() };
         let cameras = recipe.rig().cameras();
         let plates: Vec<_> = cameras.iter().map(|c| BackgroundPlate::from_frame(&render_rgbd(&empty, c, &opts))).collect();
         // (nearer, changed, box of nearer, box of all) per camera and instant.
-        let mut samples: Vec<[f64; 4]> = Vec::new();
+        let mut samples: Vec<[f64; 5]> = Vec::new();
         let mut worst_tick = (0.0f64, 0.0f64);
+        let mut worst_tiles = 0.0f64;
         for k in 0..instants {
             let snap = scene.snapshot(loop_duration * k as f32 / instants as f32);
-            let mut tick = (0.0f64, 0.0f64);
+            let mut tick = (0.0f64, 0.0f64, 0.0f64);
             for (cam, plate) in cameras.iter().zip(&plates) {
                 let frame = render_rgbd(&snap, cam, &opts);
                 let mask = foreground_mask(&frame, plate, &params);
@@ -718,19 +721,34 @@ pub fn capture(lab: &Lab) {
                     let grow = 2;
                     ((x1 + grow).min(w) - x0.saturating_sub(grow)) as f64 * ((y1 + grow).min(h) - y0.saturating_sub(grow)) as f64 / (w * h) as f64
                 };
+                // Tiles of 1/20 of the image width that hold a marked pixel,
+                // grown by one tile on every side.
+                let tile = (8 * scale) as usize;
+                let (tw, th) = (w.div_ceil(tile), h.div_ceil(tile));
+                let mut dirty = vec![false; tw * th];
+                for (i, &m) in mask.iter().enumerate() {
+                    if m != MASK_SKIP {
+                        dirty[(i / w / tile) * tw + (i % w) / tile] = true;
+                    }
+                }
+                let grown = gs_core::experimental::metrics::dilate(&dirty, tw, th, 1);
+                let tiles = grown.iter().filter(|&&d| d).count() as f64 / grown.len() as f64;
                 let sample = [
                     count(&|m| m == MASK_FOREGROUND),
                     count(&|m| m != MASK_SKIP && m != MASK_FOREGROUND),
                     bounds(&|m| m == MASK_FOREGROUND),
                     bounds(&|m| m != MASK_SKIP),
+                    tiles,
                 ];
+                tick.2 += tiles / cameras.len() as f64;
                 tick.0 += (sample[0] + sample[1]) / cameras.len() as f64;
                 tick.1 += sample[3] / cameras.len() as f64;
                 samples.push(sample);
             }
             if tick.1 > worst_tick.1 {
-                worst_tick = tick;
+                worst_tick = (tick.0, tick.1);
             }
+            worst_tiles = worst_tiles.max(tick.2);
         }
         let stat = |c: usize| {
             let mean = samples.iter().map(|s| s[c]).sum::<f64>() / samples.len() as f64;
@@ -739,7 +757,7 @@ pub fn capture(lab: &Lab) {
         };
         let cell = |c: usize| format!("{:.1} / {:.1}", 100.0 * stat(c).0, 100.0 * stat(c).1);
         println!(
-            "| 8 x {}x{} | {} | {} | {} | {} | {:.1}, {:.1} |",
+            "| 8 x {}x{} | {} | {} | {} | {} | {:.1}, {:.1} | {} | {:.1} |",
             160 * scale,
             120 * scale,
             cell(0),
@@ -747,9 +765,12 @@ pub fn capture(lab: &Lab) {
             cell(2),
             cell(3),
             100.0 * worst_tick.0,
-            100.0 * worst_tick.1
+            100.0 * worst_tick.1,
+            cell(4),
+            100.0 * worst_tiles
         );
         box_fraction[slot] = (stat(3).0, worst_tick.1);
+        tile_fraction[slot] = (stat(4).0, worst_tiles);
         lab.note(&format!("foreground at scale {scale} done"));
     }
 
@@ -758,7 +779,8 @@ pub fn capture(lab: &Lab) {
          \"wall\" the best single run. \"boxes only\" is an estimate: the CPU time times the fraction of pixels inside the bounding boxes of \
          everything that differs from the plate (mean over the loop, and the worst tick), i.e. a simulator that ray casts only those boxes at this \
          resolution and reuses the plate elsewhere. Divide CPU ms by the number of free cores for the wall-clock time on an idle machine.\n\n\
-         | ring | threads | full frames: CPU ms | best wall ms | CPU ns per ray | boxes only, mean tick: CPU ms | boxes only, worst tick: CPU ms |\n|---|---|---|---|---|---|---|"
+         \"Tiles only\" is the same estimate for the dirty tiles of the table above (it does not include finding them, e.g. from a full 160x120 frame).\n\n\
+         | ring | threads | full frames: CPU ms | best wall ms | CPU ns per ray | boxes only, mean tick: CPU ms | boxes only, worst tick: CPU ms | tiles only, mean tick: CPU ms | tiles only, worst tick: CPU ms |\n|---|---|---|---|---|---|---|---|---|"
     );
     let snap = scene.snapshot(STAGE_TIMES[0]);
     for (slot, scale) in [1u32, 2, 4].into_iter().enumerate() {
@@ -772,12 +794,14 @@ pub fn capture(lab: &Lab) {
                 crate::harness::cost_ms(3.0, shoot)
             };
             println!(
-                "| 8 x {}x{} | {threads} | {ms:.1} | {wall:.1} | {:.0} | {:.1} | {:.1} |",
+                "| 8 x {}x{} | {threads} | {ms:.1} | {wall:.1} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} |",
                 160 * scale,
                 120 * scale,
                 ms * 1e6 / rays,
                 ms * box_fraction[slot].0,
-                ms * box_fraction[slot].1
+                ms * box_fraction[slot].1,
+                ms * tile_fraction[slot].0,
+                ms * tile_fraction[slot].1
             );
         }
     }
@@ -1174,10 +1198,11 @@ pub fn combo(lab: &Lab) {
 // ---------------------------------------------------------------------------
 
 /// The normalised renderer the sweeps settled on for the stage: hard
-/// silhouettes at 1.6 sigma, plane depths with a two-sided 1 % test, and no
-/// extra weight for the live layer.
+/// silhouettes at 1.6 sigma, plane depths with a two-sided 1 % test, and a
+/// live layer that outweighs the static one 16 to 1 (its shadow splats lie
+/// on the static floor they must darken).
 pub fn best_stage_renderer() -> Renderer {
-    c1_renderer(1.6, 1.0)
+    c1_renderer(1.6, 16.0)
 }
 
 /// The same for the house, with the kernel narrowed to 0.45 cell (0.75 of
@@ -1206,6 +1231,48 @@ pub fn with_planar(renderer: Renderer) -> Renderer {
 pub fn best_stage_recipe(scale: u32) -> StageRecipe {
     StageRecipe { scale, fusion: Some(greedy(0.25)), ..StageRecipe::default() }
 }
+// ---------------------------------------------------------------------------
+// Shadows under normalised blending
+// ---------------------------------------------------------------------------
+
+/// The live layer's shadow splats lie on the static floor they must
+/// darken. Under normalised blending they share the pixel with the floor's
+/// own splats in proportion to their weights: how much weight does the live
+/// layer need, and what does it cost elsewhere?
+pub fn shadow(lab: &Lab) {
+    use crate::harness::{crop_row, evaluate};
+    use gs_core::raster::Image;
+    let scene = make_scene(SceneKind::Stage);
+    let views = StageViews::new(lab, scene.as_ref(), &STAGE_TIMES, FULL);
+    let clouds = stage_clouds(scene.as_ref(), &best_stage_recipe(1), &STAGE_TIMES);
+    let today_clouds = stage_clouds(scene.as_ref(), &StageRecipe::default(), &STAGE_TIMES);
+    let best = with_planar(c1_soft_renderer(0.5, 1.0));
+    let (splats, wire) = stage_budget(&clouds);
+    println!("### Weight of the live layer under normalised blending (A1 + C1 soft + C2, 1280x960, both instants)\n\n{}", table_header("live weight"));
+    let weights = [1.0f32, 2.0, 4.0, 8.0, 16.0];
+    for w in weights {
+        let result = score_stage(&views, &clouds, &Renderer { live_weight: w, ..best });
+        println!("{}", table_row(&format!("{w}"), FULL, &splats, &wire, &result));
+    }
+    // The ball's shadow seen from the first held-out view, and the dancer's from above.
+    let mut strips = Vec::new();
+    for (name, rect) in [("ring0", (200, 620, 300, 200)), ("above", (700, 280, 300, 200))] {
+        let index = views.views.iter().position(|v| v.name == name).expect("no such view");
+        let view = &views.views[index];
+        let mut panels = vec![("ground truth".to_string(), Image::from_frame(&view.reference))];
+        let today = &today_clouds[views.instant[index]];
+        let layers = [Layer { splats: &today.fixed, weight: 1.0 }, Layer { splats: &today.live, weight: 1.0 }];
+        panels.push(("today".into(), evaluate(view, &layers, &WblendOptions::default()).image));
+        for w in [1.0, 4.0, 16.0] {
+            let cloud = &clouds[views.instant[index]];
+            let layers = [Layer { splats: &cloud.fixed, weight: 1.0 }, Layer { splats: &cloud.live, weight: w }];
+            panels.push((format!("A1 + C1 soft + C2, live weight {w}"), evaluate(view, &layers, &best.opts).image));
+        }
+        strips.push(crop_row(&panels, rect, 2, 2));
+    }
+    lab.save("sheets/tech_shadow_weight_stage.png", &gs_core::experimental::sheet::stacked(&strips, 8, [255; 3]));
+}
+
 // ---------------------------------------------------------------------------
 // Headline table
 // ---------------------------------------------------------------------------
@@ -1282,27 +1349,33 @@ fn stage_variants() -> Vec<StageVariant> {
     let variant = |label: &'static str, recipe: StageRecipe, renderer: Renderer| StageVariant { label, recipe, renderer };
     let selected = StageRecipe { recon: ReconstructParams { footprint: 0.65, ..d }, fusion: Some(greedy(0.0)), ..base.clone() };
     vec![
-        variant("today: 8x160x120, stacked, sorted over", base.clone(), over),
-        variant("A1 best view only (footprint 0.65), sorted over", selected, over),
+        variant("today: 8x160x120 stacked, over", base.clone(), over),
+        variant("A1 best view only (fp 0.65), over", selected, over),
         variant("stacked, C1", base.clone(), c1),
         variant("A1 + C1", fused(1, Sensor::Native), c1),
         variant("A1 + C1 + C2", fused(1, Sensor::Native), with_planar(c1)),
         variant("A1 + C1 soft + C2", fused(1, Sensor::Native), best),
-        variant("8x320x240, stacked, sorted over", StageRecipe { scale: 2, ..base.clone() }, over),
-        variant("8x320x240: A1 + C1 soft + C2", fused(2, Sensor::Native), best),
-        variant("colour 320x240, depth 160x120 guided: A1 + C1 soft + C2", fused(2, guided), best),
-        variant("8x640x480: A1 + C1 soft + C2", fused(4, Sensor::Native), best),
-        variant("8x640x480, stacked, sorted over", StageRecipe { scale: 4, ..base.clone() }, over),
-        variant("8x240x180: A1 + C1 soft + C2", StageRecipe { size: Some((240, 180)), ..best_stage_recipe(1) }, best),
-        variant("8x240x180, stacked, sorted over", StageRecipe { size: Some((240, 180)), ..base.clone() }, over),
-        variant("8x320x240: A1 + C1", fused(2, Sensor::Native), c1),
+        variant("8x320x240 stacked, over", StageRecipe { scale: 2, ..base.clone() }, over),
+        variant("8x320x240, A1 + C1 soft + C2", fused(2, Sensor::Native), best),
+        variant("A2 colour 320x240 depth 160x120, same", fused(2, guided), best),
+        variant("8x640x480, A1 + C1 soft + C2", fused(4, Sensor::Native), best),
+        variant("8x640x480 stacked, over", StageRecipe { scale: 4, ..base.clone() }, over),
+        variant("8x240x180, A1 + C1 soft + C2", StageRecipe { size: Some((240, 180)), ..best_stage_recipe(1) }, best),
+        variant("8x240x180 stacked, over", StageRecipe { size: Some((240, 180)), ..base.clone() }, over),
+        variant("8x320x240, A1 + C1", fused(2, Sensor::Native), c1),
         variant("stacked, C1 soft + C2", base, best),
     ]
 }
 
-/// `label  xx.xx dB  SSIM 0.xxx`.
+/// `label  xx.xx dB  SSIM 0.xxx` (scores of the whole view, also above a
+/// crop of it).
 fn caption(label: &str, score: &gs_core::experimental::metrics::Score) -> String {
     format!("{label}  {:.2} dB  SSIM {:.3}", score.psnr, score.ssim)
+}
+
+/// The caption without the SSIM, for narrow panels.
+fn short_caption(text: &str) -> String {
+    text.split("  SSIM").next().unwrap_or(text).to_string()
 }
 
 pub fn sheets(lab: &Lab) {
@@ -1354,7 +1427,8 @@ pub fn sheets(lab: &Lab) {
             ("tech_resolution_today_renderer_stage", vec![0, 6, 10], vec![("ring0", (500, 300, 300, 220)), ("near", (300, 200, 300, 220))]),
         ];
         for (file, which, rows) in techniques {
-            let strips: Vec<Image> = rows.iter().map(|(view, rect)| crop_row(&panels(view_named(view), &which), *rect, 2, 2)).collect();
+            let shorten = |list: Vec<(String, Image)>| -> Vec<(String, Image)> { list.into_iter().map(|(t, i)| (short_caption(&t), i)).collect() };
+            let strips: Vec<Image> = rows.iter().map(|(view, rect)| crop_row(&shorten(panels(view_named(view), &which)), *rect, 2, 2)).collect();
             lab.save(&format!("sheets/{file}.png"), &stacked(&strips, 8, white));
         }
     }
@@ -1367,13 +1441,13 @@ pub fn sheets(lab: &Lab) {
         let medium = bench.scan(lab, 1, 0.024, Sensor::Native);
         let fine = bench.scan(lab, 1, voxel / 2.0, Sensor::Native);
         let variants: Vec<(&str, &[Splat], Renderer)> = vec![
-            ("today: 192x144, 3.2 cm cells, sorted over", &bench.today.splats, over),
+            ("today: 3.2 cm cells, over", &bench.today.splats, over),
             ("same scan, C1", &bench.today.splats, hard_house_renderer()),
             ("same scan, C1 soft", &bench.today.splats, c1),
             ("same scan, C1 soft + C2", &bench.today.splats, with_planar(c1)),
             ("2.4 cm cells, C1 soft + C2", &medium.splats, with_planar(c1)),
             ("1.6 cm cells, C1 soft + C2", &fine.splats, with_planar(c1)),
-            ("1.6 cm cells, sorted over", &fine.splats, over),
+            ("1.6 cm cells, over", &fine.splats, over),
         ];
         let points = house_viewpoints();
         let view_named = |name: &str| {
@@ -1399,7 +1473,8 @@ pub fn sheets(lab: &Lab) {
             ("tech_cells_house", vec![0, 6, 3, 5], vec![("furniture", (440, 330, 300, 220)), ("living_a0", (440, 330, 300, 220))]),
         ];
         for (file, which, rows) in techniques {
-            let strips: Vec<Image> = rows.iter().map(|(view, rect)| crop_row(&panels(&view_named(view), &which), *rect, 2, 2)).collect();
+            let shorten = |list: Vec<(String, Image)>| -> Vec<(String, Image)> { list.into_iter().map(|(t, i)| (short_caption(&t), i)).collect() };
+            let strips: Vec<Image> = rows.iter().map(|(view, rect)| crop_row(&shorten(panels(&view_named(view), &which)), *rect, 2, 2)).collect();
             lab.save(&format!("sheets/{file}.png"), &stacked(&strips, 8, white));
         }
     }

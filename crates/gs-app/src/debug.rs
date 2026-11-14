@@ -84,6 +84,7 @@ fn state(core: &Core) -> Value {
             "showDynamic": params.show_dynamic,
             "clipY": params.clip_y_max,
             "dollhouse": display.dollhouse,
+            "inScanHead": core.in_scan_head(),
             "autoRotate": display.auto_rotate,
         },
         "xr": {
