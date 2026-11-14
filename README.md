@@ -227,7 +227,9 @@ Section « Captures et affinage » du panneau (avec le serveur ou
 l'application de bureau, sur l'ordinateur lui-même) :
 
 1. chaque capture conservée se rouvre (l'œil), s'affine (l'étoile) ou se
-   supprime ;
+   supprime ; une capture que le téléphone vient de terminer s'affine tout
+   de suite, mais ne se supprime qu'une fois quittée (revenez à une
+   démonstration avec les boutons du haut) ;
 2. « Affiner cette capture » demande un préréglage et ce qu'il faut faire là
    où le capteur n'a rien mesuré (peindre d'après les photos, ou laisser les
    trous) ;
@@ -288,8 +290,8 @@ cargo test -p splat-live
 # les outils de référence en Python (formats de fichiers, téléphone simulé)
 python3 -m unittest discover -s tools
 
-# l'application iPhone, sur un Mac
-cd ios/SplatCapture && swift test
+# la bibliothèque de l'application iPhone, sur un Mac (sans Xcode ni iPhone)
+cd ios/SplatCapture/Packages/SplatCaptureKit && swift test
 ```
 
 Les vérifications de bout en bout pilotent un navigateur sans écran. Elles
@@ -297,7 +299,7 @@ demandent l'interface construite, le serveur compilé
 (`cargo build --release -p gs-server`) et Playwright :
 
 ```bash
-(cd e2e/render && npm install)          # une fois : Playwright et l'émulateur WebXR
+(cd e2e && npm install && npx playwright install chromium)   # une fois : Playwright, son Chromium et l'émulateur WebXR
 SKIP_BUILD=1 node e2e/app/run.cjs       # l'application : démonstrations, relecture, capture, affinage, VR émulée
 SKIP_BUILD=1 ONLY=refine node e2e/app/run.cjs   # une seule suite
 node e2e/render/run.cjs                 # le moteur de rendu comparé à sa référence

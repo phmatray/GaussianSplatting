@@ -154,6 +154,16 @@ impl RawCapture {
         }
     }
 
+    /// The capture finished (`true`): everything received is written and
+    /// the file may be read while it stays open, should the phone take the
+    /// capture up again (`false`: it did, the file grows again).
+    pub fn settle(&mut self, finished: bool) {
+        if finished {
+            self.checkpoint();
+        }
+        self.hold.set_settled(finished && !self.failed && self.frames > 0);
+    }
+
     /// Closes the file. A capture without a single frame leaves no file.
     pub fn close(mut self) {
         self.checkpoint();

@@ -11,13 +11,19 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use common::{get, http, https, loopback, TestServer};
-use phone::{lan, start_capture_server, Dirs, Footage};
+use phone::{lan, start_capture_server, Dirs, Footage, PhoneClient};
 use serde_json::{json, Value};
 
 /// A sweep through the bedroom, filmed once for all the tests.
+fn footage() -> &'static Footage {
+    static FOOTAGE: OnceLock<Footage> = OnceLock::new();
+    FOOTAGE.get_or_init(|| Footage::bedroom(40, 0))
+}
+
+/// The same sweep as the file a phone records offline.
 fn bedroom() -> &'static Vec<u8> {
     static FILE: OnceLock<Vec<u8>> = OnceLock::new();
-    FILE.get_or_init(|| Footage::bedroom(40, 0).gscap("Chambre d'amis"))
+    FILE.get_or_init(|| footage().gscap("Chambre d'amis"))
 }
 
 const CAPTURE: &str = "Chambre-20261114-120000.gscap";
@@ -369,5 +375,65 @@ async fn the_state_of_the_disk_is_told_at_the_machine() {
         assert!(text.contains("\"code\":\"disk_full\"") && text.contains("\"free_bytes\":"), "{text}");
         assert_eq!(Dirs::files(&dirs.captures(), ""), vec![CAPTURE.to_string()], "something of the refused upload was kept");
     }
+    server.handle.shutdown().await;
+}
+
+/// The road a real capture takes: the phone films, says `finish`, and the
+/// capture stays on show. Its raw file is still held by the server (the
+/// phone may take the capture up again), but it is complete: it must be
+/// refinable there and then, without leaving the capture first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_capture_a_phone_just_finished_is_refined_while_it_is_still_on_show() {
+    let (server, dirs) = start_capture_server(|config| {
+        config.refine_iterations = Some(12);
+        config.refine_threads = 2;
+    })
+    .await;
+    let port = server.port();
+    let listed = || async move { get(port, "/api/captures").await.json()["captures"][0].clone() };
+
+    let mut phone = PhoneClient::open(&server, "room", "Salon").await;
+    phone.stream(&footage().frames).await;
+    // While the phone films, its file grows: not to be read as a whole.
+    let entry = listed().await;
+    let file = entry["file"].as_str().expect("the capture is not listed").to_string();
+    assert_eq!(entry["capturing"], json!(true), "{entry}");
+    let early = post(port, json!({ "action": "start", "capture": file, "preset": "rapide" })).await;
+    assert_eq!((early.status, early.json()["code"].as_str().map(str::to_string)), (409, Some("in_use".to_string())));
+
+    // Finished: by the time the phone has its answer the capture is listed
+    // as complete and a refinement of it starts.
+    phone.finish().await;
+    let entry = listed().await;
+    assert_eq!(entry["capturing"], json!(false), "{entry}");
+    assert_eq!(entry["size"].as_u64(), Some(std::fs::metadata(dirs.captures().join(&file)).unwrap().len()));
+    let started = post(port, json!({ "action": "start", "capture": file, "preset": "rapide" })).await;
+    assert_eq!(started.status, 200, "{}", started.text());
+    // It is still the server's to write to: not deleted under its feet.
+    let delete = http(port, "DELETE", &format!("/captures/{file}"), &[], &[]).await;
+    assert_eq!((delete.status, delete.json()["code"].as_str().map(str::to_string)), (409, Some("in_use".to_string())));
+    let (last, _) = wait_for_the_end(port, Duration::from_secs(240)).await;
+    assert_eq!(last["outcome"], json!("done"), "{last}");
+    assert_eq!(last["result"]["capture"], json!(file));
+    assert!(last["result"]["gaussians"].as_u64().unwrap() > 1000, "{last}");
+
+    // The phone goes on after its finish: the file grows again.
+    phone.text(r#"{"type":"resume"}"#).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while listed().await["capturing"] != json!(true) {
+        assert!(Instant::now() < deadline, "the resumed capture is still listed as complete");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let again = post(port, json!({ "action": "start", "capture": file })).await;
+    assert_eq!((again.status, again.json()["code"].as_str().map(str::to_string)), (409, Some("in_use".to_string())));
+
+    // Left for a demonstration: the file is let go of and can be deleted.
+    phone.close().await;
+    let mut viewer = common::Client::connect(port).await;
+    viewer.until("the capture on show", |v, _| v.scene() == "capture").await;
+    viewer.send_json(json!({ "type": "set_scene", "scene": "stage" })).await;
+    viewer.until("the stage", |v, _| v.scene() == "stage").await;
+    assert_eq!(listed().await["capturing"], json!(false));
+    assert_eq!(http(port, "DELETE", &format!("/captures/{file}"), &[], &[]).await.status, 200);
     server.handle.shutdown().await;
 }

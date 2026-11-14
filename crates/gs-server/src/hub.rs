@@ -666,6 +666,10 @@ impl Loop<'_> {
                 log::info!("phone {}: continues the {} capture", link.conn, hello.mode.name());
                 let restarted = capture.session.is_finished();
                 let reply = capture.session.resume();
+                // Its file grows again.
+                if let Some(raw) = capture.raw.as_mut() {
+                    raw.settle(false);
+                }
                 link.send(&welcome);
                 capture.phone = Some(Phone { link, hello });
                 capture.floor_told = None;
@@ -777,6 +781,13 @@ impl Loop<'_> {
             _ => {}
         }
         let finished = capture.session.is_finished();
+        // A finished capture is complete on disk and may be read (refined,
+        // reopened) although its file stays open for a phone that goes on.
+        if finished != was_finished {
+            if let Some(raw) = capture.raw.as_mut() {
+                raw.settle(finished);
+            }
+        }
         // Before the phone has its answer (and long before the files are
         // written): whoever acts on that answer must find the capture as
         // it now is.

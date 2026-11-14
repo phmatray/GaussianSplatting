@@ -290,7 +290,9 @@ impl Refiner {
     /// goes on on a thread of its own.
     pub fn start(self: &Arc<Self>, file: &str, task: Task) -> Result<JobStatus, Refusal> {
         let path = self.store.existing(Kind::Capture, file).ok_or(Refusal::NotFound)?;
-        if self.store.is_busy(Kind::Capture, file) {
+        // A capture its phone has finished is complete on disk although its
+        // file is still held: it is read, not written to.
+        if self.store.is_growing(Kind::Capture, file) {
             return Err(Refusal::InUse);
         }
         let header = store::peek_capture_header(&path).unwrap_or_default();

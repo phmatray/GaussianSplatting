@@ -26,11 +26,18 @@ const VIRTUAL_PREFIXES: [&str; 14] = [
     "podman",
 ];
 
+/// macOS numbers the bridges of virtual machines and of Internet Sharing
+/// from 100 (`bridge100`, `bridge101`…); `bridge0` is the Thunderbolt
+/// bridge, and a Linux `bridge0` may well carry the real network.
+fn mac_vm_bridge(name: &str) -> bool {
+    name.strip_prefix("bridge").and_then(|number| number.parse::<u32>().ok()).is_some_and(|number| number >= 100)
+}
+
 /// Rank of an address for the URL list: lower is more plausible as "the
 /// address a headset on the same network should use".
 fn plausibility(name: &str, ip: Ipv4Addr) -> u8 {
     let name = name.to_ascii_lowercase();
-    let virtual_adapter = VIRTUAL_PREFIXES.iter().any(|prefix| name.starts_with(prefix));
+    let virtual_adapter = VIRTUAL_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || mac_vm_bridge(&name);
     let [a, b, ..] = ip.octets();
     let class = match (a, b) {
         _ if ip.is_link_local() => 6,
@@ -161,6 +168,25 @@ mod tests {
         .map(Ipv4Addr::from)
         .collect();
         assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn a_mac_with_virtual_machines_still_offers_its_wifi_first() {
+        // The Wi-Fi of a Mac on a 10.x network, next to the bridge of a
+        // virtual machine tool on 192.168.x: the phone and the headset
+        // reach the first, never the second.
+        let order = ranked(&[
+            ("lo0", [127, 0, 0, 1]),
+            ("bridge100", [192, 168, 64, 1]),
+            ("utun4", [100, 96, 1, 2]),
+            ("en0", [10, 0, 0, 37]),
+            ("bridge0", [192, 168, 2, 1]),
+        ]);
+        let expected: Vec<Ipv4Addr> =
+            [[192, 168, 2, 1], [10, 0, 0, 37], [192, 168, 64, 1], [100, 96, 1, 2]].into_iter().map(Ipv4Addr::from).collect();
+        assert_eq!(order, expected);
+        assert!(mac_vm_bridge("bridge100") && mac_vm_bridge("bridge101"));
+        assert!(!mac_vm_bridge("bridge0") && !mac_vm_bridge("bridge") && !mac_vm_bridge("br-1a2b") && !mac_vm_bridge("en0"));
     }
 
     #[test]

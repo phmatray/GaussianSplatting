@@ -124,7 +124,9 @@ pub struct CaptureEntry {
     pub size: u64,
     /// `captures/<file>`, percent-encoded (loopback listener only).
     pub url: String,
-    /// The server is still writing this file.
+    /// The server is still writing this file: a phone is filming it. A
+    /// capture its phone has finished is no longer `capturing`, although
+    /// its file stays held (not deletable) for as long as it is on show.
     pub capturing: bool,
 }
 
@@ -230,6 +232,9 @@ pub(crate) struct Store {
     /// Files being written, as `(kind, file name)`: they are not deleted,
     /// zipped or replaced meanwhile.
     busy: Mutex<HashSet<(Kind, String)>>,
+    /// Those of the busy files that are complete on disk for now and may be
+    /// read ([`Hold::set_settled`]).
+    settled: Mutex<HashSet<(Kind, String)>>,
 }
 
 /// A file of the store that is being written. While this exists the file
@@ -252,11 +257,28 @@ impl Hold {
     pub fn report_problem(&self, code: &'static str, message: impl std::fmt::Display) {
         self.store.report_problem(code, &self.file, message);
     }
+
+    /// Says whether the file, though still held, is complete on disk for
+    /// now: the capture of a phone that has finished is kept open in case
+    /// the phone takes it up again, and can meanwhile be read (reopened,
+    /// refined, exported). It is still not deleted or replaced
+    /// ([`Store::is_growing`]).
+    pub fn set_settled(&self, settled: bool) {
+        let key = (self.kind, self.file.clone());
+        let mut set = self.store.settled.lock().unwrap_or_else(|p| p.into_inner());
+        if settled {
+            set.insert(key);
+        } else {
+            set.remove(&key);
+        }
+    }
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        self.store.busy().remove(&(self.kind, std::mem::take(&mut self.file)));
+        let key = (self.kind, std::mem::take(&mut self.file));
+        self.store.settled.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        self.store.busy().remove(&key);
     }
 }
 
@@ -369,7 +391,15 @@ impl Store {
             .or_else(|| recordings.as_ref().map(|dir| dir.parent().unwrap_or(Path::new("")).join("captures")));
         let beside = |name: &str| recordings.as_ref().map(|dir| dir.parent().unwrap_or(Path::new("")).join(name));
         let (refined, datasets) = (beside("refined"), beside("datasets"));
-        Self { recordings, captures, refined, datasets, problem: Mutex::new(None), busy: Mutex::new(HashSet::new()) }
+        Self {
+            recordings,
+            captures,
+            refined,
+            datasets,
+            problem: Mutex::new(None),
+            busy: Mutex::new(HashSet::new()),
+            settled: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Names the directories of the refined results and of the exported
@@ -424,6 +454,14 @@ impl Store {
 
     pub fn is_busy(&self, kind: Kind, file: &str) -> bool {
         self.busy().contains(&(kind, file.to_string()))
+    }
+
+    /// The file is being written and what is on disk is not complete yet:
+    /// it is not to be read as a whole. A busy file that its writer has
+    /// declared settled ([`Hold::set_settled`]) is not growing.
+    pub fn is_growing(&self, kind: Kind, file: &str) -> bool {
+        let key = (kind, file.to_string());
+        self.busy().contains(&key) && !self.settled.lock().unwrap_or_else(|p| p.into_inner()).contains(&key)
     }
 
     /// The path of an existing file of the store, or `None` when `file` is
@@ -635,7 +673,7 @@ impl Store {
                     created: header.created,
                     size: meta.len(),
                     url: url_of(Kind::Capture, &file),
-                    capturing: self.is_busy(Kind::Capture, &file),
+                    capturing: self.is_growing(Kind::Capture, &file),
                     file,
                 }
             })

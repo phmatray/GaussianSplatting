@@ -4,12 +4,15 @@ Playwright scripts that drive the `crates/gs-render-harness` page in headless
 Chromium (WebGL2 through SwiftShader, WebXR through the IWER emulator).
 
 ```bash
-(cd e2e/render && npm install)   # once: fetches the IWER emulator
+(cd e2e && npm install && npx playwright install chromium)   # once: Playwright, its Chromium, the IWER emulator
 node e2e/render/run.cjs          # trunk build --release, then every suite
 ```
 
-`playwright` itself must be resolvable by Node (it is not installed from
-here, to avoid downloading browsers).
+`e2e/package.json` names both packages; Node finds them from every script
+under `e2e/`. On a machine where Playwright is installed elsewhere, make it
+resolvable through `NODE_PATH`; the emulator alone can also come from
+`npm install` in this directory, from `GS_NPM_TOOLS` (a `node_modules`
+directory) or from `IWER_BUNDLE`.
 
 | Suite | Page | What it asserts |
 |---|---|---|

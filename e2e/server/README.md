@@ -71,6 +71,12 @@
   du réseau local (`https://<adresse>/?file=recordings/<nom>.gsrec&embed=1`).
   Captures d'écran dans `$OUT`. Ignoré si l'interface n'est pas construite.
 
+Sous macOS : `tauri-smoke.sh` et `tauri-real.sh` demandent Xvfb et ne
+tournent que sous Linux. `abuse.py` et `hostile.py` lisent `/proc` sous
+Linux ; ailleurs ils interrogent `ps` et `lsof`. Ce second chemin n'a été
+essayé que sous Linux, forcé avec `GS_NO_PROC=1` : la variante `ps -M` propre
+à macOS (comptage des fils d'exécution dans `abuse.py`) n'a jamais tourné.
+
 ```bash
 cargo build --release -p gs-server
 node e2e/server/browser.cjs          # ports 7860 et 7861

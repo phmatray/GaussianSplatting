@@ -895,7 +895,7 @@ pub(crate) async fn open(State(state): State<AppState>, request: Request) -> Res
     let Some(path) = core.store.existing(Kind::Capture, &request.file) else {
         return json_error(StatusCode::NOT_FOUND, "not_found", "no such capture");
     };
-    if core.store.is_busy(Kind::Capture, &request.file) {
+    if core.store.is_growing(Kind::Capture, &request.file) {
         return json_error(StatusCode::CONFLICT, "in_use", "the capture is still being written");
     }
     if core.hub.metrics.capturing.load(Ordering::Relaxed) {

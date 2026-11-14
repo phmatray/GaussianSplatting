@@ -318,7 +318,13 @@ frontend resolves its source in this order: Tauri command (then uses
   stamps, gaps cut to 2 s). The files of one capture share their stem,
   number suffix included. A scan whose phone never sent `finish` is finished
   and saved when its capture is closed (`set_scene`, another capture taking
-  its place, shutdown).
+  its place, shutdown). The raw file of a phone's capture stays the
+  server's (`DELETE` answers 409 `in_use`) for as long as that capture is on
+  show, because the phone may take it up again. `capturing` in
+  `GET /api/captures` is true only while the file grows: once the phone has
+  said `finish` everything received is on disk, the capture is listed with
+  `capturing: false` and can be reopened, refined and exported there and
+  then (409 `in_use` again if the phone resumes).
 - **Recorder.** The file is a slug of the given name (letters and digits of
   any script, `-`, `_`), `enregistrement-<timestamp>` without one; titles are
   cut to 120 characters; the recorder counts as a spectator, so the scene

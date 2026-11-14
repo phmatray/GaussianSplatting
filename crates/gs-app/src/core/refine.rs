@@ -133,6 +133,14 @@ impl Core {
                         } else {
                             core.notify(true, refine::refusal_text(answer.status, &parsed.code));
                         }
+                        // Job ids start again when the server does: a
+                        // summary closed before must not hide the end of
+                        // a new job that bears the same number.
+                        if let (Some(job), Some(dismissed)) = (&parsed.job, core.dismissed_job.get()) {
+                            if job.id <= dismissed && answer.ok() {
+                                core.dismissed_job.set(None);
+                            }
+                        }
                         // A refusal names the job that is in the way.
                         if parsed.job.is_some() {
                             Ui::set_if_changed(core.ui.job, parsed.job);
@@ -212,7 +220,12 @@ impl Core {
                             core.ui.refining.set(None);
                         }
                     }
-                    Ok(answer) if answer.status == 409 => core.notify(true, "Cette capture est encore en cours d'enregistrement.".to_string()),
+                    // A capture stays the server's for as long as it is on
+                    // show, also after its phone has finished.
+                    Ok(answer) if answer.status == 409 => core.notify(
+                        true,
+                        "Cette capture est encore ouverte sur le serveur (en cours, ou affichée après sa fin). Revenez à une démonstration avec les boutons du haut, puis supprimez-la.".to_string(),
+                    ),
                     Ok(answer) if answer.status == 403 => core.notify(true, "Les captures se suppriment depuis l'ordinateur qui exécute Splat Live.".to_string()),
                     Ok(answer) => core.notify(true, format!("Le serveur a refusé la suppression (HTTP {}).", answer.status)),
                     Err(error) => core.notify(true, format!("Le serveur n'a pas répondu ({error}).")),

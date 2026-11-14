@@ -42,6 +42,9 @@ import gscap  # noqa: E402
 import wsproto  # noqa: E402
 
 FAILED = []
+# Linux tells what a process holds under /proc; elsewhere (macOS) `ps` and
+# `lsof` are asked. GS_NO_PROC=1 forces the second way, to try it on Linux.
+HAS_PROC = os.path.isdir("/proc/self/fd") and not os.environ.get("GS_NO_PROC")
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -193,6 +196,10 @@ class Server:
         return self.http("POST", path, headers=headers, body=json.dumps(value).encode(), **kwargs)
 
     def rss_kb(self) -> int:
+        if not HAS_PROC:
+            # macOS has no /proc: `ps` knows the resident size, in kilobytes.
+            out = subprocess.run(["ps", "-o", "rss=", "-p", str(self.process.pid)], capture_output=True, text=True).stdout
+            return int(out.strip() or 0)
         with open("/proc/%d/status" % self.process.pid) as status:
             for line in status:
                 if line.startswith("VmRSS:"):
@@ -866,6 +873,10 @@ def silent_readers(server: Server, with_frontend: bool) -> None:
         out.truncate(300 << 20)
 
     def held() -> int:
+        if not HAS_PROC:
+            # macOS has no /proc: `lsof` names the files a process holds.
+            out = subprocess.run(["lsof", "-p", str(server.process.pid), "-Fn"], capture_output=True, text=True).stdout
+            return sum(line[1:] in (big, os.path.realpath(big)) for line in out.splitlines() if line.startswith("n"))
         count = 0
         for fd in os.listdir("/proc/%d/fd" % server.process.pid):
             try:

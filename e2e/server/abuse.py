@@ -47,7 +47,18 @@ def check(name, ok, detail=""):
 
 # -- process ---------------------------------------------------------------------
 
+# Linux tells what a process holds under /proc; elsewhere (macOS) `ps` and
+# `lsof` are asked. GS_NO_PROC=1 forces the second way, to try it on Linux.
+HAS_PROC = os.path.isdir("/proc/self/fd") and not os.environ.get("GS_NO_PROC")
+
+
 def stats(pid):
+    if not HAS_PROC:
+        ask = lambda *command: subprocess.run(command, capture_output=True, text=True).stdout
+        # One line per thread: `ps -M` on macOS (below a header), `-L` elsewhere.
+        threads = len(ask("ps", "-M", "-p", str(pid)).splitlines()) - 1 if sys.platform == "darwin" else len(ask("ps", "-L", "-o", "lwp=", "-p", str(pid)).split())
+        descriptors = sum(line[1:].isdigit() for line in ask("lsof", "-p", str(pid), "-Ff").splitlines() if line.startswith("f"))
+        return {"rss_kb": int(ask("ps", "-o", "rss=", "-p", str(pid)).strip() or 0), "threads": threads, "fds": descriptors}
     status = open(f"/proc/{pid}/status").read()
     field = lambda key: int(next(line for line in status.splitlines() if line.startswith(key)).split()[1])
     return {"rss_kb": field("VmRSS:"), "threads": field("Threads:"), "fds": len(os.listdir(f"/proc/{pid}/fd"))}

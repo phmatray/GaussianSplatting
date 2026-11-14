@@ -10,9 +10,11 @@ node e2e/app/run.cjs
 
 Cette commande construit l'application (`trunk build --release` dans
 `crates/gs-app`), la sert avec un petit serveur statique sur un port de la
-plage 8100 à 8199, puis lance toutes les suites. Playwright doit être
-installé sur la machine (il n'est pas installé d'ici) ; l'émulateur WebXR IWER
-vient de `e2e/render` (`npm install` dans ce dossier, ou `GS_NPM_TOOLS`).
+plage 8100 à 8199, puis lance toutes les suites. Playwright et
+l'émulateur WebXR IWER s'installent une fois depuis le dossier `e2e` :
+`(cd e2e && npm install && npx playwright install chromium)`. Sur une machine
+où Playwright est installé ailleurs, `NODE_PATH` doit y mener ; l'émulateur
+seul peut aussi venir de `GS_NPM_TOOLS`.
 
 | Suite | Ce qu'elle vérifie |
 |---|---|
