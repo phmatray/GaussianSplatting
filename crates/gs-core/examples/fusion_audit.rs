@@ -298,7 +298,7 @@ fn holes(out: &Path, base: PipelineConfig, times: &[f32], save: Option<&str>) {
                 100.0 * gained as f64 / n.max(1) as f64
             ));
         }
-        worst.sort_by(|a, b| b.0.cmp(&a.0));
+        worst.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         for (rank, (lost, name, image)) in worst.iter().take(4).enumerate() {
             let file = out.join(format!("holes_{noise_name}_{rank}.png"));
             save_png(&file, image);
@@ -345,8 +345,8 @@ fn subject_area(scene: &dyn Scene, times: &[f32], cam: &Camera) -> Vec<bool> {
     let mut mask = vec![false; w * h];
     for &t in times {
         let frame = render_rgbd(&scene.snapshot(t), cam, &opts);
-        for i in 0..w * h {
-            mask[i] |= frame.depth[i] != plate.depth[i] || frame.rgb[i * 3..i * 3 + 3] != plate.rgb[i * 3..i * 3 + 3];
+        for (i, marked) in mask.iter_mut().enumerate() {
+            *marked |= frame.depth[i] != plate.depth[i] || frame.rgb[i * 3..i * 3 + 3] != plate.rgb[i * 3..i * 3 + 3];
         }
     }
     gs_core::experimental::metrics::dilate(&mask, w, h, 6)
@@ -393,7 +393,7 @@ fn flicker_audit(base: PipelineConfig) {
                 let mut index = 0usize;
                 live.retain(|_| {
                     index += 1;
-                    index % drop_every != 0
+                    !index.is_multiple_of(drop_every)
                 });
             }
             report(&format!("the same with every {drop_every}th live splat missing on odd ticks"), &pictures(mode, &flipping, &cam));

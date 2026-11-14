@@ -6,7 +6,7 @@
 //! samples it finely, one that sees it from afar at a grazing angle smears
 //! its texture along the line of sight. [`fuse`] keeps, per surface point,
 //! the observations that describe it best and drops the others. On the
-//! stage that is about 45 % of the static layer and a third of the live one:
+//! stage that is about 45 % of the static layer and 30 % of the live one:
 //! the budget that pays for finer sensors.
 //!
 //! # Rule
@@ -18,8 +18,13 @@
 //! * its center projects into the pixel that produced the other splat,
 //! * both lie at the same depth of that camera within
 //!   [`MultiViewParams::tolerance`],
-//! * their normals agree ([`MultiViewParams::min_normal_dot`]: the two faces
-//!   of an arm are "the same depth" at three meters), and
+//! * it lies on the tangent plane of the other splat within
+//!   [`MultiViewParams::plane_tolerance`] (a hand held a few centimetres in
+//!   front of the chest is "the same depth" at three meters, and faces the
+//!   same way: without this test the chest behind the hand gave way to the
+//!   hand, and showed a hole from every other side),
+//! * their normals agree ([`MultiViewParams::min_normal_dot`]: so are the
+//!   two faces of an arm), and
 //! * the other one is better by the margin: `q' > (1 + margin) · q`.
 //!
 //! A dominated splat is dropped **only if the splat that dominates it is
@@ -33,34 +38,67 @@
 //! rule is a recursion along strictly increasing quality, so it has exactly
 //! one solution and needs no sorting: [`fuse`] resolves it with a memo.
 //!
-//! Pixels on the rim of a camera's splats (image border, silhouette, mask
-//! edge) never dominate ([`MultiViewParams::edge_guard`]): their own
-//! footprint is the least certain one.
+//! # The rim of a camera
+//!
+//! A better pixel covers the splat it replaces only together with its
+//! neighbours, and at the rim of what a camera sees of a surface (image
+//! border, silhouette, mask edge) there are none, or shrunken ones. So
+//!
+//! * the pixels on the rim never dominate ([`MultiViewParams::edge_guard`]),
+//!   and
+//! * the pixels in a band behind the rim ([`MultiViewParams::demote_band`])
+//!   only *demote*: the splat they are better than stays where it is, with
+//!   its opacity multiplied by [`MultiViewParams::demoted_weight`].
+//!
+//! In the normalised blending mode of `docs/ARCHITECTURE.md` the opacity is
+//! a blending weight and every splat closes the surface whatever its weight:
+//! a demoted splat fills the gaps the better camera leaves near its rim and
+//! gives way to that camera's colours wherever both are present. This is
+//! what keeps thin limbs closed: on an arm six pixels wide every pixel is
+//! near a rim.
 //!
 //! # What the measurements say
 //!
-//! (`examples/quality_lab.rs` and `examples/quality_report.rs`.) Under the
-//! normalised blending mode the fused cloud scores level with the stacked
-//! one or slightly above it, with crisper floor texture. Under sorted
-//! "over" compositing a fused cloud needs a larger footprint to stay closed
-//! (a viewer's splat scale of about 1.45): eight overlapping clouds no longer
-//! hide the gaps between the splats of one camera.
+//! (`examples/quality_report.rs`, `examples/fusion_audit.rs`; the default
+//! stage, eight 240x180 cameras, held-out views at 1280x960.)
+//!
+//! | rule | static + live splats | live layer | PSNR, normalised | PSNR, sorted x1.4 | holes |
+//! |---|---|---|---|---|---|
+//! | stacked (no fusion) | 155.0k + 20.4k | 9.8 MB/s | 28.26 dB | 25.45 dB | 0 |
+//! | depth test, guard 1 | 82.7k + 12.7k | 6.1 MB/s | 28.43 | 27.17 | 0.55 % |
+//! | + tangent plane | 82.8k + 12.7k | 6.1 MB/s | 28.42 | 27.14 | 0.43 % |
+//! | + guard 2 | 84.8k + 14.1k | 6.7 MB/s | 28.28 | 26.97 | 0.30 % |
+//! | + guard 1, demoting band 1 (default) | 84.8k + 14.1k | 6.7 MB/s | 28.41 | 27.13 | 0.30 % |
+//! | + guard 1, demoting band 2 | 86.6k + 15.8k | 7.5 MB/s | 28.40 | 27.12 | 0.25 % |
+//!
+//! *Holes*: the share of the pixels well inside the dancer, in close-ups,
+//! that the stacked live layer closes and the fused one leaves open (inside
+//! no opaque visibility disc). With realistic sensor noise the same rows
+//! read 0.88, 0.58, 0.21, 0.21 and 0.11 %: the depth test alone lets the
+//! floor show through a forearm, the default does not.
+//!
+//! Under sorted "over" compositing a fused cloud needs a larger footprint to
+//! stay closed ([`crate::protocol::SORTED_SPLAT_SCALE`]): eight overlapping
+//! clouds no longer hide the gaps between the splats of one camera.
 //!
 //! # What was tried and dropped
 //!
-//! Measured on the default stage with realistic sensor noise, eight 240x180
-//! cameras, normalised blending (`examples/quality_report.rs`):
+//! Measured with realistic sensor noise under normalised blending:
 //!
 //! * *Hysteresis* (a quality bonus for the pixels kept on the previous
 //!   tick): no effect on the flicker of a still subject, at any strength.
 //!   The seams between cameras do not wander enough to show.
-//! * *Keeping the dominated splats with a reduced blending weight*
+//! * *Keeping every dominated splat with a reduced blending weight*
 //!   (`(q / q_best)^p` in the opacity byte): +0.2 dB without noise, nothing
-//!   with noise, for 60 % more splats on the wire.
+//!   with noise, for 60 % more splats on the wire. The demoting band is the
+//!   part of that idea that pays.
+//! * *A plain guard two or three pixels wide* closes the same holes as the
+//!   demoting band and costs 0.15 dB per pixel of width: the splats it keeps
+//!   blur the better camera's picture at full weight.
 //!
-//! What a fused cloud of a still, noisy subject does flicker more than the
-//! stacked one (4 to 11 % in RMS) comes from averaging fewer observations
-//! per pixel; with the subject moving it flickers 4 to 7 % less.
+//! A fused cloud of a still, noisy subject flickers 4 to 6 % more than the
+//! stacked one over the area of the subject (it averages fewer observations
+//! per pixel); with the subject moving it flickers 2 to 8 % less.
 //!
 //! # Cost
 //!
@@ -105,11 +143,27 @@ pub struct MultiViewParams {
     /// 4-neighbours produced no splat, and so on inward. `0` disables the
     /// guard.
     pub edge_guard: u32,
+    /// Width in pixels of the band behind that rim whose splats only
+    /// *demote* what they are better than: the other splat stays, with its
+    /// opacity (its blending weight in the normalised mode) multiplied by
+    /// [`Self::demoted_weight`]. `0` disables the band.
+    pub demote_band: u32,
+    /// Opacity factor of a demoted splat, `0..=1`.
+    pub demoted_weight: f32,
 }
 
 impl Default for MultiViewParams {
     fn default() -> Self {
-        Self { enabled: true, margin: 0.25, tolerance: 0.03, min_normal_dot: 0.3, plane_tolerance: 0.006, edge_guard: 2 }
+        Self {
+            enabled: true,
+            margin: 0.25,
+            tolerance: 0.03,
+            min_normal_dot: 0.3,
+            plane_tolerance: 0.006,
+            edge_guard: 1,
+            demote_band: 1,
+            demoted_weight: 0.25,
+        }
     }
 }
 
@@ -126,6 +180,8 @@ impl MultiViewParams {
             min_normal_dot: clamp(self.min_normal_dot, d.min_normal_dot, -1.0, 1.0),
             plane_tolerance: clamp(self.plane_tolerance, d.plane_tolerance, 1.0e-4, 0.5),
             edge_guard: self.edge_guard.min(16),
+            demote_band: self.demote_band.min(16),
+            demoted_weight: clamp(self.demoted_weight, d.demoted_weight, 0.0, 1.0),
         }
     }
 }
@@ -146,6 +202,8 @@ pub struct FusionStats {
     pub input: usize,
     /// Splats in the output.
     pub kept: usize,
+    /// Of those, the ones kept with a reduced opacity.
+    pub demoted: usize,
 }
 
 /// Samples per square meter of surface of an observation: what the best
@@ -157,6 +215,8 @@ pub fn quality(cam: &Camera, splat: &SourcedSplat) -> f32 {
 }
 
 const NONE: u32 = u32::MAX;
+/// Flag on a splat index: this dominator only demotes.
+const WEAK: u32 = 1 << 31;
 
 /// What the fusion needs to know about a splat that may dominate another.
 #[derive(Clone, Copy)]
@@ -180,7 +240,8 @@ struct Table {
     height: f32,
     stride: usize,
     /// Pixel → index of the splat it produced, when that splat may dominate
-    /// others; [`NONE`] otherwise.
+    /// others; [`NONE`] otherwise. [`WEAK`] is set on the index of a splat
+    /// in the band that only demotes.
     slot: Vec<u32>,
     covers: Vec<Cover>,
     /// Index of the camera's first splat in the global numbering.
@@ -192,24 +253,47 @@ impl Table {
         let cam = view.cam;
         let (w, h) = (cam.width as usize, cam.height as usize);
         let mut emitted = vec![NONE; w * h];
+        // The rectangle of pixels that produced splats: on the live layer a
+        // small part of the image, and all the peeling has to look at.
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
         for (k, s) in view.splats.iter().enumerate() {
             if let Some(slot) = emitted.get_mut(s.pixel as usize) {
                 *slot = k as u32;
+                let (x, y) = (s.pixel as usize % w, s.pixel as usize / w);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
             }
         }
+        // A pixel on the image border is on the rim.
+        let (x0, y0, x1, y1) = (x0.max(1), y0.max(1), x1.min(w.saturating_sub(1)), y1.min(h.saturating_sub(1)));
         // Peel the rim off `edge_guard` times: what is left may dominate.
-        let mut slot = emitted;
-        for _ in 0..params.edge_guard {
+        // Peel `demote_band` times more: what is left dominates outright,
+        // what went in between only demotes.
+        let peel = |slot: &[u32]| {
             let has = |x: usize, y: usize| slot[y * w + x] != NONE;
             let mut inner = vec![NONE; w * h];
-            for y in 1..h.saturating_sub(1) {
-                for x in 1..w.saturating_sub(1) {
-                    if has(x - 1, y) && has(x + 1, y) && has(x, y - 1) && has(x, y + 1) {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if has(x, y) && has(x - 1, y) && has(x + 1, y) && has(x, y - 1) && has(x, y + 1) {
                         inner[y * w + x] = slot[y * w + x];
                     }
                 }
             }
-            slot = inner;
+            inner
+        };
+        let mut slot = emitted;
+        for _ in 0..params.edge_guard {
+            slot = peel(&slot);
+        }
+        if params.demote_band > 0 {
+            let mut strong = peel(&slot);
+            for _ in 1..params.demote_band {
+                strong = peel(&strong);
+            }
+            for (index, strong) in slot.iter_mut().zip(&strong) {
+                if *index != NONE && *strong == NONE {
+                    *index |= WEAK;
+                }
+            }
         }
         let covers = view
             .splats
@@ -240,7 +324,8 @@ impl Table {
 }
 
 /// The splats that dominate the splats of one camera: for splat `k`, the
-/// global indices `list[end[k − 1]..end[k]]`.
+/// global indices `list[end[k − 1]..end[k]]`, with [`WEAK`] set on those
+/// that only demote.
 #[derive(Default)]
 struct Dominators {
     end: Vec<u32>,
@@ -286,17 +371,18 @@ fn dominators(tables: &[Table], own: usize, view: &View, params: &MultiViewParam
             if !(u >= 0.0 && v >= 0.0 && u < table.width && v < table.height) {
                 continue;
             }
-            let index = table.slot[v as usize * table.stride + u as usize];
-            if index == NONE {
+            let slot = table.slot[v as usize * table.stride + u as usize];
+            if slot == NONE {
                 continue;
             }
+            let index = slot & !WEAK;
             let other = &table.covers[index as usize];
             if other.quality > needed
                 && (other.depth - z).abs() <= tolerance * z
                 && other.normal.dot(normal) >= params.min_normal_dot
                 && other.normal.dot(p - other.position).abs() <= params.plane_tolerance * z
             {
-                out.list.push(table.first + index);
+                out.list.push((table.first + index) | (slot & WEAK));
             }
         }
         out.end.push(out.list.len() as u32);
@@ -304,51 +390,57 @@ fn dominators(tables: &[Table], own: usize, view: &View, params: &MultiViewParam
     out
 }
 
-/// Decides which splats stay: a splat goes when one of its dominators stays.
+/// What becomes of a splat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    Kept,
+    /// Kept with a reduced opacity.
+    Demoted,
+    Dropped,
+}
+
+/// Decides which splats stay: a splat goes when one of its dominators
+/// stays, and is demoted when only dominators flagged [`WEAK`] stay.
 ///
 /// `dominated(g)` lists the dominators of splat `g`; all of them have a
 /// strictly higher quality than `g`, so the recursion ends.
-fn resolve<'a>(total: usize, dominated: impl Fn(usize) -> &'a [u32]) -> Vec<bool> {
-    const UNKNOWN: u8 = 0;
-    const KEPT: u8 = 1;
-    const DROPPED: u8 = 2;
-    let mut state = vec![UNKNOWN; total];
+fn resolve<'a>(total: usize, dominated: impl Fn(usize) -> &'a [u32]) -> Vec<Fate> {
+    let mut fate: Vec<Option<Fate>> = vec![None; total];
     let mut stack: Vec<u32> = Vec::new();
     for start in 0..total {
-        if state[start] != UNKNOWN {
+        if fate[start].is_some() {
             continue;
         }
         stack.push(start as u32);
-        while let Some(&g) = stack.last() {
+        'pending: while let Some(&g) = stack.last() {
             let g = g as usize;
-            let mut verdict = KEPT;
-            for &c in dominated(g) {
-                match state[c as usize] {
-                    KEPT => {
-                        verdict = DROPPED;
-                        break;
-                    }
-                    UNKNOWN => {
-                        // Decide the dominator first, then come back.
-                        verdict = UNKNOWN;
+            let mut verdict = Fate::Kept;
+            for &entry in dominated(g) {
+                let c = entry & !WEAK;
+                match fate[c as usize] {
+                    // Decide the dominator first, then come back.
+                    None => {
                         stack.push(c);
+                        continue 'pending;
+                    }
+                    Some(Fate::Dropped) => {}
+                    Some(_) if entry & WEAK == 0 => {
+                        verdict = Fate::Dropped;
                         break;
                     }
-                    _ => {}
+                    Some(_) => verdict = Fate::Demoted,
                 }
             }
-            if verdict != UNKNOWN {
-                state[g] = verdict;
-                stack.pop();
-            }
+            fate[g] = Some(verdict);
+            stack.pop();
         }
     }
-    state.into_iter().map(|s| s == KEPT).collect()
+    fate.into_iter().map(|f| f.unwrap_or(Fate::Kept)).collect()
 }
 
 /// Fuses the splats of a camera ring into `out` (cleared first): the kept
-/// splats in camera order, each camera's in pixel order. See the module
-/// documentation.
+/// splats in camera order, each camera's in pixel order, the demoted ones
+/// among them with their reduced opacity. See the module documentation.
 ///
 /// With [`MultiViewParams::enabled`] off, or a single view, this is the
 /// plain concatenation. A view whose splats do not belong to its camera's
@@ -357,9 +449,9 @@ pub fn fuse(views: &[View], params: &MultiViewParams, out: &mut Vec<Splat>) -> F
     out.clear();
     let total: usize = views.iter().map(|v| v.splats.len()).sum();
     out.reserve(total);
-    if !params.enabled || views.len() < 2 || total >= NONE as usize {
+    if !params.enabled || views.len() < 2 || total >= WEAK as usize {
         out.extend(views.iter().flat_map(|v| v.splats.iter().map(|s| s.splat)));
-        return FusionStats { input: total, kept: total };
+        return FusionStats { input: total, kept: total, demoted: 0 };
     }
     let mut firsts = Vec::with_capacity(views.len());
     let mut first = 0u32;
@@ -384,23 +476,28 @@ pub fn fuse(views: &[View], params: &MultiViewParams, out: &mut Vec<Splat>) -> F
     for (i, view) in views.iter().enumerate() {
         owner.resize(owner.len() + view.splats.len(), i as u32);
     }
-    let kept = resolve(total, |g| {
+    let fates = resolve(total, |g| {
         let i = owner[g] as usize;
         let k = g - firsts[i] as usize;
         let list = &found[i];
         let start = if k == 0 { 0 } else { list.end[k - 1] as usize };
         &list.list[start..list.end[k] as usize]
     });
-    let mut g = 0;
-    for view in views {
-        for s in view.splats {
-            if kept[g] {
-                out.push(s.splat);
+    let mut demoted = 0;
+    for (s, fate) in views.iter().flat_map(|v| v.splats).zip(&fates) {
+        match fate {
+            Fate::Kept => out.push(s.splat),
+            Fate::Demoted => {
+                let mut splat = s.splat;
+                // At least 1: an opacity of 0 would make the splat vanish.
+                splat.rgba[3] = ((splat.rgba[3] as f32 * params.demoted_weight).round() as u8).max(1);
+                out.push(splat);
+                demoted += 1;
             }
-            g += 1;
+            Fate::Dropped => {}
         }
     }
-    FusionStats { input: total, kept: out.len() }
+    FusionStats { input: total, kept: out.len(), demoted }
 }
 
 #[cfg(test)]
@@ -475,8 +572,8 @@ mod tests {
         for list in splats {
             let mut kept = Vec::new();
             for s in list {
-                if rest.first() == Some(&s.splat) {
-                    kept.push(s.splat);
+                if rest.first().is_some_and(|first| same_but_opacity(first, &s.splat)) {
+                    kept.push(rest[0]);
                     rest = &rest[1..];
                 }
             }
@@ -486,8 +583,22 @@ mod tests {
         (per_view, stats)
     }
 
-    const GREEDY: MultiViewParams =
-        MultiViewParams { enabled: true, margin: 0.0, tolerance: 0.03, min_normal_dot: 0.3, plane_tolerance: 0.006, edge_guard: 2 };
+    /// One camera per surface point, no demotion: the bare rule.
+    const GREEDY: MultiViewParams = MultiViewParams {
+        enabled: true,
+        margin: 0.0,
+        tolerance: 0.03,
+        min_normal_dot: 0.3,
+        plane_tolerance: 0.006,
+        edge_guard: 1,
+        demote_band: 0,
+        demoted_weight: 0.25,
+    };
+
+    /// The same splat, whatever its opacity.
+    fn same_but_opacity(a: &Splat, b: &Splat) -> bool {
+        (a.pos, a.scale, a.rot, &a.rgba[..3]) == (b.pos, b.scale, b.rot, &b.rgba[..3])
+    }
 
     #[test]
     fn the_frontal_camera_wins_and_nothing_else_changes() {
@@ -603,6 +714,19 @@ mod tests {
             }
         }
         assert!(kept_before < splats[1].len(), "a guard of 4 pixels keeps everything of a patch 38 pixels wide");
+
+        // A band that demotes keeps exactly what a guard of the same total
+        // width keeps; the splats the wider guard saved carry less opacity.
+        let (narrow, _) = fused(&cams, &splats, &MultiViewParams { edge_guard: 1, ..GREEDY });
+        let (wide, _) = fused(&cams, &splats, &MultiViewParams { edge_guard: 3, ..GREEDY });
+        let (banded, stats) = fused(&cams, &splats, &MultiViewParams { edge_guard: 1, demote_band: 2, demoted_weight: 0.5, ..GREEDY });
+        assert_eq!(banded[1].len(), wide[1].len());
+        assert!(banded[1].iter().zip(&wide[1]).all(|(a, b)| same_but_opacity(a, b)));
+        let full = splats[1][0].splat.rgba[3];
+        let faint = banded[1].iter().filter(|s| s.rgba[3] == (full as f32 * 0.5).round() as u8).count();
+        assert_eq!(faint, wide[1].len() - narrow[1].len());
+        assert_eq!((stats.demoted, banded[0].len()), (faint, splats[0].len()));
+        assert!(faint > 20 && banded[1].iter().all(|s| s.rgba[3] == full || s.rgba[3] == (full as f32 * 0.5).round() as u8));
     }
 
     #[test]
@@ -637,7 +761,7 @@ mod tests {
         let ball = Some((Vec3::new(0.2, 0.4, 0.1), 0.4));
         let frames: Vec<RgbdFrame> = cams.iter().map(|c| shoot(c, |p| p.length() < 1.2, ball)).collect();
         let splats = candidates(&cams, &frames);
-        for params in [GREEDY, MultiViewParams::default(), MultiViewParams { edge_guard: 0, ..GREEDY }] {
+        for params in [GREEDY, MultiViewParams::default(), MultiViewParams { edge_guard: 0, demote_band: 2, ..GREEDY }] {
             let all = views(&cams, &splats);
             let tables: Vec<Table> = {
                 let mut first = 0;
@@ -661,20 +785,40 @@ mod tests {
             }
             // Every dominator is strictly better.
             for (g, list) in dominated.iter().enumerate() {
-                assert!(list.iter().all(|&c| quality[c as usize] > quality[g]));
+                assert!(list.iter().all(|&c| quality[(c & !WEAK) as usize] > quality[g]));
             }
             let mut order: Vec<usize> = (0..quality.len()).collect();
             order.sort_by(|&a, &b| quality[b].total_cmp(&quality[a]).then(a.cmp(&b)));
-            let mut expected = vec![true; quality.len()];
+            let mut expected = vec![Fate::Kept; quality.len()];
             for &g in &order {
-                expected[g] = !dominated[g].iter().any(|&c| expected[c as usize]);
+                let stays = |c: &&u32| expected[(**c & !WEAK) as usize] != Fate::Dropped;
+                expected[g] = if dominated[g].iter().filter(stays).any(|&c| c & WEAK == 0) {
+                    Fate::Dropped
+                } else if dominated[g].iter().any(|c| stays(&c)) {
+                    Fate::Demoted
+                } else {
+                    Fate::Kept
+                };
             }
             let mut out = Vec::new();
             let stats = fuse(&all, &params, &mut out);
-            let reference: Vec<Splat> =
-                splats.iter().flatten().zip(&expected).filter(|(_, keep)| **keep).map(|(s, _)| s.splat).collect();
+            let reference: Vec<Splat> = splats
+                .iter()
+                .flatten()
+                .zip(&expected)
+                .filter(|(_, fate)| **fate != Fate::Dropped)
+                .map(|(s, fate)| {
+                    let mut splat = s.splat;
+                    if *fate == Fate::Demoted {
+                        splat.rgba[3] = ((splat.rgba[3] as f32 * params.demoted_weight).round() as u8).max(1);
+                    }
+                    splat
+                })
+                .collect();
             assert_eq!(out, reference, "{params:?}");
             assert!(stats.kept < stats.input);
+            assert_eq!(stats.demoted, expected.iter().filter(|f| **f == Fate::Demoted).count());
+            assert_eq!(stats.demoted > 0, params.demote_band > 0, "{params:?}");
         }
     }
 
@@ -704,9 +848,12 @@ mod tests {
             min_normal_dot: f32::INFINITY,
             plane_tolerance: f32::NEG_INFINITY,
             edge_guard: u32::MAX,
+            demote_band: u32::MAX,
+            demoted_weight: f32::NAN,
         };
         let tame = wild.sanitized();
         assert_eq!((tame.margin, tame.tolerance, tame.min_normal_dot, tame.plane_tolerance), (0.25, 1.0e-4, 0.3, 0.006));
+        assert_eq!((tame.edge_guard, tame.demote_band, tame.demoted_weight), (16, 16, 0.25));
         assert_eq!(tame.sanitized(), tame);
         assert_eq!(serde_json::from_str::<MultiViewParams>("{}").unwrap(), MultiViewParams::default());
     }

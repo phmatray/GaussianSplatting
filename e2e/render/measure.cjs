@@ -49,8 +49,28 @@ const scene = (page, fn, ...args) => page.evaluate(([f, a]) => window.__scene[f]
 const sceneCmd = (page, name, arg) => page.evaluate(([n, a]) => window.__scene.cmd(n, a), [name, arg]);
 const load = () => os.loadavg().map((x) => Number(x.toFixed(2)));
 
+// Wraps a requestAnimationFrame so that the time spent inside its callbacks
+// (the viewer's whole frame: sort, uploads, draw calls) adds up in
+// window.__raf: the main-thread time per frame, unsmoothed.
+const TIME_FRAME_CALLBACKS = `(target, name) => {
+  window.__raf = window.__raf || { ms: 0, calls: 0 };
+  const real = target[name];
+  target[name] = function (callback) {
+    return real.call(this, (...args) => {
+      const start = performance.now();
+      try {
+        return callback(...args);
+      } finally {
+        window.__raf.ms += performance.now() - start;
+        window.__raf.calls++;
+      }
+    });
+  };
+}`;
+
 async function open(browser, url, sceneName, { patch = null, extra = '', iwer = false, width = 1280, height = 720 } = {}) {
   const { ctx, page, logs } = await newPage(browser, { width, height, iwer });
+  await page.addInitScript(`(${TIME_FRAME_CALLBACKS})(window, 'requestAnimationFrame')`);
   const query = `?test=scene&scene=${sceneName}${patch ? `&patch=${encodeURIComponent(patch)}` : ''}${extra}`;
   await page.goto(`${url}/${query}`);
   await page.waitForFunction(() => window.__ready || window.__error, null, { timeout: 900000 });
@@ -169,23 +189,26 @@ async function loopTiming(page, frames) {
     for (let i = 1; i <= 4; i++) { turn(i); await frame(); }
     const a = window.__scene.state();
     const t0 = performance.now();
-    let cpu = 0, sort = 0;
+    const raf0 = window.__raf.ms;
+    let sort = 0;
     for (let i = 5; i < 5 + frames; i++) {
       turn(i);
       await frame();
       const s = window.__scene.state();
-      cpu += s.frameMs;
       sort += s.blend === 'sorted' ? s.sortMs : 0;
     }
     const b = window.__scene.state();
+    const cpu = window.__raf.ms - raf0;
     window.__scene.cmd('view', [ex, ey, ez, tx, ty, tz]);
     const rendered = b.framesRendered - a.framesRendered;
     return {
       blend: b.blend,
       frames: rendered,
       intervalMs: (performance.now() - t0) / Math.max(rendered, 1),
-      // Smoothed by the viewer (weight 0.1 per frame): an average over the run.
-      mainThreadMs: cpu / frames,
+      // Time inside the animation-frame callbacks, per rendered frame.
+      mainThreadMs: cpu / Math.max(rendered, 1),
+      // Duration of the most recent sort as the viewer reports it, averaged
+      // over the frames (a slow sort runs every other frame).
       sortMs: sort / frames,
       sortsPerFrame: (b.sorts - a.sorts) / Math.max(rendered, 1),
       splatsDrawn: b.splatsDrawn,
@@ -260,6 +283,7 @@ async function flicker(browser, url, report) {
 
 async function xr(browser, url, sceneName, report) {
   const { ctx, page, logs } = await open(browser, url, sceneName, { iwer: true });
+  await page.evaluate(`(${TIME_FRAME_CALLBACKS})(XRSession.prototype, 'requestAnimationFrame')`);
   await sceneCmd(page, 'enterXr');
   await page.waitForFunction(() => window.__scene.state().xrActive && window.__scene.state().xrFrames > 2, null, { timeout: 60000 });
   report.xr = [];
@@ -273,12 +297,12 @@ async function xr(browser, url, sceneName, report) {
       for (let i = 0; i < 4; i++) { yaw(i); await wait(1); }
       const a = window.__scene.state();
       const t0 = performance.now();
-      let cpu = 0, sort = 0;
+      const raf0 = window.__raf.ms;
+      let sort = 0;
       for (let i = 4; i < 4 + frames; i++) {
         yaw(i);
         await wait(1);
         const s = window.__scene.state();
-        cpu += s.frameMs;
         sort += s.blend === 'sorted' ? s.sortMs : 0;
       }
       const b = window.__scene.state();
@@ -288,7 +312,7 @@ async function xr(browser, url, sceneName, report) {
         offscreen: b.offscreen,
         frames: b.xrFrames - a.xrFrames,
         intervalMs: (performance.now() - t0) / Math.max(b.xrFrames - a.xrFrames, 1),
-        mainThreadMs: cpu / frames,
+        mainThreadMs: (window.__raf.ms - raf0) / Math.max(b.xrFrames - a.xrFrames, 1),
         sortMs: sort / frames,
         sortsPerFrame: (b.sorts - a.sorts) / Math.max(b.xrFrames - a.xrFrames, 1),
       };

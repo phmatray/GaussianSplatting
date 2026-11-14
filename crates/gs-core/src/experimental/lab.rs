@@ -336,10 +336,13 @@ mod tests {
         assert_eq!(fused.fixed_stats.kept, fused.fixed.len());
         assert_eq!(fused.live_stats.input, cloud.live.len());
         // The product's fusion (`crate::multiview`) follows the prototype's
-        // greedy rule with the same margin. It skips cameras behind a
-        // splat's surface, which the prototype asks all the same: the two
-        // agree on all but a few splats.
-        let product = Pipeline::new(PipelineConfig { fusion: Default::default(), ..config });
+        // greedy rule with the same margin once what it adds to that rule
+        // is switched off (the tangent-plane test and the demoting band
+        // behind a camera's rim). It skips cameras behind a splat's
+        // surface, which the prototype asks all the same: the two agree on
+        // all but a few splats.
+        let bare = crate::multiview::MultiViewParams { plane_tolerance: 0.5, demote_band: 0, ..Default::default() };
+        let product = Pipeline::new(PipelineConfig { fusion: bare, ..config });
         let margin = product.config().fusion.margin;
         let prototype = FusionParams { margin, carve: false, ..FusionParams::default() };
         let fused = stage_cloud(&capture, &candidates, Some(&prototype), None);
@@ -347,6 +350,11 @@ mod tests {
             let (a, b) = (ours.len() as f32, theirs.len() as f32);
             assert!(a < 0.9 * cloud.fixed.len() as f32 && (a - b).abs() <= 0.02 * b, "{a} against {b}");
         }
+        // The product's default keeps a little more: the band.
+        let default = Pipeline::new(PipelineConfig { fusion: Default::default(), ..config });
+        assert!(default.static_splats().len() > product.static_splats().len());
+        assert!(default.dynamic_splats().len() > product.dynamic_splats().len());
+        assert!(default.static_splats().len() < cloud.fixed.len() * 9 / 10);
         // A subset of the ring.
         let two = stage_cloud(&capture, &candidates, None, Some(&[0, 2]));
         assert_eq!(two.fixed.len(), candidates.fixed[0].len() + candidates.fixed[2].len());

@@ -23,13 +23,15 @@ use common::{
     scan_path_distance, side_by_side, stack, stage_view_above, stage_views, Client, Exposures, Renderer, Score, BACKGROUND,
     HALL_VIEW_CLEARANCE, HOUSE_VIEW_CLEARANCE, HOUSE_VIEW_PATH_DISTANCE,
 };
-use gs_core::capture::{render_reference, NoiseModel};
+use gs_core::capture::{render_reference, render_rgbd, CaptureOptions, NoiseModel};
 use gs_core::experimental::metrics::dilate;
+use gs_core::experimental::wblend::{self, Blend, Coverage, Layer, Normalized, Silhouette, WblendOptions};
 use gs_core::glam::{Mat4, Quat, Vec3};
 use gs_core::pipeline::{scan_frame, scan_frame_count, scan_sensor, Pipeline};
 use gs_core::protocol::{CameraInfo, ControlMsg, PipelineConfig, ScanHead, ScanState};
 use gs_core::raster::{psnr, Image};
 use gs_core::rig::ScanPath;
+use gs_core::scene::stage::StageScene;
 use gs_core::scene::{house, make_scene, SceneKind, SceneSnapshot};
 use gs_core::{Camera, Splat};
 
@@ -158,18 +160,18 @@ fn stage_default_settings() {
     let [normalized, sorted] = &tallies;
     let (fixed, live) = (client.layers[0].len(), client.layers[1].len());
     println!("stage default: {fixed} + {live} splats");
-    // Measured, normalised: mean 28.63 dB, worst view 24.46 dB (the one
-    // from above, which sees floor that no camera sees), SSIM 0.941; around
-    // color edges 25.4 dB, around silhouettes 21.0 dB.
+    // Measured, normalised: mean 28.54 dB, worst view 24.42 dB (the one
+    // from above, which sees floor that no camera sees), SSIM 0.940; around
+    // color edges 25.3 dB, around silhouettes 20.9 dB.
     let (mean_psnr, worst, ssim) = normalized.headline();
     assert!(mean_psnr >= 28.2 && worst >= 24.0 && ssim >= 0.93, "normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
     assert!(mean(&normalized.texture) >= 24.9, "texture {:.2} dB", mean(&normalized.texture));
     assert!(mean(&normalized.silhouette) >= 20.5, "silhouettes {:.2} dB", mean(&normalized.silhouette));
-    // Measured, sorted fallback: mean 26.61 dB, worst 23.78 dB, SSIM 0.904.
+    // Measured, sorted fallback: mean 26.40 dB, worst 23.68 dB, SSIM 0.902.
     let (mean_psnr, worst, ssim) = sorted.headline();
     assert!(mean_psnr >= 26.2 && worst >= 23.3 && ssim >= 0.894, "sorted: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
 
-    // Static plate about 83k splats, live layer about 12.6k: 16 bytes each.
+    // Static plate about 85k splats, live layer about 14k: 16 bytes each.
     assert!((70_000..95_000).contains(&fixed), "{fixed}");
     assert!((8_000..17_000).contains(&live), "{live}");
     let stats = client.stats();
@@ -182,10 +184,10 @@ fn stage_with_sensor_noise() {
     let config = PipelineConfig { noise: NoiseModel::realistic(), ..PipelineConfig::for_scene(SceneKind::Stage) };
     let (tallies, client) = stage_scores(config, &[1.3, 3.2], "stage with noise");
     let [normalized, sorted] = &tallies;
-    // Measured, normalised: mean 27.25 dB, worst 23.98 dB, SSIM 0.929.
+    // Measured, normalised: mean 27.05 dB, worst 23.93 dB, SSIM 0.928.
     let (mean_psnr, worst, ssim) = normalized.headline();
     assert!(mean_psnr >= 26.8 && worst >= 23.5 && ssim >= 0.919, "normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
-    // Measured, sorted fallback: mean 25.82 dB, worst 23.50 dB, SSIM 0.894.
+    // Measured, sorted fallback: mean 25.55 dB, worst 23.40 dB, SSIM 0.892.
     let (mean_psnr, worst, ssim) = sorted.headline();
     assert!(mean_psnr >= 25.4 && worst >= 23.0 && ssim >= 0.884, "sorted: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
     // Noise must not leak background into the live layer.
@@ -195,7 +197,7 @@ fn stage_with_sensor_noise() {
 #[test]
 fn stage_light_preset_and_without_background_subtraction() {
     // Measured, light preset (eight 160x120 cameras): normalised mean
-    // 27.42 dB (worst 24.08), SSIM 0.921; sorted 25.92 dB (worst 23.68).
+    // 27.37 dB (worst 24.06), SSIM 0.921; sorted 25.63 dB (worst 23.56).
     let (tallies, client) = stage_scores(PipelineConfig::light(SceneKind::Stage), &[2.1], "stage light");
     let (mean_psnr, worst, ssim) = tallies[0].headline();
     assert!(mean_psnr >= 27.0 && worst >= 23.6 && ssim >= 0.911, "light, normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
@@ -203,8 +205,8 @@ fn stage_light_preset_and_without_background_subtraction() {
     assert!(mean_psnr >= 25.5 && worst >= 23.2, "light, sorted: {mean_psnr:.2} dB, worst {worst:.2}");
     assert_eq!(client.stats().pixels, 8 * 160 * 120);
 
-    // Measured, everything live: normalised mean 29.22 dB (worst 24.60),
-    // SSIM 0.949; sorted 27.05 dB (worst 24.03).
+    // Measured, everything live: normalised mean 29.17 dB (worst 24.58),
+    // SSIM 0.948; sorted 26.89 dB (worst 23.89).
     let config = PipelineConfig { background_subtraction: false, ..PipelineConfig::for_scene(SceneKind::Stage) };
     let (tallies, client) = stage_scores(config, &[2.1], "stage all live");
     let (mean_psnr, worst, ssim) = tallies[0].headline();
@@ -289,11 +291,11 @@ fn the_dancers_shadow_is_reconstructed_without_a_halo() {
             mean(&picked)
         };
         // Measured (normalised, clean / noisy): in the shadow the
-        // reconstruction is 5.9 / 6.4 levels from the shadowed truth and 47
+        // reconstruction is 5.9 / 6.3 levels from the shadowed truth and 48
         // from the lit one; the plate alone is 38 levels off. In the band
-        // around the shadow: 5.1 / 5.5 levels, against 5.0 / 5.3 for the
-        // plate alone. Sorted: 6.8 / 7.4 and 52 levels in the shadow, 10.4
-        // in the band against 10.3 / 10.2.
+        // around the shadow: 5.1 / 5.5 levels, against 5.0 / 5.4 for the
+        // plate alone. Sorted: 7.5 / 7.8 and 53 levels in the shadow, 10.6 /
+        // 10.5 in the band against 10.4 / 10.3.
         let (to_shadow, to_lit) = (error(&reconstruction, &with_shadow, &shadow), error(&reconstruction, &without, &shadow));
         let plate_to_shadow = error(&static_only, &with_shadow, &shadow);
         // Around the shadow the floor is as good as without live layer.
@@ -361,15 +363,15 @@ fn a_frozen_scene_does_not_flicker_under_sensor_noise() {
              {fused_rms:.2} levels rms, {stacked_rms:.2} without fusion",
             renderer.name()
         );
-        // Measured, normalised: 36.1 dB between consecutive ticks, 1.2
-        // levels in the shadow, 3.45 levels rms against 2.99 without fusion.
-        // Sorted: 36.4 dB, 1.8 levels, 3.26 against 3.00. The fused cloud
-        // averages fewer observations per pixel, which is where its 9 to
-        // 15 % come from (a hysteresis on the choice of camera changes
+        // Measured, normalised: 36.4 dB between consecutive ticks, 1.1
+        // levels in the shadow, 3.34 levels rms against 2.99 without fusion.
+        // Sorted: 36.5 dB, 1.8 levels, 3.19 against 3.00. The fused cloud
+        // averages fewer observations per pixel, which is where its 6 to
+        // 12 % come from (a hysteresis on the choice of camera changes
         // nothing; see `gs_core::multiview`).
-        assert!(worst_psnr > 34.0, "{}: consecutive ticks differ: {worst_psnr:.1} dB", renderer.name());
+        assert!(worst_psnr > 35.0, "{}: consecutive ticks differ: {worst_psnr:.1} dB", renderer.name());
         assert!(worst_shadow < 4.0, "{}: the shadow flickers by {worst_shadow:.2} levels", renderer.name());
-        assert!(fused_rms < 1.25 * stacked_rms, "{}: {fused_rms:.2} levels against {stacked_rms:.2} stacked", renderer.name());
+        assert!(fused_rms < 1.16 * stacked_rms, "{}: {fused_rms:.2} levels against {stacked_rms:.2} stacked", renderer.name());
     }
 }
 
@@ -391,11 +393,95 @@ fn a_moving_scene_changes_like_the_ground_truth() {
         let (fused_rms, stacked_rms) = (flicker(&frames, Some(&truth)), flicker(&stacked_frames, Some(&truth)));
         println!("moving scene, {label}: the truth changes by {truth_rms:.2} levels rms; unexplained change {fused_rms:.2}, {stacked_rms:.2} without fusion");
         // Measured: the truth changes by 10.7 levels rms; unexplained
-        // change 7.17 levels (clean) and 8.07 (noisy), against 7.50 and 8.31
+        // change 7.20 levels (clean) and 8.07 (noisy), against 7.50 and 8.31
         // without fusion.
         assert!(truth_rms > 5.0, "the dance stands still: {truth_rms:.2}");
         assert!(fused_rms < 9.0, "{label}: {fused_rms:.2} levels of flicker");
         assert!(fused_rms < 1.02 * stacked_rms, "{label}: {fused_rms:.2} levels against {stacked_rms:.2} stacked");
+    }
+}
+
+/// The live layer of the stage at scene time `t`.
+fn live_layer(config: PipelineConfig, t: f32) -> Vec<Splat> {
+    let mut pipeline = Pipeline::new(config);
+    let mut client = Client::default();
+    client.apply(&pipeline.snapshot());
+    client.apply(&pipeline.tick(t));
+    std::mem::take(&mut client.layers[1])
+}
+
+/// Share of the pixels well inside the dancer, seen from close-ups all
+/// around the chest at three instants, that the stacked live layer closes
+/// and the fused one leaves open, and the share the fused one leaves open
+/// at all. "Closed" means inside an opaque visibility disc of the normalised
+/// mode's hard level, the layer drawn alone with back faces culled, so that
+/// neither the far side of a limb nor the plate hides a hole.
+fn holes_of_the_fusion(config: PipelineConfig) -> (f32, f32) {
+    let scene = make_scene(SceneKind::Stage);
+    let empty = scene.snapshot_static();
+    let hard = WblendOptions::normalized_hard();
+    let Blend::Normalized(params) = hard.blend else { panic!("the hard level is normalised") };
+    let discs = WblendOptions {
+        cull_backfaces: true,
+        blend: Blend::Normalized(Normalized { vis_cutoff: 1.6, coverage: Coverage::None, silhouette: Silhouette::Hard, ..params }),
+        ..hard
+    };
+    let mut stacked_config = config;
+    stacked_config.fusion.enabled = false;
+    let clean = CaptureOptions { shadows: config.shadows, ..CaptureOptions::default() };
+    let (mut pixels, mut lost, mut open) = (0u32, 0u32, 0u32);
+    // Instants at which a hand passes in front of the body.
+    for t in [3.1, 7.9, 9.1] {
+        let (fused, stacked) = (live_layer(config, t), live_layer(stacked_config, t));
+        let snap = scene.snapshot(t);
+        let chest = StageScene::new().dancer_joints(t).chest;
+        for k in 0..6 {
+            let angle = (20.0 + 60.0 * k as f32).to_radians();
+            let eye = chest + Vec3::new(0.94 * angle.sin(), 0.34, 0.94 * angle.cos()) * 0.8;
+            let cam = Camera::look_at(eye, chest, Vec3::Y, 50f32.to_radians(), 320, 240);
+            let (full, plate) = (render_rgbd(&snap, &cam, &clean), render_rgbd(&empty, &cam, &clean));
+            let subject: Vec<bool> =
+                full.depth.iter().zip(&plate.depth).map(|(&z, &zp)| z > 0.0 && (zp == 0.0 || z < zp - 1.0e-3)).collect();
+            let outside: Vec<bool> = subject.iter().map(|inside| !inside).collect();
+            let rim = dilate(&outside, 320, 240, 2);
+            let coverage = |live: &[Splat]| wblend::render(&[Layer { splats: live, weight: 1.0 }], &cam, &discs).alpha;
+            let (a, b) = (coverage(&stacked), coverage(&fused));
+            for i in (0..subject.len()).filter(|&i| !rim[i]) {
+                pixels += 1;
+                open += u32::from(b[i] < 0.5);
+                lost += u32::from(b[i] < 0.5 && a[i] >= 0.5);
+            }
+        }
+    }
+    assert!(pixels > 100_000, "the close-ups show only {pixels} pixels of the dancer");
+    (lost as f32 / pixels as f32, open as f32 / pixels as f32)
+}
+
+#[test]
+fn the_fusion_opens_no_holes_in_the_dancer() {
+    for (label, noise) in [("clean", NoiseModel::NONE), ("noisy", NoiseModel::realistic())] {
+        let config = PipelineConfig { noise, ..PipelineConfig::for_scene(SceneKind::Stage) };
+        let (lost, open) = holes_of_the_fusion(config);
+        // The rule without the tangent-plane test and the demoting band:
+        // a hand could replace the chest behind it.
+        let mut old = config;
+        (old.fusion.plane_tolerance, old.fusion.demote_band) = (0.5, 0);
+        let (old_lost, old_open) = holes_of_the_fusion(old);
+        println!(
+            "holes, {label}: {:.3} % of the dancer closed by the stacked cloud is open in the fused one ({:.3} % open in all); \
+             {:.3} % ({:.3} %) with the depth test alone",
+            100.0 * lost,
+            100.0 * open,
+            100.0 * old_lost,
+            100.0 * old_open
+        );
+        // Measured: 0.188 % clean and 0.180 % noisy, against 0.272 % and
+        // 0.420 % with the depth test alone (0.48 % and 0.50 % of the dancer
+        // are open in all: what no camera sees, and pinholes between discs
+        // that the stacked cloud has as well).
+        assert!(lost < 0.0023, "{label}: {:.3} % of the dancer is open", 100.0 * lost);
+        assert!(lost < 0.75 * old_lost, "{label}: {lost} against {old_lost}");
+        assert!(open < 0.006, "{label}: {:.3} % of the dancer is open in all", 100.0 * open);
     }
 }
 
@@ -611,7 +697,7 @@ fn house_full_scan() {
     // bound keeps that much distance.
     assert!(mean_psnr >= 23.25 && worst >= 20.0 && ssim >= 0.84, "normalised: {mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
     assert!(mean(&normalized.coverage) >= 0.996, "mean coverage {:.4}", mean(&normalized.coverage));
-    assert!(min(&normalized.coverage) >= 0.97, "worst coverage {:.4}", min(&normalized.coverage));
+    assert!(min(&normalized.coverage) >= 0.973, "worst coverage {:.4}", min(&normalized.coverage));
     assert!(mean(&normalized.psnr_observed) >= 23.55, "mean observed PSNR {:.2} dB", mean(&normalized.psnr_observed));
     assert!(mean(&normalized.coverage_observed) >= 0.998, "mean observed coverage {:.4}", mean(&normalized.coverage_observed));
     assert!(min(&normalized.coverage_observed) >= 0.993, "worst observed coverage {:.4}", min(&normalized.coverage_observed));
@@ -645,7 +731,7 @@ fn house_light_preset_scan() {
     assert!((400_000..=460_000).contains(&client.layers[0].len()), "{} splats", client.layers[0].len());
     let (mean_psnr, worst, ssim) = tally.headline();
     assert!(mean_psnr >= 24.8 && worst >= 20.7 && ssim >= 0.85, "{mean_psnr:.2} dB, worst {worst:.2}, SSIM {ssim:.3}");
-    assert!(mean(&tally.coverage) >= 0.996 && min(&tally.coverage) >= 0.972, "{:?}", tally.coverage);
+    assert!(mean(&tally.coverage) >= 0.996 && min(&tally.coverage) >= 0.973, "{:?}", tally.coverage);
 }
 
 #[test]

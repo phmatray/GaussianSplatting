@@ -294,8 +294,8 @@ impl PipelineConfig {
     pub const RIG_RESOLUTIONS: [(u32, u32); 3] = [(160, 120), (240, 180), (320, 240)];
 
     /// The default configuration for a scene: eight 240x180 cameras for the
-    /// stage, fused across views (about 83 000 static splats and 12 600 live
-    /// ones, 6 MB/s at 30 Hz); a handheld head of five 192x144 sensors with
+    /// stage, fused across views (about 85 000 static splats and 14 000 live
+    /// ones, 6.8 MB/s at 30 Hz); a handheld head of five 192x144 sensors with
     /// an 80 degree vertical field of view and 2.4 cm cells for the house
     /// (about 756 000 splats for the whole scan, a walk of 67 s).
     pub fn for_scene(scene: SceneKind) -> Self {
@@ -317,7 +317,7 @@ impl PipelineConfig {
 
     /// A lighter configuration for single-threaded WebAssembly on a laptop or
     /// a standalone headset: eight 160x120 ring cameras at 20 Hz (about
-    /// 37 000 static and 6 000 live splats), and a scan head of 144x108
+    /// 38 000 static and 7 000 live splats), and a scan head of 144x108
     /// sensors taking 5 frames per second into 3.2 cm cells (about 430 000
     /// splats). On one native core a stage tick takes 10 ms and a scan tick
     /// 11 ms on average, 16 ms at the 95th percentile.
