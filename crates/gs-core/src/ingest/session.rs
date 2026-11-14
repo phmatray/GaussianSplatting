@@ -26,6 +26,22 @@
 //! phone reported (`floor` message), what the data shows (the lowest large
 //! horizontal surface facing up), or a guess (the phone 1.3 m above it).
 
+//!
+//! # A restarted application
+//!
+//! A capture is continued when the phone reconnects with the same name and
+//! mode. That is right while the application lives: ARKit's world is the
+//! same before and after a dropped connection. It is wrong once the
+//! application was restarted, because its AR session, and with it the
+//! origin and heading of the world, started again; frames of the new world
+//! would be fused across the old cloud. The frame index tells the two
+//! apart: it starts at 0 when the application starts and only grows, so a
+//! frame whose index is lower than one already taken comes from a new run
+//! of the application. The session then starts again from nothing, as
+//! after a `reset` (viewers get the empty session before that frame), and
+//! keeps only a region and a floor that the phone sent after its last
+//! frame, which already belong to the new world.
+
 use glam::{Quat, Vec3};
 use web_time::Instant;
 
@@ -138,6 +154,12 @@ pub struct CaptureSession {
     ceiling: Option<f32>,
     /// A person mask has been seen: frames without one show nobody.
     mask_seen: bool,
+    /// Highest frame index taken so far (see [`CaptureSession::restart`]).
+    last_index: Option<u32>,
+    /// The region, or the floor, was sent by the phone after the last frame
+    /// it sent: if the next frame opens a new world, they belong to it.
+    region_is_recent: bool,
+    floor_is_recent: bool,
 
     frames_received: u32,
     frames_used: u32,
@@ -171,6 +193,8 @@ pub struct CaptureSession {
     state_due: bool,
     /// [`CaptureSession::progress`] calls since layer 0 was last replaced.
     quiet_ticks: u32,
+    /// [`CaptureSession::progress`] calls since the layers were last merged.
+    unmerged_ticks: u32,
     last_stats: Stats,
     seq: u32,
 }
@@ -211,6 +235,9 @@ impl CaptureSession {
             floor: Floor::default(),
             ceiling: None,
             mask_seen: false,
+            last_index: None,
+            region_is_recent: false,
+            floor_is_recent: false,
             frames_received: 0,
             frames_used: 0,
             paused: false,
@@ -231,6 +258,7 @@ impl CaptureSession {
             replace_due: false,
             state_due: false,
             quiet_ticks: 0,
+            unmerged_ticks: 0,
             last_stats: Stats::default(),
             seq: 0,
         }
@@ -296,6 +324,11 @@ impl CaptureSession {
 
     /// A phone that reconnects with this hello continues this capture
     /// (same name and mode) instead of starting a new one.
+    ///
+    /// The name alone cannot tell a dropped connection from an application
+    /// that was restarted (the app proposes the same name for every
+    /// capture). The frames can: see "A restarted application" in the
+    /// module documentation.
     pub fn matches(&self, hello: &Hello) -> bool {
         hello.mode == self.hello.mode && hello.name == self.hello.name
     }
@@ -569,8 +602,17 @@ impl CaptureSession {
 
     /// Everything a viewer that joins now needs: State, both layers as
     /// `Replace`, the last preview and Stats.
+    ///
+    /// A snapshot is for whoever asks, usually one viewer among several:
+    /// it does not count as a broadcast. A State or a whole layer 0 that is
+    /// due (the floor or the region moved, cells were refined) still goes
+    /// out with the next frame or [`CaptureSession::progress`], for the
+    /// viewers that did not get this snapshot.
     pub fn snapshot(&mut self) -> Vec<Outgoing> {
+        let broadcast =
+            (self.sent_floor, self.sent_bounds, self.sent_refined, self.replace_due, self.state_due, self.quiet_ticks);
         let mut out = vec![self.encode_state(), self.encode_static_replace()];
+        (self.sent_floor, self.sent_bounds, self.sent_refined, self.replace_due, self.state_due, self.quiet_ticks) = broadcast;
         let live = self.dynamic_splats();
         out.push(self.encode_splats(LAYER_DYNAMIC, LayerMode::Replace, &live));
         if let Some(preview) = self.preview.take() {
@@ -596,11 +638,13 @@ impl CaptureSession {
             ClientMessage::Hello(_) => return reply,
             ClientMessage::Region(region) => {
                 if self.mode().uses_region() {
+                    self.region_is_recent = true;
                     self.set_region(region.sanitized());
                     reply.to_viewers.push(self.encode_state());
                 }
             }
             ClientMessage::Floor { y } => {
+                self.floor_is_recent = true;
                 if self.floor.told.is_none_or(|old| (old - y).abs() >= FLOOR_STEP) {
                     self.floor.told = Some(*y);
                     self.floor_moved();
@@ -677,6 +721,23 @@ impl CaptureSession {
         ServerMessage::Progress { frames: self.frames_received as u64, splats: self.splat_count() as u64 }
     }
 
+    /// The phone's application was restarted: its frame index, which
+    /// only grows while the application lives, went back. ARKit's world
+    /// started again with it, somewhere else, so what was fused cannot be
+    /// continued: frames of the new world would land across the old cloud.
+    /// The capture starts again from nothing, as after a `reset`, except
+    /// that a region and a floor the phone sent since its last frame
+    /// already belong to the new world and are kept. Returns the empty
+    /// session viewers must be shown first.
+    fn restart(&mut self) -> Vec<Outgoing> {
+        let region = self.region.filter(|_| self.region_is_recent);
+        let told = self.floor.told.filter(|_| self.floor_is_recent);
+        let fresh = Self::new(&self.hello, self.params);
+        *self = Self { seq: self.seq, imported: self.imported, region, floor: Floor { told, ..Floor::default() }, ..fresh };
+        self.sent_floor = self.floor.y();
+        self.snapshot()
+    }
+
     // -- frames --------------------------------------------------------------
 
     /// Handles one binary message: decodes the frame, fuses it (or says why
@@ -697,14 +758,24 @@ impl CaptureSession {
     }
 
     fn ingest(&mut self, frame: &CaptureFrame, start: Instant) -> Reply {
+        let mut reply = Reply::default();
+        // Frames that are not taken (paused, finished) say nothing about
+        // the capture that is being continued.
+        if !self.finished && !self.paused {
+            if self.last_index.is_some_and(|last| frame.index < last) {
+                reply.to_viewers = self.restart();
+            }
+            self.last_index = Some(frame.index);
+            (self.region_is_recent, self.floor_is_recent) = (false, false);
+        }
         self.frames_received = self.frames_received.saturating_add(1);
         self.tracking = frame.tracking;
-        let mut reply = Reply::default();
         let mut work = FrameWork::default();
         // A frame can change what the State says (where to look from, the
         // region assumed, the floor guessed); viewers must read that before
         // the layers of the same reply.
         let state_seq = self.next_seq();
+        let first = reply.to_viewers.len();
         let outcome = self.reconstruct(frame, &mut work, &mut reply.to_viewers);
         let used = outcome.is_ok();
         if used {
@@ -712,7 +783,7 @@ impl CaptureSession {
         }
         if self.state_due {
             let state = self.encode_state_as(state_seq);
-            reply.to_viewers.insert(0, state);
+            reply.to_viewers.insert(first, state);
         }
         let bytes: usize = reply.to_viewers.iter().map(|m| m.bytes.len()).sum();
         let total_ms = ms_since(start);
@@ -788,9 +859,15 @@ impl CaptureSession {
             self.live.clear();
             frame_to_splats(&prepared.frame, &prepared.cam, &self.params.recon, mask.as_deref(), &mut self.live);
             work.fuse_ms = ms_since(start);
-            if self.floor.told.is_none() && (self.floor.estimated.is_none() || self.frames_used.is_multiple_of(30)) {
+            // One view may show a table and no floor: the floor is the
+            // lowest level any view has shown, and a scan this capture
+            // goes over ([`CaptureSession::into_live`]) knows it better.
+            if self.floor.told.is_none()
+                && self.fusion.is_empty()
+                && (self.floor.estimated.is_none() || self.frames_used.is_multiple_of(30))
+            {
                 let level = horizontal_level(&self.live, self.params.recon.footprint, Facing::Up);
-                self.floor_estimated(level);
+                self.floor_estimated(level.filter(|y| self.floor.estimated.is_none_or(|old| *y < old)));
             }
             let start = Instant::now();
             for splat in &self.live {
@@ -951,6 +1028,13 @@ impl CaptureSession {
             let refined = self.fusion.refined().saturating_sub(self.sent_refined);
             let patience = 4 + (count / 100_000) as u32;
             let polish = refined as usize >= (count / 20).max(500) && self.quiet_ticks >= patience;
+            // Layers that noise put next to a surface go before the layer
+            // is sent as a whole anyway, and when room is needed (not at
+            // every tick: a full map with nothing to merge stays full).
+            self.unmerged_ticks = self.unmerged_ticks.saturating_add(1);
+            if self.replace_due || polish || (self.fusion.is_full() && self.unmerged_ticks >= patience) {
+                self.merge_layers();
+            }
             let outgrown = !self.bounds.is_empty() && {
                 let shift = self.shift();
                 let (lo, hi) = (self.bounds.min + shift, self.bounds.max + shift);
@@ -979,6 +1063,7 @@ impl CaptureSession {
         if !self.finished {
             self.finished = true;
             if self.mode().fuses() {
+                self.merge_layers();
                 self.drop_specks();
                 self.estimate_levels();
                 self.bounds = Aabb::from_points(self.fusion.splats().iter().map(Splat::position).chain(self.path.iter().copied()));
@@ -1033,6 +1118,105 @@ impl CaptureSession {
         if removed > 0 {
             self.replace_due = true;
         }
+    }
+}
+
+impl CaptureSession {
+    /// Brings every surface back to one layer of cells.
+    ///
+    /// The fusion takes an observation within about a cell of an existing
+    /// one for the same surface. A depth sensor is not that exact at range
+    /// (the simulated phone of the tests is off by 1.4 cm at 3 m and 2.4 cm
+    /// at 4 m, differently in every frame), so over a long capture every
+    /// wall grows second and third layers a few centimeters in front of
+    /// and behind itself: the cloud looks fuzzy from the side, and the
+    /// cells run out long before the house does (measured on a simulated
+    /// walk of ten minutes: 1.48 million cells where an exact sensor
+    /// leaves 0.68 million).
+    ///
+    /// Cells that face the same way, in the same column of cells along
+    /// that direction and closer than [`IngestParams::layer_window`] cells
+    /// to the next one are one surface seen with noise: a real second
+    /// surface that close behind the first would be hidden by it. Of each
+    /// such group the cell nearest to the group's mean height (weighted by
+    /// the frames that built each cell) stays. Returns how many cells were
+    /// removed; layer 0 is then due as a whole.
+    fn merge_layers(&mut self) -> usize {
+        self.unmerged_ticks = 0;
+        let window = self.params.layer_window * self.fusion.voxel_size();
+        if !self.mode().fuses() || window <= 0.0 || self.fusion.len() < 2 {
+            return 0;
+        }
+        // Frames per cell, in the order of the splats (nothing is removed).
+        let mut frames: Vec<u32> = Vec::with_capacity(self.fusion.len());
+        self.fusion.retain(|_, count| {
+            frames.push(count.max(1));
+            true
+        });
+        // (facing and column, height along the facing axis, splat).
+        let inv = 1.0 / self.fusion.voxel_size();
+        let mut cells: Vec<(u64, f32, u32)> = self
+            .fusion
+            .splats()
+            .iter()
+            .enumerate()
+            .map(|(index, splat)| {
+                let normal = Quat::from_array(splat.rot) * Vec3::Z;
+                let abs = normal.abs();
+                let axis = if abs.x >= abs.y && abs.x >= abs.z {
+                    0
+                } else if abs.y >= abs.z {
+                    1
+                } else {
+                    2
+                };
+                let position = splat.position();
+                // 30 bits each: far more columns than a pose within 10 km
+                // of the origin can reach with the smallest cells.
+                let column = |c: f32| ((c * inv).floor() as i64 + (1 << 29)) as u64 & ((1 << 30) - 1);
+                let facing = (axis * 2) as u64 + u64::from(normal[axis] < 0.0);
+                let key = facing << 60 | column(position[(axis + 1) % 3]) << 30 | column(position[(axis + 2) % 3]);
+                (key, position[axis], index as u32)
+            })
+            .collect();
+        let order = |a: &(u64, f32, u32), b: &(u64, f32, u32)| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1));
+        // A million cells take a tenth of a second on one core.
+        #[cfg(feature = "par")]
+        rayon::slice::ParallelSliceMut::par_sort_unstable_by(cells.as_mut_slice(), order);
+        #[cfg(not(feature = "par"))]
+        cells.sort_unstable_by(order);
+
+        let mut keep = vec![true; frames.len()];
+        let mut start = 0;
+        while start < cells.len() {
+            // The group: same column, each cell within the window of the
+            // one before.
+            let mut end = start + 1;
+            while end < cells.len() && cells[end].0 == cells[start].0 && cells[end].1 - cells[end - 1].1 < window {
+                end += 1;
+            }
+            if end - start > 1 {
+                let group = &cells[start..end];
+                let (mut weight, mut moment) = (0.0f64, 0.0f64);
+                for &(_, height, index) in group {
+                    let w = frames[index as usize] as f64;
+                    weight += w;
+                    moment += w * height as f64;
+                }
+                let mean = (moment / weight) as f32;
+                let best = group.iter().min_by(|a, b| (a.1 - mean).abs().total_cmp(&(b.1 - mean).abs())).map(|c| c.2);
+                for &(_, _, index) in group {
+                    keep[index as usize] = Some(index) == best;
+                }
+            }
+            start = end;
+        }
+        let mut next = keep.iter();
+        let removed = self.fusion.retain(|_, _| next.next().copied().unwrap_or(true));
+        if removed > 0 {
+            self.replace_due = true;
+        }
+        removed
     }
 }
 

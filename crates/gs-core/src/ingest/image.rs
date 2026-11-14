@@ -19,6 +19,13 @@ use jpeg_decoder::{Decoder, PixelFormat};
 /// make the decoder allocate.
 pub const MAX_COLOR_PIXELS: u64 = 1 << 23;
 
+/// Most scans a JPEG may have. A baseline JPEG has one to four, a
+/// progressive one about ten; a picture with an embedded thumbnail a few
+/// more. Every scan of a progressive JPEG is a pass over the whole picture
+/// and can be as short as 25 bytes, so that a single frame of 8 MiB could
+/// otherwise hold 300 000 of them and keep the decoder busy for minutes.
+pub const MAX_JPEG_SCANS: usize = 64;
+
 /// An sRGB image, 3 bytes per pixel, row-major from the top-left.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColorImage {
@@ -34,6 +41,8 @@ pub enum ImageError {
     Size { width: u32, height: u32 },
     /// A JPEG flavour without a plain colour meaning (CMYK).
     Unsupported,
+    /// More than [`MAX_JPEG_SCANS`] scans.
+    Scans,
     /// Not a JPEG, or a damaged one.
     Decode(String),
 }
@@ -43,6 +52,7 @@ impl fmt::Display for ImageError {
         match self {
             Self::Size { width, height } => write!(f, "colour image of {width}x{height} pixels"),
             Self::Unsupported => f.write_str("unsupported JPEG pixel format"),
+            Self::Scans => write!(f, "JPEG with more than {MAX_JPEG_SCANS} scans"),
             Self::Decode(detail) => write!(f, "JPEG: {detail}"),
         }
     }
@@ -55,6 +65,9 @@ impl std::error::Error for ImageError {}
 /// smaller than that).
 pub fn decode_jpeg(data: &[u8], min_width: u32, min_height: u32) -> Result<ColorImage, ImageError> {
     let fail = |e: jpeg_decoder::Error| ImageError::Decode(e.to_string());
+    if has_too_many_scans(data) {
+        return Err(ImageError::Scans);
+    }
     let mut decoder = Decoder::new(data);
     decoder.read_info().map_err(fail)?;
     let info = decoder.info().ok_or_else(|| ImageError::Decode("no image header".into()))?;
@@ -62,8 +75,8 @@ pub fn decode_jpeg(data: &[u8], min_width: u32, min_height: u32) -> Result<Color
     if full_w == 0 || full_h == 0 || full_w as u64 * full_h as u64 > MAX_COLOR_PIXELS {
         return Err(ImageError::Size { width: full_w, height: full_h });
     }
-    let clamp = |v: u32| v.clamp(1, u16::MAX as u32) as u16;
-    let (width, height) = decoder.scale(clamp(min_width), clamp(min_height)).map_err(fail)?;
+    let (request_w, request_h) = scale_request(full_w, full_h, min_width, min_height);
+    let (width, height) = decoder.scale(request_w, request_h).map_err(fail)?;
     let (width, height) = (width as usize, height as usize);
     // Output plus the decoder's working planes; a baseline JPEG needs far
     // less, a progressive one keeps its coefficients (16 bits per sample).
@@ -80,6 +93,37 @@ pub fn decode_jpeg(data: &[u8], min_width: u32, min_height: u32) -> Result<Color
         return Err(ImageError::Decode("decoded size does not match the header".into()));
     }
     Ok(ColorImage { width: width as u32, height: height as u32, rgb })
+}
+
+/// Whether `data` holds more start-of-scan markers (`FF DA`) than
+/// [`MAX_JPEG_SCANS`].
+///
+/// Every byte pair is looked at instead of walking the segments the way a
+/// decoder would: entropy-coded data never contains the pair (an `FF` in it
+/// is followed by `00` or a restart marker), so the count can only err on
+/// the high side, by pairs that happen to occur in metadata, and no
+/// malformed structure can hide a scan from it.
+fn has_too_many_scans(data: &[u8]) -> bool {
+    let pairs = data.iter().zip(data.iter().skip(1));
+    pairs.filter(|&(&a, &b)| a == 0xFF && b == 0xDA).nth(MAX_JPEG_SCANS).is_some()
+}
+
+/// What to ask of [`Decoder::scale`] so that it picks the smallest of its
+/// scales (eighths: 1, 2, 4, 8) at which the picture is still at least
+/// `min_width` x `min_height`.
+///
+/// The decoder itself settles for the first scale that satisfies *either*
+/// side, which halves a picture along the side it is already short on when
+/// its proportions are not those of the grid it is wanted for (a 16:9
+/// picture for a 4:3 depth map). So the scale is chosen here, and the
+/// decoder is asked for exactly the longer side at that scale and for a
+/// shorter side it can never reach.
+fn scale_request(full_w: u32, full_h: u32, min_width: u32, min_height: u32) -> (u16, u16) {
+    // The decoder's own rounding: `ceil(len * eighths / 8)`.
+    let scaled = |len: u32, eighths: u32| (len * eighths).div_ceil(8);
+    let eighths = [1, 2, 4].into_iter().find(|&e| scaled(full_w, e) >= min_width && scaled(full_h, e) >= min_height).unwrap_or(8);
+    let exact = |len: u32| scaled(len, eighths).clamp(1, u16::MAX as u32) as u16;
+    if full_w >= full_h { (exact(full_w), u16::MAX) } else { (u16::MAX, exact(full_h)) }
 }
 
 /// One output sample of a box filter: the source samples `first..` it
@@ -207,6 +251,36 @@ mod tests {
             if src >= dst {
                 assert!(coverage.iter().all(|c| (c - 1.0).abs() < 1e-3), "{src} -> {dst}: {coverage:?}");
             }
+        }
+    }
+
+    #[test]
+    fn the_scale_covers_the_wanted_grid_on_both_sides() {
+        // Replays the decoder's choice (`choose_idct_size` of jpeg-decoder
+        // 0.3) on the request and checks what comes out.
+        let scaled = |len: u32, e: u32| (len * e).div_ceil(8);
+        let decoder_picks = |w: u32, h: u32, (rw, rh): (u16, u16)| {
+            let e = [1, 2, 4].into_iter().find(|&e| scaled(w, e) >= rw as u32 || scaled(h, e) >= rh as u32).unwrap_or(8);
+            (scaled(w, e), scaled(h, e))
+        };
+        for (w, h, min_w, min_h, expected) in [
+            (1920, 1440, 256, 192, (480, 360)),
+            (960, 720, 256, 192, (480, 360)),
+            (640, 480, 256, 192, (320, 240)),
+            (1920, 1080, 256, 192, (480, 270)),
+            (1080, 1920, 256, 192, (270, 480)),
+            (3, 500, 256, 192, (3, 500)),
+            (500, 3, 256, 192, (500, 3)),
+            (2048, 1536, 256, 192, (256, 192)),
+            (1920, 1440, 1, 1, (240, 180)),
+            (100, 100, 4000, 3000, (100, 100)),
+            (1, 1, 256, 192, (1, 1)),
+            (65535, 128, 16, 16, (8192, 16)),
+        ] {
+            let got = decoder_picks(w, h, scale_request(w, h, min_w, min_h));
+            assert_eq!(got, expected, "{w}x{h} for {min_w}x{min_h}");
+            // Never smaller than wanted unless the picture itself is.
+            assert!((got.0 >= min_w && got.1 >= min_h) || got == (w, h));
         }
     }
 

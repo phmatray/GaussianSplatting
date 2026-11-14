@@ -111,6 +111,11 @@ pub struct IngestParams {
     /// is dropped by the final pass of `finish` (what a flying pixel or a
     /// burst of noise leaves in mid-air). `1` keeps everything.
     pub min_frames: u32,
+    /// Fused cells that face the same way, one behind the other and closer
+    /// than this many cells, are one surface that sensor noise spread over
+    /// several layers: all but the central one are removed whenever layer
+    /// 0 is sent as a whole, and at the end. `0` keeps every layer.
+    pub layer_window: f32,
     /// Width of the preview thumbnails in pixels (before they are turned
     /// upright).
     pub preview_width: u32,
@@ -135,6 +140,7 @@ impl Default for IngestParams {
             region_margin: 1.5,
             live_person_only: false,
             min_frames: 2,
+            layer_window: 3.0,
             preview_width: 96,
             recon: ReconstructParams::default(),
         }
@@ -183,6 +189,7 @@ impl IngestParams {
             region_margin: finite_clamp(self.region_margin, d.region_margin, 1.0, 4.0),
             live_person_only: self.live_person_only,
             min_frames: self.min_frames.clamp(1, 16),
+            layer_window: finite_clamp(self.layer_window, d.layer_window, 0.0, 8.0),
             preview_width: self.preview_width.clamp(16, 640),
             recon: self.recon.sanitized(),
         }

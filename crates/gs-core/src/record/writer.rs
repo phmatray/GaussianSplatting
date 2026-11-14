@@ -8,7 +8,7 @@ use super::state::{scene_of, StreamState};
 use super::wire::MessageClass;
 use super::{
     write_record_header, RecordError, RecordKind, END_MAGIC, FLAG_DEFLATE, HEADER_JSON_SIZE, INDEX_ENTRY_SIZE, MAGIC,
-    MAX_RECORD_LEN, RECORD_HEADER_SIZE, TRAILER_SIZE,
+    MAX_INFLATED, MAX_RECORD_LEN, RECORD_HEADER_SIZE, TRAILER_SIZE,
 };
 use crate::protocol::PROTOCOL_VERSION;
 
@@ -48,6 +48,107 @@ impl RecordSink for Vec<u8> {
             usize::try_from(offset).ok().and_then(|start| self.get_mut(start..start.checked_add(bytes.len())?));
         if let Some(target) = target {
             target.copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+}
+
+/// A recording in memory, kept in pieces of a fixed size.
+///
+/// A `Vec<u8>` that grows to hundreds of megabytes doubles its allocation
+/// on the way, and while it moves, the old and the new block exist side by
+/// side: a recording bounded to 256 MiB can hold three times that for a
+/// moment, in a WebAssembly memory that never shrinks again. This sink
+/// allocates one piece at a time and never moves what is written, so the
+/// memory it takes is the size of the recording plus at most one piece.
+/// The pieces go to a `Blob` (or to a file) one by one.
+#[derive(Clone, Debug)]
+pub struct ChunkedSink {
+    chunks: Vec<Vec<u8>>,
+    chunk_size: usize,
+    len: u64,
+}
+
+impl ChunkedSink {
+    /// Size of a piece unless chosen otherwise: 4 MiB.
+    pub const CHUNK_SIZE: usize = 4 << 20;
+
+    pub fn new() -> Self {
+        Self::with_chunk_size(Self::CHUNK_SIZE)
+    }
+
+    /// A sink with pieces of `chunk_size` bytes (at least 1).
+    pub fn with_chunk_size(chunk_size: usize) -> Self {
+        Self { chunks: Vec::new(), chunk_size: chunk_size.max(1), len: 0 }
+    }
+
+    /// Bytes written.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The recording, in order: every piece but the last is full.
+    pub fn chunks(&self) -> &[Vec<u8>] {
+        &self.chunks
+    }
+
+    pub fn into_chunks(self) -> Vec<Vec<u8>> {
+        self.chunks
+    }
+
+    /// The recording as one block (a copy).
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len as usize);
+        self.chunks.iter().for_each(|chunk| out.extend_from_slice(chunk));
+        out
+    }
+}
+
+impl Default for ChunkedSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordSink for ChunkedSink {
+    type Error = Infallible;
+
+    fn append_bytes(&mut self, mut bytes: &[u8]) -> Result<(), Infallible> {
+        self.len += bytes.len() as u64;
+        while !bytes.is_empty() {
+            let room = self.chunks.last().map_or(0, |last| self.chunk_size - last.len());
+            if room == 0 {
+                self.chunks.push(Vec::with_capacity(self.chunk_size));
+                continue;
+            }
+            let (now, later) = bytes.split_at(room.min(bytes.len()));
+            if let Some(last) = self.chunks.last_mut() {
+                last.extend_from_slice(now);
+            }
+            bytes = later;
+        }
+        Ok(())
+    }
+
+    fn patch_bytes(&mut self, offset: u64, mut bytes: &[u8]) -> Result<(), Infallible> {
+        // As for `Vec<u8>`: a patch that is not inside what was written is
+        // ignored.
+        let inside = offset.checked_add(bytes.len() as u64).is_some_and(|end| end <= self.len);
+        if !inside {
+            return Ok(());
+        }
+        // `offset < len`, and `len` counts bytes held in memory.
+        let (mut chunk, mut at) =
+            ((offset / self.chunk_size as u64) as usize, (offset % self.chunk_size as u64) as usize);
+        while !bytes.is_empty() {
+            let (now, later) = bytes.split_at((self.chunk_size - at).min(bytes.len()));
+            self.chunks[chunk][at..at + now.len()].copy_from_slice(now);
+            bytes = later;
+            (chunk, at) = (chunk + 1, 0);
         }
         Ok(())
     }
@@ -360,7 +461,9 @@ impl<S: RecordSink> Recorder<S> {
             if !(boundary || time_s > since) {
                 return Ok(if recorded { Pushed::Recorded } else { Pushed::Skipped });
             }
-            self.origin = Some(if time_s.is_finite() { time_s } else { since });
+            // (A clock that is not a number yet: the first time that is
+            // one becomes the origin, see `rebase`.)
+            self.origin = [time_s, since].into_iter().find(|time| time.is_finite());
             self.write_keyframe(0.0)?;
             return Ok(if self.full { Pushed::Full } else { Pushed::Keyframe });
         }
@@ -393,7 +496,7 @@ impl<S: RecordSink> Recorder<S> {
             return Err(WriteError::Stopped);
         }
         if self.index.is_empty() && self.state.has_state() && !self.full {
-            self.origin = self.waiting_since.or(Some(0.0));
+            self.origin = self.waiting_since.filter(|time| time.is_finite());
             self.write_keyframe(0.0)?;
         }
         if self.written > 0 {
@@ -473,8 +576,12 @@ impl<S: RecordSink> Recorder<S> {
     /// The time of a record on the recording's own clock: it starts at 0
     /// and never runs backwards.
     fn rebase(&mut self, time_s: f64) -> f64 {
-        let origin = self.origin.unwrap_or(time_s);
-        let time = time_s - origin;
+        if self.origin.is_none() && time_s.is_finite() {
+            // The first keyframe was written without a usable time: the
+            // first one that comes counts from the time of that keyframe.
+            self.origin = Some(time_s - self.time);
+        }
+        let time = time_s - self.origin.unwrap_or(time_s);
         if time.is_finite() && time > self.time {
             self.time = time;
         }
@@ -523,8 +630,11 @@ impl<S: RecordSink> Recorder<S> {
         }
         let header_len = record.len();
         let packed = match self.options.compression {
-            // Tiny payloads cannot win back the cost of a deflate block.
-            Compression::Deflate(level) if payload.len() >= 64 => {
+            // Tiny payloads cannot win back the cost of a deflate block, and
+            // readers refuse to inflate more than `MAX_INFLATED`: a payload
+            // beyond that is stored as it is, which the length limit below
+            // then refuses.
+            Compression::Deflate(level) if (64..=MAX_INFLATED).contains(&payload.len()) => {
                 let packed = miniz_oxide::deflate::compress_to_vec(payload, level.clamp(1, 10));
                 (packed.len() + packed.len() / 8 <= payload.len()).then_some(packed)
             }
@@ -641,6 +751,27 @@ mod tests {
         sink.patch_bytes(u64::MAX, b"z").unwrap();
         sink.append_bytes(b"!").unwrap();
         assert_eq!(sink, b"01ab456789!");
+
+        for chunk_size in [0, 1, 3, 4, 10, 11, 64] {
+            let mut chunked = ChunkedSink::with_chunk_size(chunk_size);
+            assert!(chunked.is_empty() && chunked.chunks().is_empty());
+            chunked.append_bytes(b"").unwrap();
+            chunked.append_bytes(b"0123").unwrap();
+            chunked.append_bytes(b"456789").unwrap();
+            chunked.patch_bytes(2, b"ab").unwrap();
+            chunked.patch_bytes(9, b"xy").unwrap();
+            chunked.patch_bytes(u64::MAX, b"z").unwrap();
+            chunked.patch_bytes(10, b"").unwrap();
+            chunked.append_bytes(b"!").unwrap();
+            chunked.patch_bytes(8, b"89!").unwrap();
+            assert_eq!(chunked.to_vec(), b"01ab456789!", "pieces of {chunk_size}");
+            assert_eq!(chunked.len(), 11);
+            let size = chunk_size.max(1);
+            let chunks = chunked.into_chunks();
+            assert_eq!(chunks.len(), 11usize.div_ceil(size));
+            assert!(chunks.iter().rev().skip(1).all(|chunk| chunk.len() == size));
+            assert!(chunks.iter().all(|chunk| chunk.capacity() == size), "no piece is ever reallocated");
+        }
 
         let mut io = IoSink(std::io::Cursor::new(Vec::new()));
         io.append_bytes(b"0123456789").unwrap();

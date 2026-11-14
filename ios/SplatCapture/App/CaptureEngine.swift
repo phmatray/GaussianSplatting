@@ -177,6 +177,19 @@ final class CaptureEngine: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
+    /// The name sent to the server and given to the file: the user's name
+    /// plus the start time. The server continues a scan whose name and mode
+    /// it already knows, so two captures must never share a name; a
+    /// reconnection within one capture keeps the name chosen here.
+    static func stampedName(_ name: String, at date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH'h'mm'm'ss"
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? "Capture" : String(trimmed.prefix(90))
+        return base + " " + formatter.string(from: date)
+    }
+
     // MARK: Start, pause, reset, finish
 
     /// Starts a capture: to the paired server, or to a file when `offline`
@@ -187,7 +200,7 @@ final class CaptureEngine: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
         self.mode = mode
-        captureName = name
+        captureName = CaptureEngine.stampedName(name)
         selector = KeyframeSelector(mode: mode)
         stats = CaptureStats()
         notice = nil

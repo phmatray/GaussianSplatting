@@ -6,7 +6,8 @@
 //! implementation of the same format.
 //!
 //! * [`Recorder`] writes one, to a file ([`IoSink`]) or to memory
-//!   (`Vec<u8>`), from the wire messages of a session.
+//!   (`Vec<u8>`, or [`ChunkedSink`] for a long one), from the wire
+//!   messages of a session.
 //! * [`Player`] replays one against a clock: from the bytes of a whole
 //!   file, from a download in progress, or from HTTP `Range` requests.
 //! * [`verify`] checks a whole file and describes it.
@@ -94,10 +95,15 @@
 //!   does not inflate, it is not a message, it is not a snapshot) is
 //!   skipped. A wrong index costs a player that depends on it (`Range`
 //!   requests) a detour, never a wrong picture: a keyframe is only used
-//!   if it is where the index says, with the time the index says. Nothing
-//!   is allocated from an announced length before the bytes are there, a
-//!   record is at most [`MAX_RECORD_LEN`] bytes and inflates to at most
-//!   [`MAX_INFLATED`].
+//!   if it is where the index says, with the time the index says; before
+//!   the first keyframe that is known, a seek starts from the first
+//!   record of the file, which is a keyframe whatever the index lists;
+//!   and a record later than the duration the index announces extends
+//!   it. Nothing is allocated from an announced length before the bytes
+//!   are there, a record is at most [`MAX_RECORD_LEN`] bytes and inflates
+//!   to at most [`MAX_INFLATED`]; the writer refuses (`too_large`) a
+//!   message or a snapshot beyond that instead of writing what no reader
+//!   would read.
 //! * **Statistics and thumbnails across a seek**: a keyframe carries the
 //!   latest of them, so [`Update::reset`] tells the host to forget the
 //!   ones on screen. A `State` of another scene drops them from the
@@ -116,8 +122,8 @@ pub use reader::{verify, Problem, Report};
 pub use state::StreamState;
 pub use wire::{classify, MessageClass};
 pub use writer::{
-    rfc3339_utc, Compression, IoSink, KeyframePolicy, Pushed, RecordSink, Recorder, RecorderOptions, Summary,
-    WriteError,
+    rfc3339_utc, ChunkedSink, Compression, IoSink, KeyframePolicy, Pushed, RecordSink, Recorder, RecorderOptions,
+    Summary, WriteError,
 };
 
 /// First eight bytes of a recording.
@@ -436,8 +442,9 @@ pub(crate) fn split_keyframe(payload: &[u8]) -> Result<Vec<&[u8]>, RecordError> 
         if rest.len() < 4 {
             return Err(RecordError::BadKeyframe);
         }
-        let len = u32_at(rest, 0) as usize;
-        let body = rest.get(4..4 + len).ok_or(RecordError::BadKeyframe)?;
+        // Checked: on wasm32 a hostile length wraps `4 + len`.
+        let end = (u32_at(rest, 0) as usize).checked_add(4).ok_or(RecordError::BadKeyframe)?;
+        let body = rest.get(4..end).ok_or(RecordError::BadKeyframe)?;
         let class = classify(body).ok_or(RecordError::BadKeyframe)?;
         let expected = match messages.len() {
             0 => class == MessageClass::State,
@@ -449,7 +456,7 @@ pub(crate) fn split_keyframe(payload: &[u8]) -> Result<Vec<&[u8]>, RecordError> 
             return Err(RecordError::BadKeyframe);
         }
         messages.push(body);
-        rest = &rest[4 + len..];
+        rest = &rest[end..];
     }
     if messages.len() < 3 {
         return Err(RecordError::BadKeyframe);

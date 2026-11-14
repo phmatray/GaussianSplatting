@@ -43,7 +43,8 @@ pub struct PlayerOptions {
     /// stretch from the keyframe before the play head to the play head is
     /// always kept, whatever its size (a scan, which has one keyframe, is
     /// kept whole up to the play head), and one block more may be in
-    /// flight.
+    /// flight. A cache smaller than that stretch leaves no room to read
+    /// ahead: playback then waits for every block.
     pub max_cache_bytes: u64,
     /// Size of one request.
     pub fetch_block: u64,
@@ -78,8 +79,9 @@ pub struct Update {
     /// the messages bring those of the new one, if it has any.
     pub reset: bool,
     /// The player waits for bytes that have not arrived (a download in
-    /// progress, a `Range` request): the picture is older than the play
-    /// head, and a playing head does not move.
+    /// progress, a `Range` request): the picture is older than where the
+    /// play head wants to be, and a playing head goes no further than the
+    /// last record on screen.
     pub buffering: bool,
     /// The play head reached the end and stopped (not looping). Reported
     /// once.
@@ -102,8 +104,9 @@ pub struct PlayerStats {
     /// Messages handed to the viewer, and their bytes.
     pub messages: u64,
     pub message_bytes: u64,
-    /// Recorded messages left out because they did not inflate or were not
-    /// valid wire messages.
+    /// Recorded messages left out because they did not inflate, were not
+    /// valid wire messages, or would have taken an update beyond
+    /// [`Player::MAX_UPDATE_BYTES`].
     pub dropped: u64,
     /// The index at the end of the file was missing or wrong (a `Range`
     /// player then reads forward from the start).
@@ -317,6 +320,10 @@ pub struct Player {
     spans: Vec<Span>,
     /// Sorted by offset (and so by time).
     keys: Vec<Key>,
+    /// The first record is not a usable keyframe: a damaged or foreign
+    /// file. Until that is found out, the first record is where a seek to
+    /// a time before every known keyframe starts, whatever an index says.
+    headless: bool,
     /// Where the records stop, once known: the index, damage, or the end
     /// of a file cut short.
     records_end: Option<u64>,
@@ -326,6 +333,10 @@ pub struct Player {
     error: Option<RecordError>,
 
     head: f64,
+    /// Where the last step tried to bring the viewer: the play head, or,
+    /// while a playing head waits for data, the time it waits to get to.
+    /// The bytes to ask for are the ones that get there.
+    reach: f64,
     playing: bool,
     speed: f64,
     looping: bool,
@@ -348,6 +359,14 @@ const TAIL_FETCH_MIN: u64 = 4 << 10;
 const TAIL_FETCH_MAX: u64 = 64 << 10;
 
 impl Player {
+    /// Most bytes of messages one [`Update`] hands out (512 MiB). No
+    /// recording of a real session comes near it: a seek hands out a
+    /// snapshot and the few records behind it, megabytes. It is there for
+    /// files built to inflate (a megabyte of zeros deflates to a kilobyte,
+    /// so a small file can announce gigabytes): what lies beyond is left
+    /// out and counted in [`PlayerStats::dropped`].
+    pub const MAX_UPDATE_BYTES: usize = 512 << 20;
+
     fn new(source: Source) -> Self {
         Self {
             options: PlayerOptions::default(),
@@ -356,11 +375,13 @@ impl Player {
             first_record: 0,
             spans: Vec::new(),
             keys: Vec::new(),
+            headless: false,
             records_end: None,
             end_time: None,
             damage: None,
             error: None,
             head: 0.0,
+            reach: 0.0,
             playing: false,
             speed: 1.0,
             looping: false,
@@ -594,6 +615,7 @@ impl Player {
     pub fn play(&mut self) {
         if self.end_time.is_some_and(|end| self.head >= end) {
             self.head = 0.0;
+            self.reach = 0.0;
         }
         self.playing = true;
     }
@@ -626,6 +648,7 @@ impl Player {
     pub fn seek(&mut self, time_s: f64) {
         let time = if time_s.is_finite() { time_s.max(0.0) } else { 0.0 };
         self.head = self.duration().map_or(time, |end| time.min(end));
+        self.reach = self.head;
     }
 
     /// Forgets what the viewer holds: the next update starts from a
@@ -707,6 +730,7 @@ impl Player {
                 stopping = clock.is_some();
             }
         }
+        self.reach = self.head;
         let mut batch = Coalescer::default();
         let reset = self.catch_up(&mut batch);
         // The head stops once the viewer shows the end, not before.
@@ -741,10 +765,20 @@ impl Player {
         }
     }
 
-    /// The last keyframe that is not after `time`, or the first one.
+    /// The keyframe a seek to `time` starts from: the last known one that
+    /// is not after `time`. Before all of them, the first record of the
+    /// file, which is a keyframe by the format even when an index does not
+    /// list it or lists it wrongly; only in a file that breaks that rule
+    /// is the first keyframe there is the best that can be shown.
     fn key_at(&self, time: f64) -> Option<Key> {
         let after = self.keys.partition_point(|k| k.time <= time);
-        self.keys.get(after.saturating_sub(1)).copied()
+        if after > 0 {
+            return self.keys.get(after - 1).copied();
+        }
+        if self.headless || self.info.is_none() {
+            return self.keys.first().copied();
+        }
+        Some(Key { time: 0.0, offset: self.first_record })
     }
 
     /// Span and record index of the record that starts at `offset`.
@@ -785,7 +819,7 @@ impl Player {
             // A keyframe further on that is not after the target: take it
             // when the way there is long or has not been loaded.
             Some(key) if key.offset > cursor.offset => {
-                let loaded = self.span_for(cursor.offset).is_some_and(|s| key.offset < s.scanned_end());
+                let loaded = self.span_for(cursor.offset).is_some_and(|s| key.offset <= s.scanned_end());
                 target - cursor.time > self.options.jump_s || !loaded
             }
             _ => false,
@@ -823,10 +857,25 @@ impl Player {
                         break;
                     }
                     Loaded::Missing => {
-                        self.starved = true;
+                        // Its bytes are on their way, unless there is
+                        // nothing to wait for: an empty recording.
+                        if self.keys.is_empty() && self.exhausted() {
+                            self.error.get_or_insert(self.damage.map_or(RecordError::Empty, |d| d.error));
+                        }
+                        self.starved = self.error.is_none();
                         return false;
                     }
-                    Loaded::Unusable => self.keys.retain(|k| k.offset != key.offset),
+                    Loaded::Unusable => {
+                        self.headless |= key.offset == self.first_record;
+                        let listed = self.keys.len();
+                        self.keys.retain(|k| k.offset != key.offset);
+                        // Keys found by reading are keyframe records; only
+                        // an index lists a place that is none.
+                        let keyframe = self
+                            .rec_at(key.offset)
+                            .is_some_and(|(si, ri)| self.spans[si].recs[ri].kind == RecordKind::Keyframe);
+                        self.stats.index_missing |= !keyframe && self.keys.len() < listed;
+                    }
                 }
             }
         }
@@ -884,10 +933,16 @@ impl Player {
     }
 
     /// Turns the surviving items of a batch into messages, leaving out a
-    /// `State` and a layer 0 `Replace` the viewer already holds.
+    /// `State` and a layer 0 `Replace` the viewer already holds, and
+    /// whatever would take the update beyond [`Player::MAX_UPDATE_BYTES`].
     fn materialize(&mut self, batch: Coalescer) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
+        let mut room = Self::MAX_UPDATE_BYTES;
         for item in batch.items.into_iter().flatten() {
+            if room == 0 {
+                self.stats.dropped += 1;
+                continue;
+            }
             let bytes = match item.body {
                 Body::Owned(bytes) => Some(bytes),
                 Body::Stored(si, ri) => {
@@ -900,6 +955,12 @@ impl Player {
                 self.stats.dropped += 1;
                 continue;
             };
+            if bytes.len() > room {
+                // One too many: this update hands out nothing more.
+                room = 0;
+                self.stats.dropped += 1;
+                continue;
+            }
             match item.class {
                 MessageClass::State => {
                     let print = fingerprint(&bytes);
@@ -918,6 +979,7 @@ impl Player {
             }
             self.stats.messages += 1;
             self.stats.message_bytes += bytes.len() as u64;
+            room -= bytes.len();
             out.push(bytes);
         }
         out
@@ -989,12 +1051,19 @@ impl Player {
                     self.check_playable();
                     return true;
                 }
-                RecordKind::Keyframe => {
-                    if let Err(at) = self.keys.binary_search_by_key(&offset, |k| k.offset) {
-                        self.keys.insert(at, Key { time: header.time, offset });
-                    }
-                }
+                RecordKind::Keyframe => match self.keys.binary_search_by_key(&offset, |k| k.offset) {
+                    // The record knows its time better than an index does.
+                    Ok(at) => self.keys[at].time = header.time,
+                    Err(at) => self.keys.insert(at, Key { time: header.time, offset }),
+                },
                 RecordKind::Message => {}
+            }
+            // A record later than the duration the index announced (only a
+            // `Range` player knows one before it has read the records): the
+            // index understated it. The play head must not stop short of
+            // records that are there.
+            if self.end_time.is_some_and(|end| header.time > end) {
+                self.end_time = Some(header.time);
             }
             let span = &mut self.spans[i];
             span.recs.push(rec);
@@ -1044,10 +1113,12 @@ impl Player {
     }
 
     /// Where the player reads next: the keyframe a seek goes through, or
-    /// the record after the last one applied.
+    /// the record after the last one applied. Judged by where the last
+    /// step wanted to get to, not by where a waiting head was held back:
+    /// the step waits for exactly these bytes.
     fn anchor(&self) -> u64 {
-        if self.wants_resync(self.head) {
-            self.key_at(self.head).map_or(self.first_record, |k| k.offset)
+        if self.wants_resync(self.reach) {
+            self.key_at(self.reach).map_or(self.first_record, |k| k.offset)
         } else {
             self.cursor.map_or(self.first_record, |c| c.offset)
         }
@@ -1066,7 +1137,7 @@ impl Player {
                 // Reading ahead is a comfort the cache must have room for.
                 let room = self.cached_bytes() < self.options.max_cache_bytes;
                 let ahead = if self.playing && room { self.options.prefetch_s.max(0.0) * self.speed } else { 0.0 };
-                if span.recs.last().is_some_and(|r| r.time > self.head + ahead) {
+                if span.recs.last().is_some_and(|r| r.time > self.reach + ahead) {
                     return None;
                 }
                 span.end()
@@ -1170,6 +1241,11 @@ impl Player {
                 break;
             }
             let cut = (key - span.base) as usize;
+            // Only at a record that was parsed: an index may name an
+            // offset inside a record, or one that has not arrived whole.
+            if span.recs.binary_search_by_key(&cut, |r| r.pos).is_err() {
+                break;
+            }
             span.bytes.drain(..cut);
             span.base = key;
             span.scanned -= cut;

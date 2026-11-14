@@ -10,7 +10,10 @@
 //!
 //! This is also the quickest look at a recording of a real phone without
 //! the application: `--png` draws the cloud with the CPU reference renderer
-//! from where the phone started and from above.
+//! from where the phone started and from above. The same recording can be
+//! run again with other parameters of its mode, to see what suits the real
+//! sensor: `--voxel METERS` (cell size), `--far METERS` (depth beyond it is
+//! not used), `--min-confidence 0|1|2`, `--max-voxels N`, `--layer-window CELLS`.
 
 use std::io::Read;
 use std::time::Instant;
@@ -39,10 +42,13 @@ fn save_png(path: &str, image: &Image) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.first() else {
-        eprintln!("usage: gscap_ingest <file.gscap> [--png out.png] [--ply out.ply]");
+        eprintln!(
+            "usage: gscap_ingest <file.gscap> [--png out.png] [--ply out.ply] [--voxel M] [--far M] [--min-confidence 0|1|2] [--max-voxels N] [--layer-window CELLS]"
+        );
         std::process::exit(2);
     };
     let option = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+    let number = |name: &str| option(name).and_then(|v| v.parse::<f64>().ok());
     let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
 
     let mut parser = GscapParser::new();
@@ -64,7 +70,19 @@ fn main() {
             match parser.next_item() {
                 Ok(Some(ParsedItem::Header(header))) => {
                     println!("header: {}", header.to_json());
-                    session = Some(CaptureSession::from_header(&header, IngestParams::default()).unwrap_or_else(|e| panic!("{e}")));
+                    let mut params = IngestParams::default();
+                    let of_mode = match header.mode.as_str() {
+                        "object" => &mut params.object,
+                        "person" => &mut params.person,
+                        "live" => &mut params.live,
+                        _ => &mut params.room,
+                    };
+                    of_mode.voxel_size = number("--voxel").map_or(of_mode.voxel_size, |v| v as f32);
+                    of_mode.far = number("--far").map_or(of_mode.far, |v| v as f32);
+                    params.min_confidence = number("--min-confidence").map_or(params.min_confidence, |v| v as u8);
+                    params.max_voxels = number("--max-voxels").map_or(params.max_voxels, |v| v as usize);
+                    params.layer_window = number("--layer-window").map_or(params.layer_window, |v| v as f32);
+                    session = Some(CaptureSession::from_header(&header, params).unwrap_or_else(|e| panic!("{e}")));
                 }
                 Ok(Some(ParsedItem::Frame(bytes))) => {
                     let session = session.as_mut().expect("the header comes first");

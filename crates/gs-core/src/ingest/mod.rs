@@ -8,7 +8,7 @@
 //! | Module | Contents |
 //! |---|---|
 //! | [`frame`] | The capture frame (`GSCF`): header, planes, raw deflate |
-//! | [`file`] | The `.gscap` container: header JSON, push parser, writer |
+//! | [`mod@file`] | The `.gscap` container: header JSON, push parser, writer |
 //! | [`message`] | JSON text messages of `/ingest`, both directions |
 //! | [`pairing`] | The `splatlive://pair` URI |
 //! | [`image`] | JPEG decoding and resampling of the colour image |

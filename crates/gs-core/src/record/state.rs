@@ -25,12 +25,19 @@ pub struct StreamState {
     layer_bytes: usize,
     stats: Option<Vec<u8>>,
     previews: BTreeMap<u8, Vec<u8>>,
+    /// Bytes of the `State`, the `Stats` and the `Preview` messages kept.
+    other_bytes: usize,
 }
 
 impl StreamState {
     /// Most bytes of layer messages a state keeps (512 MiB, 33 million
     /// splats); [`StreamState::apply`] refuses what would exceed it.
     pub const MAX_LAYER_BYTES: usize = 512 << 20;
+    /// Most bytes of `State`, `Stats` and `Preview` messages a state keeps
+    /// (64 MiB; a session holds some hundred kilobytes of them). A stream
+    /// names up to 256 cameras and a thumbnail of up to 65535 x 65535
+    /// pixels each, which no memory holds.
+    pub const MAX_OTHER_BYTES: usize = 64 << 20;
 
     pub fn new() -> Self {
         Self::default()
@@ -50,18 +57,31 @@ impl StreamState {
     ///
     /// [`RecordError::BadMessage`] for a message a viewer would refuse
     /// (see [`classify`]), [`RecordError::TooLarge`] when the layers would
-    /// outgrow [`StreamState::MAX_LAYER_BYTES`]; the state is unchanged
-    /// then.
+    /// outgrow [`StreamState::MAX_LAYER_BYTES`] or the rest
+    /// [`StreamState::MAX_OTHER_BYTES`]; the state is unchanged then.
     pub fn apply(&mut self, message: &[u8]) -> Result<MessageClass, RecordError> {
         let class = classify(message).ok_or(RecordError::BadMessage)?;
+        // What the message replaces, if it is not a layer.
+        let replaced = match class {
+            MessageClass::State => self.state.as_ref().map(Vec::len),
+            MessageClass::Stats => self.stats.as_ref().map(Vec::len),
+            MessageClass::Preview(camera) => self.previews.get(&camera).map(Vec::len),
+            MessageClass::Layer { .. } => None,
+        };
+        if !matches!(class, MessageClass::Layer { .. }) {
+            let other = self.other_bytes - replaced.unwrap_or(0) + message.len();
+            if other > Self::MAX_OTHER_BYTES {
+                return Err(RecordError::TooLarge);
+            }
+            self.other_bytes = other;
+        }
         match class {
             MessageClass::State => {
                 // Another scene has other cameras: its viewers drop the
                 // statistics and thumbnails of the old one.
                 let changed = self.state.as_ref().is_none_or(|old| scene_of(old) != scene_of(message));
                 if changed {
-                    self.stats = None;
-                    self.previews.clear();
+                    self.forget(true, true);
                 }
                 self.state = Some(message.to_vec());
             }
@@ -116,17 +136,17 @@ impl StreamState {
 
     /// Size of [`StreamState::snapshot`] in bytes, without building it.
     pub fn snapshot_bytes(&self) -> usize {
-        let fixed = self.state.as_ref().map_or(0, Vec::len) + self.stats.as_ref().map_or(0, Vec::len);
-        fixed + self.layer_bytes + self.previews.values().map(Vec::len).sum::<usize>()
+        self.layer_bytes + self.other_bytes
     }
 
     /// Forgets the latest `Stats` and `Preview` messages (a recorder that
     /// does not record them must not put them into keyframes either).
     pub(crate) fn forget(&mut self, stats: bool, previews: bool) {
         if stats {
-            self.stats = None;
+            self.other_bytes -= self.stats.take().map_or(0, |stats| stats.len());
         }
         if previews {
+            self.other_bytes -= self.previews.values().map(Vec::len).sum::<usize>();
             self.previews.clear();
         }
     }
@@ -244,6 +264,40 @@ mod tests {
 
         let rebuilt = StreamState::from_messages(snapshot.iter().map(Vec::as_slice));
         assert_eq!(rebuilt.snapshot().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn thumbnails_and_texts_are_bounded_too() {
+        let mut state = StreamState::from_messages([text(true, r#"{"scene":"a"}"#).as_slice()]);
+        state.apply(&text(false, "{}")).unwrap();
+        state.apply(&preview(0, 1)).unwrap();
+        state.apply(&preview(1, 1)).unwrap();
+        let counted = |state: &StreamState| state.snapshot().unwrap().iter().map(Vec::len).sum::<usize>() - 2 * 48;
+        assert_eq!(state.snapshot_bytes(), counted(&state));
+        // Replacing counts the difference, forgetting gives it back.
+        state.apply(&text(false, r#"{"longer":true}"#)).unwrap();
+        state.apply(&preview(1, 9)).unwrap();
+        state.apply(&text(true, r#"{"scene":"a","more":1}"#)).unwrap();
+        assert_eq!(state.snapshot_bytes(), counted(&state));
+        state.apply(&text(true, r#"{"scene":"b"}"#)).unwrap();
+        assert_eq!(state.snapshot().unwrap().len(), 3);
+        assert_eq!(state.snapshot_bytes(), counted(&state));
+
+        // One thumbnail of 67 MB: a valid message that is not kept.
+        state.apply(&preview(2, 5)).unwrap();
+        let before = state.snapshot().unwrap();
+        let (width, height) = (4096u16, 3300u16);
+        let mut huge = preview(3, 0);
+        huge[18..20].copy_from_slice(&width.to_le_bytes());
+        huge[20..22].copy_from_slice(&height.to_le_bytes());
+        huge.resize(24 + width as usize * height as usize * 5, 0);
+        assert_eq!(classify(&huge), Some(MessageClass::Preview(3)));
+        assert_eq!(state.apply(&huge), Err(RecordError::TooLarge));
+        assert_eq!(state.snapshot().unwrap(), before);
+        assert_eq!(state.snapshot_bytes(), counted(&state));
+        // What still fits is taken.
+        state.apply(&preview(3, 7)).unwrap();
+        assert_eq!(state.snapshot().unwrap().len(), 5);
     }
 
     #[test]

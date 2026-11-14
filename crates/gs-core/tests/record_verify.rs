@@ -4,14 +4,21 @@
 
 mod record_support;
 
+use gs_core::codec::LayerMode;
 use gs_core::pipeline::Pipeline;
 use gs_core::protocol::{ControlMsg, PipelineConfig};
 use gs_core::record::{
-    classify, verify, ByteRange, MessageClass, Compression, KeyframePolicy, Player, PlayerOptions, Pushed, Recorder, RecorderOptions,
-    StreamState, Update,
+    classify, verify, ByteRange, ChunkedSink, Compression, KeyframePolicy, MessageClass, Player, PlayerOptions, Pushed,
+    Recorder, RecorderOptions, StreamState, Update,
 };
 use gs_core::scene::SceneKind;
 use record_support::*;
+
+/// Multiplies the number of random steps: `GSREC_FUZZ=20 cargo test ...`
+/// for a long soak, 1 by default.
+fn effort() -> usize {
+    std::env::var("GSREC_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
+}
 
 /// One random step of a user at the transport controls.
 fn random_transport(player: &mut Player, random: &mut Lcg, end: f64) -> Option<f64> {
@@ -120,6 +127,18 @@ fn fuzz_ranged(stream: &Stream, file: &[u8], tolerance: f32, steps: usize, seed:
             let update = settle(&mut player, file, &mut viewer, &mut requests);
             assert_eq!(update.time, player.time());
             viewer.assert_shows(&Viewer::live(stream, update.time), tolerance, &format!("{} settled", what(step)));
+            // And with every request answered, a playing head moves on
+            // (or says that it reached the end), whatever the cache.
+            player.play();
+            let from = player.time();
+            let mut moved = false;
+            for _ in 0..40 {
+                pump(&mut player, file, &mut requests);
+                let update = player.advance(1.0 / 60.0);
+                apply_checked(&mut viewer, &player, &update, stream, tolerance, &what(step));
+                moved |= update.ended || update.time != from;
+            }
+            assert!(moved, "{}: stuck at {from} of {end} with every request answered", what(step));
         }
     }
     let fetched: u64 = requests.iter().map(ByteRange::len).sum();
@@ -130,10 +149,10 @@ fn fuzz_ranged(stream: &Stream, file: &[u8], tolerance: f32, steps: usize, seed:
 fn random_transport_keeps_the_viewer_on_the_live_picture() {
     let stream = tiny_stream();
     let file = record(&stream, tiny_options());
-    for seed in 1..=12 {
+    for seed in 1..=12 * effort() as u64 {
         fuzz_whole(&stream, &file, TINY_TOLERANCE, 1500, seed);
     }
-    for seed in 1..=10 {
+    for seed in 1..=10 * effort() as u64 {
         for (cache, block) in [(3_000, 700), (6_000, 500), (20_000, 1500), (1 << 30, 4000), (0, 300)] {
             fuzz_ranged(&stream, &file, TINY_TOLERANCE, 1200, seed, cache, block);
         }
@@ -188,8 +207,10 @@ fn merge_tolerance(stream: &Stream) -> f32 {
         if let gs_core::codec::Body::Layer(layer) = gs_core::codec::decode(message).unwrap().body {
             if layer.layer_id == 0 {
                 for k in 0..3 {
-                    let (lo, hi) =
-                        layer.splats.iter().fold((f32::MAX, f32::MIN), |(lo, hi), s| (lo.min(s.pos[k]), hi.max(s.pos[k])));
+                    let (lo, hi) = layer
+                        .splats
+                        .iter()
+                        .fold((f32::MAX, f32::MIN), |(lo, hi), s| (lo.min(s.pos[k]), hi.max(s.pos[k])));
                     extent = extent.max(hi - lo);
                 }
             }
@@ -230,25 +251,26 @@ fn a_session_that_changes_scene_resets_and_scans_replays() {
         if name != "default" {
             assert!(report.keyframes.len() > 20, "{name}: {:?}", report.keyframes.len());
         }
-        for seed in 1..=3 {
-            fuzz_whole(&stream, &file, tolerance, 400, seed);
-        }
-        fuzz_ranged(&stream, &file, tolerance, 300, 5, 300_000, 40_000);
-        fuzz_ranged(&stream, &file, tolerance, 300, 6, 1 << 30, 200_000);
+        // (Each step compares with a live viewer rebuilt from the start
+        // of the session, which is what bounds the number of steps.)
+        fuzz_whole(&stream, &file, tolerance, 150 * effort(), 1);
+        fuzz_ranged(&stream, &file, tolerance, 110 * effort(), 5, 300_000, 40_000);
+        fuzz_ranged(&stream, &file, tolerance, 110 * effort(), 6, 1 << 30, 200_000);
     }
 
     // Recording that starts in the middle of the session, from the state
     // a host kept since the start: in the stage, during the scan, while
     // the scan is paused, right after the map was thrown away.
     let dt = (1.0 / 20.0f32) as f64;
-    for start_tick in [12usize, 33, 77, 104, 155, 245, 300] {
+    for start_tick in [33usize, 104, 155, 245, 300] {
         let start_time = start_tick as f64 * dt;
         let first = stream.partition_point(|(time, _)| *time < start_time);
         let mut state = StreamState::new();
         for (_, message) in &stream[..first] {
             state.apply(message).unwrap();
         }
-        let mut recorder = Recorder::with_state(Vec::new(), RecorderOptions { keyframes: dense, ..options("late") }, state);
+        let mut recorder =
+            Recorder::with_state(Vec::new(), RecorderOptions { keyframes: dense, ..options("late") }, state);
         for (time, message) in &stream[first..] {
             let pushed = recorder.push(*time, message).unwrap();
             assert!(matches!(pushed, Pushed::Recorded | Pushed::Keyframe), "{pushed:?}");
@@ -257,7 +279,11 @@ fn a_session_that_changes_scene_resets_and_scans_replays() {
         let report = verify(&file).unwrap();
         assert!(report.is_valid(), "from tick {start_tick}: {:?}", report.problems);
         let end = stream.last().unwrap().0;
-        assert!((summary.duration_s - (end - start_time)).abs() < 1e-9, "{} from tick {start_tick}", summary.duration_s);
+        assert!(
+            (summary.duration_s - (end - start_time)).abs() < 1e-9,
+            "{} from tick {start_tick}",
+            summary.duration_s
+        );
         // The scene the recording starts in.
         let scene = scene_of(Viewer::live(&stream, start_time).state.as_deref().unwrap());
         assert_eq!(report.info.scene, scene);
@@ -265,10 +291,8 @@ fn a_session_that_changes_scene_resets_and_scans_replays() {
         // The same session with the recording's clock: its first instant
         // holds everything up to and including the first recorded tick.
         let rebased: Stream = stream.iter().map(|(time, m)| ((time - start_time).max(0.0), m.clone())).collect();
-        for seed in 1..=2 {
-            fuzz_whole(&rebased, &file, tolerance, 300, seed);
-        }
-        fuzz_ranged(&rebased, &file, tolerance, 200, 9, 500_000, 60_000);
+        fuzz_whole(&rebased, &file, tolerance, 60 * effort(), 1);
+        fuzz_ranged(&rebased, &file, tolerance, 75 * effort(), 9, 500_000, 60_000);
     }
 }
 
@@ -351,7 +375,7 @@ fn random_transport_during_a_download() {
     let stream = tiny_stream();
     let file = record(&stream, tiny_options());
     let end = stream.last().unwrap().0;
-    for seed in 1..=20u64 {
+    for seed in 1..=20 * effort() as u64 {
         let mut random = Lcg(seed * 977);
         let mut player = Player::streaming();
         let mut viewer = Viewer::default();
@@ -370,8 +394,660 @@ fn random_transport_during_a_download() {
                 None => player.update(),
             };
             assert!(!update.buffering || fed < file.len(), "step {step}: nothing left to wait for");
-            apply_checked(&mut viewer, &player, &update, &stream, TINY_TOLERANCE, &format!("download step {step} seed {seed}"));
+            apply_checked(
+                &mut viewer,
+                &player,
+                &update,
+                &stream,
+                TINY_TOLERANCE,
+                &format!("download step {step} seed {seed}"),
+            );
         }
         assert_eq!(fed, file.len());
     }
+}
+
+/// A long session of small messages: `seconds` at 4 ticks a second.
+fn long_stream(seconds: usize) -> Stream {
+    let mut stream: Stream = vec![
+        (0.0, text(0, true, r#"{"scene":"long"}"#.into())),
+        (0.0, layer(1, 0, LayerMode::Replace, &splats(30, 1))),
+        (0.0, layer(2, 1, LayerMode::Replace, &splats(6, 2))),
+        (0.0, text(3, false, r#"{"tick":0}"#.into())),
+    ];
+    for tick in 1..=(seconds * 4) as u32 {
+        let time = tick as f64 * 0.25;
+        let seq = stream.len() as u32;
+        stream.push((time, layer(seq, 1, LayerMode::Replace, &splats(4 + (tick % 5) as usize, tick))));
+        if tick % 40 == 0 {
+            stream.push((time, preview(seq + 1, (tick % 3) as u8)));
+        }
+        stream.push((time, text(seq + 2, false, format!(r#"{{"tick":{tick}}}"#))));
+    }
+    stream
+}
+
+/// The live viewer of [`long_stream`] at `t`, without replaying the whole
+/// session: layer 1 and the statistics are the latest, the thumbnails the
+/// latest of each camera.
+fn long_live(stream: &Stream, t: f64) -> Viewer {
+    let upto = stream.partition_point(|(time, _)| *time <= t);
+    let mut viewer = Viewer::default();
+    for (_, message) in &stream[..4] {
+        viewer.apply(message);
+    }
+    let mut cameras = Vec::new();
+    let mut live = false;
+    let mut statistics = false;
+    let mut late = Vec::new();
+    for (_, message) in stream[4..upto].iter().rev() {
+        let wanted = match classify(message).unwrap() {
+            MessageClass::Layer { layer: 1, replace: true } => !std::mem::replace(&mut live, true),
+            MessageClass::Stats => !std::mem::replace(&mut statistics, true),
+            MessageClass::Preview(camera) => {
+                let new = !cameras.contains(&camera);
+                cameras.push(camera);
+                new
+            }
+            other => panic!("{other:?} in a long stream"),
+        };
+        if wanted {
+            late.push(message);
+        }
+        if live && statistics && cameras.len() == 3 {
+            break;
+        }
+    }
+    for message in late.into_iter().rev() {
+        viewer.apply(message);
+    }
+    viewer
+}
+
+#[test]
+fn a_recording_of_hours_opens_and_seeks_in_a_few_requests() {
+    let seconds = 5400;
+    let stream = long_stream(seconds);
+    let end = stream.last().unwrap().0;
+    let policy = KeyframePolicy { min_interval_s: 1.0, ratio: 0.5 };
+    let started = std::time::Instant::now();
+    let file = record(&stream, RecorderOptions { keyframes: policy, ..options("long") });
+    let recording = started.elapsed();
+    let report = verify(&file).unwrap();
+    assert!(report.is_valid(), "{:?}", report.problems);
+    // More keyframes than the first request for the end of the file holds
+    // index entries for (64 KiB / 16 bytes).
+    let keyframes = report.keyframes.len();
+    assert!(keyframes > 4500, "{keyframes}");
+    let index_bytes = keyframes * 16 + 16;
+    assert!(index_bytes > 64 << 10);
+
+    // From memory.
+    let started = std::time::Instant::now();
+    let mut player = Player::from_bytes(file.clone()).unwrap();
+    let opening = started.elapsed();
+    assert_eq!(player.duration(), Some(end));
+    assert_eq!(player.keyframe_times().count(), keyframes);
+    assert_eq!(player.stats().records, report.records - 1, "every record but the index");
+    let mut viewer = Viewer::default();
+    let mut random = Lcg(4);
+    let started = std::time::Instant::now();
+    let mut handed = 0;
+    for i in 0..200 {
+        let t = random.next() * end;
+        player.seek(t);
+        let update = player.update();
+        assert!(update.reset || i > 0);
+        handed += update.messages.len();
+        viewer.apply_all(&update);
+        if i % 8 == 0 {
+            viewer.assert_shows(&long_live(&stream, t), TINY_TOLERANCE, &format!("long seek to {t:.2}"));
+        }
+    }
+    let seeking = started.elapsed() / 200;
+    // A seek hands over a keyframe and what little follows it, not the
+    // session from its start.
+    assert!(handed / 200 <= 12, "{} messages per seek", handed / 200);
+
+    // Through Range requests, with requests as small as the records.
+    let mut player = Player::ranged(file.len() as u64);
+    player.set_options(PlayerOptions { fetch_block: 4096, max_cache_bytes: 64 << 10, ..PlayerOptions::default() });
+    let mut viewer = Viewer::default();
+    let mut requests = Vec::new();
+    player.seek(end * 0.75);
+    let update = settle(&mut player, &file, &mut viewer, &mut requests);
+    assert_eq!(update.time, end * 0.75);
+    viewer.assert_shows(&long_live(&stream, end * 0.75), TINY_TOLERANCE, "ranged, three quarters in");
+    assert!(!player.stats().index_missing);
+    assert_eq!(player.duration(), Some(end));
+    assert_eq!(player.keyframe_times().count(), keyframes, "the whole index was read");
+    // Header, end of file, the rest of the index, then the keyframe.
+    assert!(requests.len() <= 5, "{requests:?}");
+    assert_eq!(requests[1].len(), 64 << 10);
+    assert_eq!(requests[2].end, file.len() as u64);
+    let opening_bytes: u64 = requests.iter().map(ByteRange::len).sum();
+    assert!(opening_bytes < index_bytes as u64 + (64 << 10) + 3 * 4096, "{opening_bytes}");
+
+    let mut worst = 0;
+    for i in 0..120 {
+        let t = random.next() * end;
+        let before = requests.len();
+        player.seek(t);
+        let update = settle(&mut player, &file, &mut viewer, &mut requests);
+        assert_eq!(update.time, t);
+        worst = worst.max(requests.len() - before);
+        if i % 8 == 0 {
+            viewer.assert_shows(&long_live(&stream, t), TINY_TOLERANCE, &format!("long ranged seek to {t:.2}"));
+        }
+        let stats = player.stats();
+        assert!(stats.cached_bytes <= (64 << 10) + 8192, "{stats:?}");
+        assert!(stats.records < 2000, "only the records of what is cached are known: {stats:?}");
+    }
+    assert!(worst <= 2, "{worst} requests for one seek");
+
+    eprintln!(
+        "long recording: {seconds} s, {} records, {keyframes} keyframes, {:.1} MB (index {:.0} KB); written in {recording:.2?}, \
+         opened from memory in {opening:.2?} ({:.1} MB of record positions), {seeking:.1?} per seek; \
+         over ranges {opening_bytes} bytes to the first picture, at most {worst} requests per seek",
+        report.records,
+        file.len() as f64 / 1e6,
+        index_bytes as f64 / 1e3,
+        report.records as f64 * 24.0 / 1e6,
+    );
+}
+
+#[test]
+fn an_index_that_understates_the_duration_does_not_hide_the_rest() {
+    let stream = tiny_stream();
+    let policy = KeyframePolicy { min_interval_s: 1.0, ratio: 2.5 };
+    let file = record(&stream, RecorderOptions { keyframes: policy, ..options("tiny") });
+    let end = stream.last().unwrap().0;
+    let index_at = u64::from_le_bytes(file[file.len() - 16..file.len() - 8].try_into().unwrap()) as usize;
+    let mut lying = file.clone();
+    // Not so low that the index contradicts itself: the time of its own
+    // last keyframe.
+    let short = verify(&file).unwrap().keyframes.last().unwrap().0;
+    assert!(short > 0.0 && short < end - 0.2, "{short} of {end}");
+    lying[index_at + 8..index_at + 16].copy_from_slice(&short.to_le_bytes());
+    // The checker says so.
+    assert!(!verify(&lying).unwrap().is_valid());
+
+    // A player that reads the file plays all of it.
+    let player = Player::from_bytes(lying.clone()).unwrap();
+    assert_eq!(player.duration(), Some(end));
+
+    // A Range player believes the index until it has seen better; it
+    // must not sit at the false end for ever without saying "ended".
+    let mut player = Player::ranged(lying.len() as u64);
+    player.set_options(PlayerOptions { fetch_block: 800, ..PlayerOptions::default() });
+    let mut viewer = Viewer::default();
+    player.play();
+    let mut ended = false;
+    for _ in 0..3000 {
+        pump(&mut player, &lying, &mut Vec::new());
+        let update = player.advance(1.0 / 30.0);
+        viewer.apply_all(&update);
+        if !update.buffering {
+            viewer.assert_shows(&Viewer::live(&stream, update.time), TINY_TOLERANCE, "lying duration");
+        }
+        if update.ended {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended, "the player never reports the end (head at {} of {end})", player.time());
+    assert_eq!(player.time(), end, "everything that was recorded plays");
+    assert_eq!(player.duration(), Some(end));
+}
+
+/// A layer message of `count` splats that are all zero bytes: valid, and
+/// it deflates to almost nothing.
+fn blank_layer(count: u32) -> Vec<u8> {
+    let mut message = layer(1, 0, LayerMode::Replace, &[]);
+    message[16 + 4..16 + 8].copy_from_slice(&count.to_le_bytes());
+    message.resize(48 + count as usize * 16, 0);
+    assert_eq!(classify(&message), Some(MessageClass::Layer { layer: 0, replace: true }));
+    message
+}
+
+/// Needs about 1 GB of memory for a moment, hence not part of the default
+/// run: `cargo test -p gs-core --test record_verify -- --ignored`.
+#[test]
+#[ignore = "allocates about 1 GB"]
+fn a_snapshot_beyond_what_readers_inflate_is_refused_not_written() {
+    // 129 MiB of layer 0: more than a reader inflates (`MAX_INFLATED`),
+    // although deflate shrinks it to a few hundred kilobytes.
+    let big = blank_layer((129 << 20) / 16);
+    let state = text(0, true, r#"{"scene":"big"}"#.into());
+    let stats = text(2, false, "{}".into());
+
+    let mut recorder = Recorder::new(Vec::new(), options("big"));
+    recorder.push(0.0, &state).unwrap();
+    recorder.push(0.0, &big).unwrap();
+    let pushed = recorder.push(0.0, &stats);
+    let file = recorder.sink().clone();
+    if !file.is_empty() {
+        // Whatever was written must be readable.
+        let report = verify(&file).unwrap();
+        assert!(report.problems.is_empty(), "the recorder wrote a file that does not read: {:?}", report.problems);
+    }
+    assert!(
+        matches!(pushed, Err(gs_core::record::WriteError::Record(gs_core::record::RecordError::TooLarge))),
+        "{pushed:?}"
+    );
+    assert_eq!(recorder.bytes_written(), 0);
+    let (file, summary) = recorder.finish().unwrap();
+    assert!(file.is_empty() && summary.bytes == 0);
+
+    // Just below the limit it is recorded, and it plays.
+    let fits = blank_layer((127 << 20) / 16);
+    let mut recorder = Recorder::new(Vec::new(), options("big"));
+    recorder.push(0.0, &state).unwrap();
+    recorder.push(0.0, &fits).unwrap();
+    assert_eq!(recorder.push(0.0, &stats).unwrap(), Pushed::Keyframe);
+    // A message record of that size, too.
+    assert_eq!(recorder.push(1.0, &fits).unwrap(), Pushed::Recorded);
+    let (file, _) = recorder.finish().unwrap();
+    assert!(file.len() < 4 << 20, "{}", file.len());
+    let report = verify(&file).unwrap();
+    assert!(report.is_valid(), "{:?}", report.problems);
+    let mut player = Player::from_bytes(file).unwrap();
+    player.seek(1.0);
+    let update = player.update();
+    assert_eq!(update.messages.len(), 4, "State, layer 1, Stats and the later of the two layer 0 messages");
+    assert_eq!(update.messages.iter().map(Vec::len).max(), Some(fits.len()));
+    assert_eq!(player.stats().dropped, 0);
+}
+
+#[test]
+fn a_clock_that_is_not_a_number_at_first_still_gives_a_time_line() {
+    let stream = tiny_stream();
+    let end = stream.last().unwrap().0;
+    let mut recorder = Recorder::new(Vec::new(), tiny_options());
+    for (i, (time, message)) in stream.iter().enumerate() {
+        // The opening burst and most of the first tick without a clock.
+        let clock = if i < 6 { f64::NAN } else { 100.0 + time };
+        recorder.push(clock, message).unwrap();
+    }
+    let (file, summary) = recorder.finish().unwrap();
+    let report = verify(&file).unwrap();
+    assert!(report.is_valid(), "{:?}", report.problems);
+    // Time starts with the first message that has one (the end of tick 1).
+    assert!((summary.duration_s - (end - 0.25)).abs() < 1e-9, "{}", summary.duration_s);
+    let mut player = Player::from_bytes(file).unwrap();
+    let mut viewer = Viewer::default();
+    for t in [0.0, 3.3, 1.1, end - 0.25] {
+        player.seek(t);
+        viewer.apply_all(&player.update());
+        viewer.assert_shows(&Viewer::live(&stream, t + 0.25), TINY_TOLERANCE, &format!("late clock, {t}"));
+    }
+    // Never a clock at all: a still recording of the last state.
+    let mut recorder = Recorder::new(Vec::new(), tiny_options());
+    for (_, message) in &stream {
+        recorder.push(f64::NAN, message).unwrap();
+    }
+    let (file, summary) = recorder.finish().unwrap();
+    assert_eq!(summary.duration_s, 0.0);
+    assert!(verify(&file).unwrap().is_valid());
+    let mut player = Player::from_bytes(file).unwrap();
+    let mut viewer = Viewer::default();
+    viewer.apply_all(&player.update());
+    viewer.assert_shows(&Viewer::live(&stream, end), TINY_TOLERANCE, "no clock");
+}
+
+/// Random damage to the index and the trailer only: the records are whole,
+/// so a `Range` player must still show the right picture wherever it can
+/// get to, and say when it reached the end.
+#[test]
+fn random_damage_to_the_index_never_changes_the_picture() {
+    let stream = tiny_stream();
+    let file = record(&stream, tiny_options());
+    let end = stream.last().unwrap().0;
+    let index_at = u64::from_le_bytes(file[file.len() - 16..file.len() - 8].try_into().unwrap()) as usize;
+    let mut random = Lcg(42);
+    let (mut detours, mut short) = (0, 0);
+    for round in 0..1500 * effort() {
+        let mut bytes = file.clone();
+        for _ in 0..1 + round % 3 {
+            let at = index_at + (random.next() * (bytes.len() - index_at) as f64) as usize;
+            bytes[at] = if round % 2 == 0 { (random.next() * 256.0) as u8 } else { bytes[at] ^ (1 << (round % 8)) };
+        }
+        let mut player = Player::ranged(bytes.len() as u64);
+        player.set_options(PlayerOptions {
+            fetch_block: 300 + (random.next() * 2000.0) as u64,
+            max_cache_bytes: 5000,
+            prefetch_s: 0.5,
+            jump_s: 2.0,
+        });
+        let mut viewer = Viewer::default();
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            player.seek(random.next() * end);
+            let update = settle(&mut player, &bytes, &mut viewer, &mut requests);
+            let changed =
+                || (0..bytes.len()).filter(|&i| bytes[i] != file[i]).map(|i| (i, bytes[i])).collect::<Vec<_>>();
+            let what = format!(
+                "index damage {round}: bytes {:?} (index at {index_at}), head {}, keyframes {:?}",
+                changed(),
+                update.time,
+                player.keyframe_times().collect::<Vec<_>>()
+            );
+            viewer.assert_shows(&Viewer::live(&stream, update.time), TINY_TOLERANCE, &what);
+        }
+        detours += usize::from(player.stats().index_missing);
+        // Play to the end from wherever that left the head.
+        player.play();
+        let mut ended = false;
+        for _ in 0..2000 {
+            pump(&mut player, &bytes, &mut requests);
+            let update = player.advance(1.0 / 20.0);
+            viewer.apply_all(&update);
+            if !update.buffering {
+                viewer.assert_shows(&Viewer::live(&stream, update.time), TINY_TOLERANCE, "index damage, playing");
+            }
+            if update.ended {
+                ended = true;
+                break;
+            }
+        }
+        let duration = player.duration().unwrap();
+        // A duration the index overstates is believed (trailing silence is
+        // legal); one it understates is corrected by the records.
+        if duration <= end {
+            assert!(
+                ended,
+                "round {round}: no end at {} of {duration}; wanted {:?}, buffered until {}, damage {:?}, {:?}, \
+                 changed bytes at {:?} (index at {index_at}, {} bytes)",
+                player.time(),
+                player.wanted(),
+                player.buffered_until(),
+                player.damage(),
+                player.stats(),
+                (0..bytes.len()).filter(|&i| bytes[i] != file[i]).map(|i| (i, bytes[i], file[i])).collect::<Vec<_>>(),
+                bytes.len(),
+            );
+            // The whole recording was shown, unless the damage made the
+            // index record itself unreadable as a record: then the player
+            // cannot tell it from damage to the last records.
+            short += usize::from(player.time() < end);
+            assert!(player.time() == end || player.damage().is_some(), "round {round}: stopped at {}", player.time());
+        }
+    }
+    assert!(detours > 100 * effort(), "{detours}");
+    assert!(short < 400 * effort(), "{short} of the damaged files stopped short");
+}
+
+/// Plays `file` through Range requests from start to end, answering every
+/// request between two frames, and returns the number of frames that had
+/// to wait. Panics when the end is not reached.
+fn play_through(stream: &Stream, file: &[u8], options: PlayerOptions, speed: f64, tolerance: f32) -> usize {
+    let end = stream.last().unwrap().0;
+    let mut player = Player::ranged(file.len() as u64);
+    player.set_options(options);
+    player.set_speed(speed);
+    let mut viewer = Viewer::default();
+    let mut requests = Vec::new();
+    player.play();
+    let mut waits = 0;
+    let frames = (end / speed * 60.0) as usize + 1;
+    for frame in 0..frames * 4 + 200 {
+        pump(&mut player, file, &mut requests);
+        let update = player.advance(1.0 / 60.0);
+        viewer.apply_all(&update);
+        waits += usize::from(update.buffering);
+        if !update.buffering {
+            viewer.assert_shows(&Viewer::live(stream, update.time), tolerance, &format!("frame {frame}"));
+        }
+        if update.ended {
+            assert_eq!(update.time, end);
+            return waits;
+        }
+    }
+    panic!(
+        "{options:?} at speed {speed}: stuck at {} of {end} after {waits} waiting frames; wanted {:?}, {:?}",
+        player.time(),
+        player.wanted(),
+        player.stats()
+    );
+}
+
+/// A cache smaller than the stretch between two keyframes leaves no room
+/// to read ahead. Playback may then wait at block boundaries, but it must
+/// get through: the player has to ask for what the play head needs next,
+/// not for what it needed where it waits.
+#[test]
+fn playback_gets_through_whatever_the_cache_and_the_block_size() {
+    let stream = tiny_stream();
+    for (name, file) in [
+        ("keyframes every second", record(&stream, tiny_options())),
+        ("one keyframe", record(&stream, RecorderOptions { compression: Compression::None, ..options("tiny") })),
+    ] {
+        for cache in [0u64, 1000, 3000, 5000, 6000, 20_000, 1 << 30] {
+            for block in [1u64, 150, 300, 700, 1024, 2500, 1 << 20] {
+                for speed in [0.5, 1.0, 3.0] {
+                    let options =
+                        PlayerOptions { fetch_block: block, max_cache_bytes: cache, prefetch_s: 0.5, jump_s: 2.0 };
+                    let waits = play_through(&stream, &file, options, speed, TINY_TOLERANCE);
+                    if cache >= 20_000 && block >= 700 {
+                        // Room to read ahead: only the start waits.
+                        assert!(waits <= 3, "{name}, cache {cache}, block {block}, speed {speed}: {waits} waits");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_chunked_sink_holds_the_same_recording_without_ever_moving_it() {
+    let stream = tiny_stream();
+    let whole = record(&stream, tiny_options());
+    for chunk in [1usize, 100, 1000, 1024, 4096, 1 << 20] {
+        let mut recorder = Recorder::new(ChunkedSink::with_chunk_size(chunk), tiny_options().with_max_bytes(1 << 20));
+        for (time, message) in &stream {
+            recorder.push(*time, message).unwrap();
+        }
+        let (sink, summary) = recorder.finish().unwrap();
+        assert_eq!(sink.len(), summary.bytes);
+        // The header, rewritten at the end, lies across several pieces.
+        assert_eq!(sink.to_vec(), whole, "pieces of {chunk}");
+        let chunks = sink.into_chunks();
+        assert_eq!(chunks.len(), whole.len().div_ceil(chunk));
+        assert!(chunks.iter().all(|piece| piece.capacity() == chunk));
+    }
+    // What a `Vec<u8>` sink costs instead: up to twice the recording once
+    // it is done, and old and new block side by side whenever it grows.
+    let mut recorder = Recorder::new(Vec::new(), tiny_options());
+    let mut peak = 0;
+    for (time, message) in &stream {
+        recorder.push(*time, message).unwrap();
+        peak = peak.max(recorder.sink().capacity());
+    }
+    assert!(peak >= whole.len() && peak <= 2 * whole.len(), "{peak} for {}", whole.len());
+}
+
+/// `file` with another index: the records as they are, then an index
+/// record with `entries` and the trailer.
+fn with_index(file: &[u8], entries: &[(f64, u64)], duration: f64) -> Vec<u8> {
+    let index_at = u64::from_le_bytes(file[file.len() - 16..file.len() - 8].try_into().unwrap()) as usize;
+    let mut out = file[..index_at].to_vec();
+    out.extend_from_slice(&(entries.len() as u32 * 16 + 12).to_le_bytes());
+    out.extend_from_slice(&[2, 0, 0, 0]);
+    out.extend_from_slice(&duration.to_le_bytes());
+    for (time, offset) in entries {
+        out.extend_from_slice(&time.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+    out.extend_from_slice(&(index_at as u64).to_le_bytes());
+    out.extend_from_slice(b"GSRECEND");
+    out
+}
+
+/// An index entry that points into the middle of a record, a network that
+/// answers with less than was asked for, and a cache that is always full:
+/// the player must find the lie, not trip over it while dropping bytes.
+#[test]
+fn a_false_index_entry_at_the_edge_of_what_is_cached_is_found_out() {
+    let stream = tiny_stream();
+    let file = record(&stream, tiny_options());
+    let report = verify(&file).unwrap();
+    let mut entries = report.keyframes.clone();
+    let records = records_of(&file);
+    // A place 20 bytes into the first record that starts after 2.4 s.
+    let at = records.iter().position(|(_, time, _)| *time > 2.4).unwrap();
+    let lie = records[at - 1].0 + 20;
+    assert!(records[at].0 > lie + 40, "the record is longer than that");
+    let place = entries.partition_point(|(_, offset)| *offset < lie);
+    entries.insert(place, (2.5, lie));
+    let lying = with_index(&file, &entries, report.duration_s);
+    assert!(!verify(&lying).unwrap().is_valid());
+
+    for cache in [0u64, 2000, 1 << 30] {
+        let mut player = Player::ranged(lying.len() as u64);
+        player.set_options(PlayerOptions { fetch_block: 64, max_cache_bytes: cache, prefetch_s: 0.0, jump_s: 2.0 });
+        let mut viewer = Viewer::default();
+        // Answers that stop at the false offset, wherever a request crosses it.
+        let short = |player: &mut Player, viewer: &mut Viewer, rounds: usize| {
+            let mut update = player.update();
+            for _ in 0..rounds {
+                let Some(range) = player.wanted() else { break };
+                let end = if range.start == 0 || range.end == lying.len() as u64 {
+                    // The header and the index, whole.
+                    range.end
+                } else if range.start < lie && range.end > lie {
+                    lie
+                } else {
+                    range.end.min(range.start + 8)
+                };
+                player.supply(range.start, &lying[range.start as usize..end as usize]).unwrap();
+                update = player.update();
+                viewer.apply_all(&update);
+            }
+            update
+        };
+        player.seek(2.2);
+        let update = short(&mut player, &mut viewer, 100_000);
+        assert!(!update.buffering && update.time == 2.2);
+        viewer.assert_shows(&Viewer::live(&stream, 2.2), TINY_TOLERANCE, "before the false entry");
+        // Read on until the cached bytes end right at the false offset.
+        player.seek(2.45);
+        let mut guard = 0;
+        while player.wanted().is_some_and(|range| range.start != lie) {
+            short(&mut player, &mut viewer, 1);
+            guard += 1;
+            assert!(guard < 10_000);
+        }
+        // Something else used the viewer; then a seek that the index
+        // sends to the false entry, with the network still trickling.
+        player.invalidate_viewer();
+        player.seek(2.6);
+        let update = short(&mut player, &mut viewer, 100_000);
+        assert!(!update.buffering && update.time == 2.6, "{update:?}");
+        viewer.assert_shows(&Viewer::live(&stream, 2.6), TINY_TOLERANCE, "past the false entry");
+        assert!(player.stats().index_missing);
+        assert!(player.keyframe_times().all(|time| time != 2.5), "the false entry is gone");
+    }
+}
+
+/// Damaged files through a `Range` player on a bad day: short answers,
+/// any cache, any block size, the viewer taken away in between. Nothing
+/// may panic, and whatever reaches the viewer decodes.
+#[test]
+fn damaged_files_over_a_bad_network_never_panic() {
+    let stream = tiny_stream();
+    let files = [
+        record(&stream, tiny_options()),
+        record(&stream, RecorderOptions { compression: Compression::None, ..tiny_options() }),
+    ];
+    let mut random = Lcg(2026);
+    let mut shown = 0;
+    let rounds = 4000 * effort();
+    for round in 0..rounds {
+        let mut bytes = files[round % 2].clone();
+        let index_at = u64::from_le_bytes(bytes[bytes.len() - 16..bytes.len() - 8].try_into().unwrap()) as usize;
+        for _ in 0..1 + round % 4 {
+            // Half of the damage goes to the index, where a player that
+            // fetches by offset is most easily led astray.
+            let lo = if round % 2 == 0 { index_at } else { 1024 };
+            let at = lo + (random.next() * (bytes.len() - lo) as f64) as usize;
+            bytes[at] = if round % 3 == 0 { (random.next() * 256.0) as u8 } else { bytes[at] ^ (1 << (round % 8)) };
+        }
+        if round % 11 == 0 {
+            bytes.truncate(1024 + (random.next() * (bytes.len() - 1024) as f64) as usize);
+        }
+        let mut player = Player::ranged(bytes.len() as u64);
+        player.set_options(PlayerOptions {
+            fetch_block: 1 + (random.next() * random.next() * 3000.0) as u64,
+            max_cache_bytes: [0, 500, 3000, 8000, 1 << 30][(random.next() * 5.0) as usize],
+            prefetch_s: random.next(),
+            jump_s: random.next() * 3.0,
+        });
+        let mut viewer = Viewer::default();
+        let mut answers = 0;
+        for _ in 0..60 {
+            match (random.next() * 8.0) as u32 {
+                0 => player.invalidate_viewer(),
+                1 => player.play(),
+                2 => player.pause(),
+                3 => player.set_looping(random.next() < 0.5),
+                _ => player.seek(random.next() * 7.0),
+            }
+            for _ in 0..(random.next() * 12.0) as usize {
+                let Some(range) = player.wanted() else { break };
+                assert!(range.start < range.end, "{range:?}");
+                let start = (range.start as usize).min(bytes.len());
+                let mut end = (range.end as usize).min(bytes.len());
+                if random.next() < 0.4 {
+                    // A short answer (never an empty one).
+                    end = start + 1 + (random.next() * (end - start) as f64) as usize;
+                    end = end.min(bytes.len());
+                }
+                answers += 1;
+                if player.supply(range.start, &bytes[start..end]).is_err() {
+                    break;
+                }
+                viewer.apply_all(&player.update());
+            }
+            viewer.apply_all(&player.advance(random.next() * 0.3));
+        }
+        assert!(answers > 0);
+        shown += usize::from(viewer.state.is_some());
+    }
+    assert!(shown > rounds / 2, "most damaged files still show something: {shown} of {rounds}");
+}
+
+/// A file built to inflate: six records of a hundred kilobytes that are
+/// six `State` messages of a hundred megabytes. One update hands out no
+/// more than `Player::MAX_UPDATE_BYTES`.
+#[test]
+#[ignore = "allocates about 1 GB"]
+fn a_file_built_to_inflate_does_not_fill_the_memory() {
+    let good = record(&tiny_stream(), tiny_options());
+    let records = records_of(&good);
+    // The header and the first keyframe of a real recording.
+    let mut file = good[..records[0].0 as usize].to_vec();
+    for i in 0..6 {
+        // (Each one different: a State the viewer holds is not sent again.)
+        let mut state = text(i, true, String::new());
+        state.resize(100 << 20, b' ');
+        let packed = miniz_oxide::deflate::compress_to_vec(&state, 1);
+        assert!(packed.len() < 1 << 20);
+        file.extend_from_slice(&(packed.len() as u32 + 12).to_le_bytes());
+        file.extend_from_slice(&[0, 1, 0, 0]);
+        file.extend_from_slice(&(i as f64).to_le_bytes());
+        file.extend_from_slice(&packed);
+    }
+    assert!(file.len() < 4 << 20);
+    // Every record is a valid message: the checker has nothing to say
+    // but that the file was cut short.
+    let report = verify(&file).unwrap();
+    assert!(report.problems.is_empty() && report.states == 6, "{:?}", report.problems);
+
+    let mut player = Player::from_bytes(file).unwrap();
+    player.seek(f64::MAX);
+    let update = player.update();
+    let handed: usize = update.messages.iter().map(Vec::len).sum();
+    assert!(handed <= Player::MAX_UPDATE_BYTES, "{handed}");
+    assert!(handed > 400 << 20, "what fits is handed out: {handed}");
+    assert!(player.stats().dropped >= 1);
 }

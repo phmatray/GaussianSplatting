@@ -437,6 +437,68 @@ and Rust tests. Where this section is silent, they decide:
   `POST /api/captures` answers `{"ok":true,"frames":n,"truncated":bool,
   "name":"…"}`, 400 for a damaged file, 401 for a missing or wrong token.
 
+### Details fixed by `gs_core::ingest`
+
+The library has no sockets, files or clock and compiles for wasm32; the
+server owns those. It has only ever seen synthetic data.
+
+- **What viewers see.** A capture looks like a home scan: `SessionState.scene`
+  is `"capture"`, `config.scene` is house, `cameras` is empty; the phone is
+  `Stats.scan.camera` and `Preview` camera 0, its path is
+  `SessionState.scan.path` (at most 1024 points). `SessionState.capture` and
+  `Stats.capture` carry mode, name, device, app, region, `floor_known`,
+  `imported`, `frames_received`, `frames_used`, `paused`, `finished`, `full`,
+  `tracking`.
+- **Coordinates.** Fusion works in ARKit's world; everything sent to viewers
+  is shifted so that the floor is `y = 0`. The floor is, in this order: the
+  phone's `floor` message or the `.gscap` header; an estimate from the data
+  (lowest upward-facing level of at least 0.25 m2); a guess (first camera
+  height minus 1.3 m). A change of 1 cm or more re-sends `State` and layer 0.
+  In live mode the estimate only moves down and is not made over a backdrop.
+- **Modes.** room: 2.4 cm cells, 0.25 to 5 m; object: 8 mm, 0.15 to 2.5 m;
+  person: 1 cm, 0.25 to 4 m; live: 0.25 to 5 m. The cap is 1 000 000 cells:
+  beyond it new surface is dropped, existing cells are still refined and
+  `Stats.capture.full` is true (the UI must say so).
+- **Region (object, person).** Until the phone sends one: a sphere of 0.6 m
+  (object) or 1.2 m (person) around the point the first frame looks at.
+  Frames are fused within 1.5 times the radius; viewers get what is inside it.
+- **Person mode.** With a mask plane only pixels of 128 or more are fused;
+  once a mask has been seen, frames without one are not used.
+- **Depth filter.** Depth 0, out of range, or of confidence below
+  `min_confidence` (1) is dropped. The depth-step filter runs only for frames
+  without a confidence plane.
+- **Fusion policy for the phone.** The same `VoxelFusion` as the simulated
+  scan with two real-sensor settings on: a cell averages up to 24 frames
+  (`blend_frames`), and a frame's colours are scaled per channel to agree
+  with the map where they overlap (`exposure_compensation`).
+- **Layer merge.** At progress ticks and at finish, same-facing cells closer
+  than `layer_window` (3) cells in a column are merged into one, which removes
+  the doubled surfaces that depth noise creates. Layer 0 then goes out as a
+  `Replace`. Finish also drops lone single-frame cells.
+- **Acks.** `used` is false when the capture is paused or finished, tracking
+  is not normal (fusing modes), pose or intrinsics are not a rigid transform
+  or a camera, the colour does not decode, no depth survives, person mode
+  sees nobody, or the depth map exceeds 2^20 pixels. Live mode uses frames
+  of any tracking state.
+- **Restart rule.** A frame whose index is lower than one already taken means
+  the app was relaunched: the session restarts (State, two empty layer
+  Replaces, Stats, then the frame). A reconnection with higher indices and
+  the same name and mode continues the scan.
+- **Colour.** The JPEG is decoded at the smallest DCT scale that still covers
+  the depth grid on both axes, then area-averaged onto it. JPEGs above 2^23
+  pixels, in CMYK, or with more than 64 scans make the frame unused.
+- **Limits.** Text messages above 16 KiB are refused; WebSocket messages are
+  capped at 8 MiB; `max_inflight` is 4; names are cut to 120 characters.
+  Error texts sent to the phone are French; the close code is 1007 for
+  `bad_frame` and 1008 otherwise.
+- **Timing.** A frame costs 7 to 18 ms (median, 4-core VM); a progress tick
+  near the cap up to 160 ms and finish about 1 s, so the server runs all
+  three off the async executor. `CaptureSession::snapshot()` goes to the
+  joining viewer only.
+- **Import.** The `.gscap` header must name a mode and, if present, protocol
+  1. A damaged frame record fails the import; a file cut inside a record
+  keeps its complete frames.
+
 ## 4D recording and sharing (binding for `gs-core::record`, `gs-server`, `gs-app`)
 
 **Recording file `.gsrec`.** A recording is the stream a viewer receives,
@@ -477,6 +539,48 @@ recording in two ways: a link (and QR code) on the local network,
 `https://<lan address>/?file=recordings/<name>.gsrec&embed=1`; and
 `GET /api/share/<name>.zip`, the web build with the recording inside and a
 `share.json` that names it, to unpack onto any static web host.
+
+### Details fixed by `gs_core::record`
+
+- **Keyframes** hold `State`, layer 0 `Replace`, layer 1 `Replace`, then the
+  latest `Stats` and the latest `Preview` of every camera when recorded.
+  They are pure redundancy: forward playback skips them; a seek starts at the
+  last keyframe not after the target and applies the records up to it. A
+  layer built from `Append` chunks is merged into one `Replace`.
+- **Keyframe policy.** One is due once the message bytes since the last one
+  reach 8 times the size of a keyframe, and not before 1 s: about every
+  1.2 s on the default stage (8 % of the file), none during a scan.
+- **Compression.** Raw deflate level 1 per record for payloads of 64 bytes or
+  more, kept only when it saves at least a ninth. Default stage: 5.8 MB/s;
+  a complete house scan: 17.3 MB.
+- **Header.** JSON padded with spaces to 1012 bytes (first record at offset
+  1024) and rewritten in place at the end with `duration_s`. Record times are
+  rebased so that the first is 0 and never decrease.
+- **Framing limits.** A record is at most 128 MiB, stored or inflated; the
+  writer refuses (`too_large`) a message or snapshot above that. Flag bits 1
+  to 7 are 0. Validation order: `bad_length`, `bad_kind`, `bad_flags`,
+  `bad_time`, `bad_deflate`, then `bad_message`, `bad_keyframe` or
+  `bad_index`.
+- **Damage.** Damage to the framing ends the readable part of the file; a
+  record with a bad payload is reported and skipped; a file without index or
+  trailer is a recording cut short and plays to its last complete record.
+- **Index.** A player holding the whole file ignores it. A `Range` player
+  uses it as a hint only: the span fetched at an index offset must begin with
+  a keyframe of exactly that time, otherwise the entry is dropped. A wrong
+  index costs a detour, never a wrong picture. A seek before the first known
+  keyframe starts at the first record; a record later than the index's
+  duration extends the duration.
+- **Players.** `from_bytes`, `streaming` (a download in progress) and `ranged`
+  (HTTP `Range`, bounded cache). The first two hold the whole file (about
+  350 MB per minute of the default stage), so long stage recordings need
+  `ranged`. One `Update` hands out at most 512 MiB. Hosts ask `wanted()`
+  after every `update`, `supply`, `seek` and `advance`, and forget the
+  statistics and thumbnails they show when `Update.reset` is set.
+- **In-memory recording** (no server) writes to a `ChunkedSink` with a size
+  bound; the recorder answers `Full` early enough that the bounded file is
+  always complete and valid.
+- **Second implementation.** `tools/gsrec.py` (`info`, `verify`, `synth`)
+  reads and writes the same bytes.
 
 ## Verification
 

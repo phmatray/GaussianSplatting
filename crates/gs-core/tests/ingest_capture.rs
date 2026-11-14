@@ -455,10 +455,13 @@ fn person_mode_keeps_the_person_and_live_mode_shows_one_view() {
     let with_floor = phone.world.to_scene(&unmasked.static_splats(), unmasked.floor().0);
     assert!(with_floor.iter().filter(|s| s.pos[1] < 0.02).count() > 2_000);
     // Once masks were seen, a frame that shows nobody adds nothing.
-    let nobody = CaptureFrame { mask: Some(vec![0; shots[0].frame.depth_mm.len()]), ..shots[0].frame.clone() };
+    // (Later frames of the same run of the app: their index goes on. An
+    // index that goes back would be the app restarted in a new world.)
+    let nobody = CaptureFrame { index: 100, mask: Some(vec![0; shots[0].frame.depth_mm.len()]), ..shots[0].frame.clone() };
     assert_eq!(person.handle_message(&ClientMessage::Resume).to_viewers.len(), 1);
     assert_eq!(person.handle_decoded(&nobody).frame.unwrap().skipped, Some(SkipReason::NoPerson));
-    assert_eq!(person.handle_decoded(&CaptureFrame { mask: None, ..shots[0].frame.clone() }).frame.unwrap().skipped, Some(SkipReason::NoPerson));
+    let unmasked_again = CaptureFrame { index: 101, mask: None, ..shots[0].frame.clone() };
+    assert_eq!(person.handle_decoded(&unmasked_again).frame.unwrap().skipped, Some(SkipReason::NoPerson));
 
     // Live: every frame replaces layer 1 with that one view; layer 0 is
     // never touched; limited tracking is no reason to drop a frame.
@@ -607,16 +610,22 @@ fn noise_jitter_and_the_cell_cap_keep_the_map_single_layered_and_bounded() {
     // poses off by 3 mm plus drift: were surfaces doubled, there would be
     // twice the splats.
     assert!(a > 15_000 && (b as f32) < a as f32 * 1.45 && (b as f32) > a as f32 * 0.85, "{a} clean, {b} noisy");
-    // The final pass drops what a single frame put somewhere: the rim of
-    // what the turn saw (cells only the first or the last frame reached),
-    // and under noise the specks that no second frame confirmed.
+    // The final pass merges the layers that lie a few centimeters behind
+    // one another (with this coarse 64x48 depth map, 4 % of the clean
+    // cells: where a pixel 5 to 9 cm wide overshoots a crease; under noise
+    // the second layers of the far walls) and drops what a single frame
+    // put somewhere: the rim of what the turn saw, and the specks that no
+    // second frame confirmed. Measured: clean 98 233 -> 94 033, noisy
+    // 123 602 -> 111 328.
     let (mut clean, mut rough) = (clean, rough);
     clean.finish();
     rough.finish();
     let (a2, b2) = (clean.static_splats().len(), rough.static_splats().len());
     println!("clean {a} -> {a2}, noisy {b} -> {b2}");
-    assert!(a2 <= a && a2 as f32 > a as f32 * 0.99, "{a} before the final pass, {a2} after");
-    assert!(b2 < b && b2 as f32 > b as f32 * 0.9, "{b} before the final pass, {b2} after");
+    assert!(a2 <= a && a2 as f32 > a as f32 * 0.95, "{a} before the final pass, {a2} after");
+    assert!(b2 < b && b2 as f32 > b as f32 * 0.85, "{b} before the final pass, {b2} after");
+    // Noise leaves at most a fifth more cells than none, not twice as many.
+    assert!((b2 as f32) < a2 as f32 * 1.22, "{a2} clean, {b2} noisy after the final pass");
 
     // A cap far below what the room needs: reached, reported, respected.
     let capped = IngestParams { max_voxels: 5_000, ..IngestParams::default() };
@@ -626,7 +635,7 @@ fn noise_jitter_and_the_cell_cap_keep_the_map_single_layered_and_bounded() {
     assert!(stats.capture.unwrap().full && stats.splats_static == 5_000);
     assert!(!rough.stats().capture.unwrap().full);
     // Frames still count as used: they refine what is there.
-    assert!(small.handle_decoded(&ideal.1[0].frame).frame.unwrap().used);
+    assert!(small.handle_decoded(&CaptureFrame { index: 72, ..ideal.1[0].frame.clone() }).frame.unwrap().used);
     assert_eq!(small.finish().to_phone, [ServerMessage::Progress { frames: 73, splats: small.static_splats().len() as u64 }]);
 }
 

@@ -546,14 +546,17 @@ pub struct RegionInfo {
 
 /// Describes a real capture in [`SessionState::capture`].
 ///
-/// A capture looks like an ordinary session to a viewer that does not know
-/// this field: `config.scene` is `house` for the `room` mode (a space to
-/// walk through; fly controls) and `stage` for `object`, `person` and
-/// `live` (a subject to look at from around; orbit controls), the fused
-/// cloud is layer 0, the single view of the `live` mode is layer 1, and the
-/// phone is reported like the handheld sensor of the home scan: its pose in
-/// [`ScanStats::camera`] (id 0, `config.scan.head` is `single`) and its
-/// picture as the preview of camera 0, turned upright.
+/// A capture looks like a home scan to a viewer that does not know this
+/// field: `config.scene` is `house` in every mode, the fused cloud is layer
+/// 0, the single view of the `live` mode is layer 1, and the phone is
+/// reported like the handheld sensor of the scan: its pose in
+/// [`ScanStats::camera`] (id 0, `config.scan.head` is `single`), its picture
+/// as the preview of camera 0, turned upright, and the path it has taken in
+/// [`ScanInfo::path`]. [`SessionState::cameras`] is empty. A viewer that
+/// knows the field can do better: orbit controls around
+/// [`CaptureInfo::region`] for `object` and `person`, the counters of
+/// [`CaptureStats`] instead of a progress bar (a capture has no known end:
+/// [`ScanStats::progress`] is 0 until it is finished).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptureInfo {
