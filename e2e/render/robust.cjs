@@ -311,7 +311,7 @@ async function stereoAgainstReference(page, label, file, blend = 'normalized-sof
   const min = blend === 'sorted' ? 35 : 45;
   const size = s.xr.views[0].viewport.slice(2);
   const targets = blend === 'sorted' ? [0, 0] : size;
-  check(`robust: ${label} [${blend}]: both eyes match the CPU reference (PSNR >= ${min} dB)`,
+  check(`${/^\w+: /.test(label) ? '' : 'robust: '}${label} [${blend}]: both eyes match the CPU reference (PSNR >= ${min} dB)`,
     s.blend === blend && s.offscreen[0] === targets[0] && s.offscreen[1] === targets[1] && eyes.every((e) => e && e.psnr >= min && e.brightFrac > 0.02),
     `${s.blend}, off-screen targets ${s.offscreen.join('x')}; ` + eyes.map((e, i) => (e ? `eye ${i}: ${e.psnr.toFixed(2)} dB, ${e.width}x${e.height}, principal point offset (${p[i][8].toFixed(2)}, ${p[i][9].toFixed(2)})` : 'no reference')).join('; '));
   return eyes;

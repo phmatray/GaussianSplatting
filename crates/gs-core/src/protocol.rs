@@ -290,7 +290,7 @@ impl PipelineConfig {
 
     /// The image sizes of the ring cameras a user interface should offer:
     /// the light preset's, the default and the finest that still ticks at
-    /// 30 Hz on four desktop cores (its live layer is 10 MB/s).
+    /// 30 Hz on four desktop cores (its live layer is 11 MB/s).
     pub const RIG_RESOLUTIONS: [(u32, u32); 3] = [(160, 120), (240, 180), (320, 240)];
 
     /// The default configuration for a scene: eight 240x180 cameras for the

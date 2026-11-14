@@ -49,7 +49,7 @@
 use gs_core::experimental::wblend::{Blend, Coverage, DepthModel, Footprint, LowPass, Silhouette, WblendOptions};
 use gs_core::splat::{ViewParams, CUTOFF_SIGMA, LOW_PASS_PX2};
 
-use crate::params::BlendQuality;
+use crate::params::{BlendQuality, LAYER_COUNT};
 use crate::shaders::DEPTH_OCTAVES;
 
 /// The numbers of a quality level, taken from its `wblend` preset.
@@ -111,6 +111,31 @@ impl Recipe {
     pub fn taper(&self) -> [f32; 2] {
         let floor = (-0.5 * self.cutoff_sigma * self.cutoff_sigma).exp();
         [floor, 1.0 / (1.0 - floor)]
+    }
+}
+
+/// The larger of the two layer weights as the shaders see it.
+///
+/// Only the ratio of the layer weights matters (`Σ w·c / Σ w`; the coverage
+/// is accumulated without them), but their size decides whether the sums fit
+/// a half-float target: its largest value is 65504 and it has eleven bits of
+/// precision. With the larger weight at 16 a pixel overflows only where four
+/// thousand opaque splats lie on top of each other, and the weaker layer
+/// keeps its precision down to a ratio of about a thousand to one.
+const SHADER_WEIGHT: f32 = 16.0;
+
+/// The layer weights the accumulation pass is given: `weights` rescaled so
+/// that the larger one is [`SHADER_WEIGHT`]. A layer of weight zero stays at
+/// zero (it hides what is behind it and adds no colour, as in the
+/// reference); negative and non-finite weights count as zero.
+pub(crate) fn shader_weights(weights: [f32; LAYER_COUNT]) -> [f32; LAYER_COUNT] {
+    let weights = weights.map(|w| if w.is_finite() && w > 0.0 { w } else { 0.0 });
+    let largest = weights.iter().copied().fold(0.0, f32::max);
+    if largest > 0.0 {
+        // Divide first: the quotient is at most 1, whatever the weights.
+        weights.map(|w| w / largest * SHADER_WEIGHT)
+    } else {
+        weights
     }
 }
 
@@ -615,6 +640,25 @@ mod tests {
         assert!(encode(100_000.0) < 1.0 && encode(0.05) == 0.0);
         let [floor, gain] = recipe.taper();
         assert!((floor - (-4.5f32).exp()).abs() < 1e-9 && ((1.0 - floor) * gain - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn layer_weights_reach_the_shaders_in_half_float_range() {
+        // The default is passed through unchanged.
+        assert_eq!(shader_weights([1.0, gs_core::experimental::wblend::LIVE_LAYER_WEIGHT]), [1.0, 16.0]);
+        // Only the ratio survives; the larger weight is always 16.
+        for weights in [[1.0, 1.0e4], [1.0e4, 1.0], [1.0e4, 1.0e4], [1.0e-3, 1.0e-3], [3.0, 0.5], [f32::MAX, 1.0e30]] {
+            let [a, b] = shader_weights(weights);
+            assert_eq!(a.max(b), 16.0, "{weights:?}");
+            let (ratio, wanted) = (a as f64 / b as f64, weights[0] as f64 / weights[1] as f64);
+            assert!((ratio / wanted - 1.0).abs() < 1.0e-6, "{weights:?} -> {a} : {b}");
+        }
+        // Zero stays zero, also next to a weight; nonsense counts as zero.
+        assert_eq!(shader_weights([0.0, 0.0]), [0.0, 0.0]);
+        assert_eq!(shader_weights([0.0, 2.0]), [0.0, 16.0]);
+        assert_eq!(shader_weights([1.0, 0.0]), [16.0, 0.0]);
+        assert_eq!(shader_weights([f32::NAN, 4.0]), [0.0, 16.0]);
+        assert_eq!(shader_weights([-3.0, f32::INFINITY]), [0.0, 0.0]);
     }
 
     #[test]

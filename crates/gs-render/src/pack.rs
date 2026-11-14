@@ -69,10 +69,20 @@ pub(crate) fn pack_splat(splat: &Splat, out: &mut [u32]) {
     out[11] = if has_plane { su.max(sv) } else { 0.0 }.to_bits();
 }
 
+/// Quantization steps of a normal coordinate on either side of zero.
+///
+/// An even number of steps in all (`0..=65534`), so that `-1`, `0` and `1`
+/// are on the grid: the normals of floors and walls, which are exactly
+/// axis-aligned in every synthetic scene, survive unchanged. With `65535`
+/// steps a zero decodes to `1.5·10⁻⁵`, which tilts such a normal by that
+/// much and culls a floor seen from exactly inside its plane on one side.
+const NORMAL_STEPS: f32 = 32767.0;
+
 /// Octahedral encoding of a unit vector: `x | y << 16`, each coordinate of
-/// the unfolded octahedron mapped from `-1..=1` to `0..=65535`. The sign of
-/// every component survives (back-face culling depends on it). The inverse
-/// is `decode_normal` in the vertex shader (and [`decode_normal`] here).
+/// the unfolded octahedron mapped from `-1..=1` to `0..=65534`
+/// ([`NORMAL_STEPS`]). The sign of every component survives (back-face
+/// culling depends on it). The inverse is `decode_normal` in the vertex
+/// shader (and [`decode_normal`] here).
 #[inline]
 pub(crate) fn encode_normal(n: Vec3) -> u32 {
     let l1 = n.x.abs() + n.y.abs() + n.z.abs();
@@ -80,14 +90,14 @@ pub(crate) fn encode_normal(n: Vec3) -> u32 {
     // rotation gives.
     let n = if l1.is_finite() && l1 > 0.0 { n / l1 } else { Vec3::Z };
     let (x, y) = if n.z >= 0.0 { (n.x, n.y) } else { ((1.0 - n.y.abs()).copysign(n.x), (1.0 - n.x.abs()).copysign(n.y)) };
-    let quantize = |v: f32| ((v * 0.5 + 0.5) * 65535.0).round().clamp(0.0, 65535.0) as u32;
+    let quantize = |v: f32| (v * NORMAL_STEPS + NORMAL_STEPS).round().clamp(0.0, 2.0 * NORMAL_STEPS) as u32;
     quantize(x) | quantize(y) << 16
 }
 
 /// Inverse of [`encode_normal`], written like the GLSL version.
 #[cfg(test)]
 pub(crate) fn decode_normal(word: u32) -> Vec3 {
-    let f = |v: u32| v as f32 / 65535.0 * 2.0 - 1.0;
+    let f = |v: u32| (v as f32 - NORMAL_STEPS) / NORMAL_STEPS;
     let (x, y) = (f(word & 0xffff), f(word >> 16));
     let z = 1.0 - x.abs() - y.abs();
     let t = (-z).max(0.0);
@@ -252,10 +262,14 @@ mod tests {
             }
         }
         assert!(worst < 1.0e-4, "worst error {worst} rad");
+        // The six axes are exact: a floor seen from inside its plane is
+        // neither culled nor tilted.
+        for axis in [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z] {
+            assert_eq!(decode_normal(encode_normal(axis)), axis);
+        }
         // Garbage in: a valid direction out.
         for bad in [Vec3::ZERO, Vec3::splat(f32::NAN), Vec3::new(f32::INFINITY, 0.0, 0.0)] {
-            // (Zero is half a step off the 16-bit grid, so not exactly +Z.)
-            assert!(angle(decode_normal(encode_normal(bad)), Vec3::Z) < 1.0e-4);
+            assert_eq!(decode_normal(encode_normal(bad)), Vec3::Z);
         }
     }
 

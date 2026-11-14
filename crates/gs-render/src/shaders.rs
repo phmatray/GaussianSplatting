@@ -118,9 +118,10 @@ out vec3 v_depth;             // nearest and farthest depth a fragment may take,
 const vec4 CULLED = vec4(0.0, 0.0, 2.0, 1.0);
 
 #ifndef SORTED
-// Inverse of `pack::encode_normal` (octahedral, 16 bits per coordinate).
+// Inverse of `pack::encode_normal` (octahedral, 16 bits per coordinate,
+// 32767 steps on either side of zero so that the axes are exact).
 vec3 decode_normal(uint word) {
-  vec2 f = vec2(float(word & 65535u), float(word >> 16)) / 65535.0 * 2.0 - 1.0;
+  vec2 f = (vec2(float(word & 65535u), float(word >> 16)) - 32767.0) / 32767.0;
   vec3 n = vec3(f, 1.0 - abs(f.x) - abs(f.y));
   float t = max(-n.z, 0.0);
   n.x += n.x >= 0.0 ? -t : t;

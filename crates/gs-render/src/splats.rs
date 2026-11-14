@@ -12,7 +12,7 @@ use web_sys::{WebGl2RenderingContext as GL, WebGlBuffer, WebGlProgram, WebGlText
 use crate::depth::{DepthWarp, RobustBounds};
 use crate::glutil::{link_program, uniform};
 use crate::lines::Occlusion;
-use crate::normalized::{LayerDraw, Normalized, Output, ViewDraw};
+use crate::normalized::{shader_weights, LayerDraw, Normalized, Output, ViewDraw};
 use crate::pack::{pack_splats, TextureLayout, MIN_ROWS, WORDS_PER_SPLAT};
 use crate::params::{BlendQuality, BlendReason, BlendStatus, LayerContent, NormalizedSupport, RenderParams, LAYER_COUNT};
 use crate::shaders::{sorted_vs, SORTED_FS};
@@ -709,12 +709,13 @@ impl SplatScene {
             normalized.forget_surface();
         }
         let shown = [params.show_static, params.show_dynamic];
+        let weights = shader_weights(params.layer_weights);
         let mut layers = Vec::with_capacity(LAYER_COUNT);
         let mut clipped = 0;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if shown[i] && !layer.splats.is_empty() {
                 clipped += layer.clipped(clip_y);
-                layers.push(LayerDraw { texture: &layer.texture, count: layer.splats.len() as u32, weight: params.layer_weights[i] });
+                layers.push(LayerDraw { texture: &layer.texture, count: layer.splats.len() as u32, weight: weights[i] });
             }
         }
         if layers.is_empty() {
