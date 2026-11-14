@@ -40,7 +40,7 @@ pub struct RingRig {
 }
 
 impl Default for RingRig {
-    /// Eight 160x120 cameras around the stage, alternating between 1.3 m and
+    /// Eight 240x180 cameras around the stage, alternating between 1.3 m and
     /// 2.5 m, 3.2 m from the axis, looking at the dancer's waist.
     fn default() -> Self {
         Self {
@@ -51,8 +51,8 @@ impl Default for RingRig {
             upper_elevation: 2.5,
             target: Vec3::new(0.0, 1.0, 0.0),
             fov_y_deg: 50.0,
-            width: 160,
-            height: 120,
+            width: 240,
+            height: 180,
         }
     }
 }

@@ -55,7 +55,7 @@
 //! cameras; the cameras are processed in parallel with the `par` feature.
 //! The result does not depend on the thread count.
 
-use glam::{Mat3A, Vec3, Vec3A};
+use glam::{Mat3A, Vec3A};
 #[cfg(feature = "par")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -373,6 +373,8 @@ pub fn fuse(views: &[View], params: &MultiViewParams, out: &mut Vec<Splat>) -> F
 
 #[cfg(test)]
 mod tests {
+    use glam::Vec3;
+
     use super::*;
     use crate::reconstruct::{frame_to_sourced_splats, ReconstructParams};
     use crate::types::RgbdFrame;
@@ -577,11 +579,11 @@ mod tests {
         splats[1][5].depth = f32::NAN;
         splats[1][6].depth = 0.0;
         splats[1][7].normal = Vec3::splat(f32::INFINITY);
-        let (_, stats) = fused(&cams, &splats, &GREEDY);
-        assert!(stats.kept > 0 && stats.kept <= stats.input);
+        let mut out = Vec::new();
+        let stats = fuse(&views(&cams, &splats), &GREEDY, &mut out);
+        assert!(stats.kept > 0 && stats.kept <= stats.input && stats.kept == out.len());
         let empty: [Vec<SourcedSplat>; 2] = [Vec::new(), Vec::new()];
         assert_eq!(fused(&cams, &empty, &GREEDY).1, FusionStats::default());
-        let mut out = vec![Splat::default()];
         assert_eq!(fuse(&[], &GREEDY, &mut out), FusionStats::default());
         assert!(out.is_empty());
         // Hostile parameters are tamed.

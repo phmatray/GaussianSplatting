@@ -43,6 +43,8 @@ feed-forward depth network) would deliver.
 | `crates/gs-app` | wasm | Leptos CSR user interface, built with Trunk |
 | `src-tauri` | native | Tauri 2 desktop shell. Starts `gs-server`, exposes info commands. Workspace member outside `default-members` (needs WebKitGTK; root `cargo build` / `cargo test` skip it) |
 | `e2e` | node | Playwright end-to-end checks (desktop render, WS mode, emulated VR) |
+| `ios/SplatCapture` | iOS (Swift) | Companion capture app: streams or records LiDAR RGB-D frames with ARKit poses. Built with Xcode on a Mac, not part of the Cargo workspace |
+| `tools` | python | Reference implementation of the capture file format, test fixtures, a simulated phone |
 
 ## Conventions (binding for every crate)
 
@@ -255,6 +257,134 @@ turning to mush.
 and for the filter; the viewer is compared against it pixel by pixel in
 `e2e/render`. The splat cloud is produced for the normalised mode; a viewer
 in sorted mode compensates with its splat scale.
+
+## Real capture: the phone companion (binding for `ios/`, `gs-core::ingest`, `gs-server`)
+
+An iPhone or iPad with a LiDAR scanner delivers, through ARKit, exactly what
+the pipeline consumes: a colour image, a depth map and the camera pose for
+every frame. The companion app `ios/SplatCapture` (Swift, SwiftUI, ARKit)
+streams those frames to `gs-server`, or records them to a file when no server
+is in reach. The server fuses them with the same voxel fusion as the simulated
+house scan; viewers see an ordinary session (`State`, layer 0 `Append` /
+`Replace`, `Stats`, `Preview`).
+
+ARKit's conventions equal ours and need no conversion: the world is
+right-handed with +Y up (gravity), the camera looks along -Z with +X right
+and +Y up, pixel `(0,0)` is the top-left of the image in the sensor's native
+(landscape) orientation, and the depth map holds the distance along the
+camera axis in meters, aligned with the colour image. Only the origin
+differs: ARKit's is where the session started, so the server shifts the world
+vertically once the floor height is known (`floor` message, or its own
+estimate) so that the floor is `y = 0`.
+
+**Capture modes.** `room` (walk through rooms; range up to 5 m), `object`
+and `person` (walk around a subject that holds still; fusion is cropped to a
+region of interest with finer cells), `live` (no fusion: every frame replaces
+layer 1 with the surfels of that one view, a relief seen from the phone's
+side; a full live volume needs several devices and is out of scope).
+
+**Pairing.** `GET /api/pair` (loopback listener only, LAN must be on) answers
+`{"uri": "splatlive://pair?host=<ip>&port=<lan port>&fp=<sha256>&token=<t>"}`
+and `GET /api/pair.svg` the QR code of that URI. `fp` is the SHA-256 of the
+server certificate (DER) as 64 lowercase hex digits; the app accepts exactly
+that certificate and no other (the certificate is self-signed, so the system
+trust store cannot help). `token` is 32 lowercase hex digits, random per
+server start; `/ingest` refuses a `hello` without it.
+
+**Stream.** `GET /ingest` on the LAN HTTPS listener, a WebSocket.
+
+- Client text frames (JSON): first `{"type":"hello","protocol":1,
+  "token":"…","device":"iPhone17,2","app":"0.1.0","mode":"room",
+  "name":"Salon"}`; then, at any time, `{"type":"region","center":[x,y,z],
+  "radius":r}` (world meters; `object` and `person`), `{"type":"floor",
+  "y":h}` (world height of the floor ARKit detected), `{"type":"pause"}`,
+  `{"type":"resume"}`, `{"type":"reset"}`, `{"type":"finish"}`.
+- Server text frames (JSON): `{"type":"welcome","protocol":1,
+  "max_inflight":4}` or `{"type":"error","code":"…","message":"…"}` followed
+  by a close; `{"type":"ack","frame":n,"used":bool}` for every frame;
+  `{"type":"progress","frames":n,"splats":n}` about once a second.
+- Client binary frames: one capture frame each, little-endian:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 4 | magic `GSCF` |
+  | 4 | 1 | version, `1` |
+  | 5 | 1 | flags: bit 0 confidence present, bit 1 depth, confidence and mask are raw-deflate compressed (RFC 1951), bit 2 mask present |
+  | 6 | 1 | tracking: 0 not available, 1 limited, 2 normal |
+  | 7 | 1 | display orientation of the device (hint for previews only): 0 sensor native (landscape), 1 portrait, 2 landscape flipped, 3 portrait upside down |
+  | 8 | 4 | frame index `u32`, increasing |
+  | 12 | 4 | reserved, 0 |
+  | 16 | 8 | timestamp `f64`, seconds (ARKit frame time) |
+  | 24 | 64 | `world_from_cam`, 16 × `f32`, column-major |
+  | 88 | 16 | `fx, fy, cx, cy` as `f32`, in pixels of the colour image as sent |
+  | 104 | 4 | colour width, height as `u16` |
+  | 108 | 4 | colour byte length `u32` (a JPEG) |
+  | 112 | 4 | depth width, height as `u16` |
+  | 116 | 4 | depth byte length `u32` |
+  | 120 | 4 | confidence byte length `u32` (0 if absent) |
+  | 124 | 4 | mask byte length `u32` (0 if absent) |
+  | 128 | … | colour, then depth, then confidence, then mask |
+
+  Depth is `u16` millimeters, row-major from the top-left, `0` = no value.
+  Confidence is one byte per depth pixel (0 low, 1 medium, 2 high, as
+  ARKit's). The mask is one byte per depth pixel (0 background, 255 person;
+  ARKit's person segmentation) and is optional in every mode.
+- Flow control: the app never has more than `max_inflight` frames
+  unacknowledged; it skips frames instead of queueing them. In the fusing
+  modes it sends a frame when the camera moved 5 cm or turned 5 degrees since
+  the last one sent, or after 0.5 s, at most 10 per second; in `live` mode up
+  to 15 per second.
+
+**Capture file `.gscap`.** What the app records offline, and what the
+simulator can write for tests: 8 bytes `GSCAP1\0\0`, a `u32` length and that
+many bytes of JSON (the `hello` fields plus `created`, RFC 3339, and
+optionally `region` and `floor`), then for every frame a `u32` length and the
+frame exactly as on the wire. `POST /api/captures` (body: the file) imports
+one into the running server; the desktop app offers it as a file to open.
+On the LAN listener that request must carry the pairing token
+(`Authorization: Bearer <token>`); on the loopback listener the usual
+`Origin` check applies.
+
+## 4D recording and sharing (binding for `gs-core::record`, `gs-server`, `gs-app`)
+
+**Recording file `.gsrec`.** A recording is the stream a viewer receives,
+with time stamps, so it replays in any viewer without the pipeline:
+
+- 8 bytes `GSREC1\0\0`, a `u32` length and that many bytes of JSON
+  (`name`, `created`, `scene`, `protocol`, `duration_s`, 0 while unknown).
+- Records: `u32` length of what follows, `u8` kind, `u8` flags (bit 0:
+  payload is raw-deflate compressed), `u16` reserved, `f64` time in seconds
+  since the start, payload.
+  - kind 0, *message*: one wire message exactly as sent to viewers.
+  - kind 1, *keyframe*: a complete snapshot (`State`, layer 0 `Replace`,
+    layer 1 `Replace`), each message prefixed by its `u32` length. Playback
+    can start at any keyframe. The first record is a keyframe.
+  - kind 2, *index*: `(f64 time, u64 file offset)` of every keyframe.
+- The file ends with the index record, the `u64` offset of that record and 8
+  bytes `GSRECEND`. A file cut short (no index) still plays by reading it
+  from the start.
+
+A still scan is a recording with one keyframe. Seeking goes to the nearest
+earlier keyframe and replays the messages up to the wanted time. Replay is
+done by the viewer side (`gs-app`, in the worker), so every viewer has its
+own time line: play, pause, speed, loop, scrub; in VR as well.
+
+**Server.** `POST /api/record` `{"action":"start","name":"…"}` /
+`{"action":"stop"}` (loopback only) records the live stream to the recordings
+directory; `GET /api/recordings` lists them (name, size, duration, scene);
+`GET /recordings/<name>.gsrec` serves one, with `Range` support; `DELETE`
+of the same path removes it (loopback only). Without a server the app
+records in memory, up to a bound, and offers the file as a download.
+
+**Sharing.** The web build is also the shareable viewer. URL parameters:
+`file=<url>` (`.gsrec`, `.ply` or `.splat`; relative or absolute),
+`embed=1` (canvas only, with small playback controls, full screen and VR
+buttons: for an `<iframe>`), `autoplay`, `loop`, `t=<seconds>`,
+`view=<eye x,y,z,target x,y,z>`, `nav=orbit|fly`. The desktop app shares a
+recording in two ways: a link (and QR code) on the local network,
+`https://<lan address>/?file=recordings/<name>.gsrec&embed=1`; and
+`GET /api/share/<name>.zip`, the web build with the recording inside and a
+`share.json` that names it, to unpack onto any static web host.
 
 ## Verification
 

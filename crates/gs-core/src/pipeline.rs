@@ -49,7 +49,8 @@ use crate::protocol::{
     CameraInfo, ControlMsg, PipelineConfig, ScanConfig, ScanHead, ScanInfo, ScanState, ScanStats, SessionState, Stats,
     ViewerStart, PROTOCOL_VERSION,
 };
-use crate::reconstruct::{foreground_mask, frame_to_splats, BackgroundPlate, VoxelFusion};
+use crate::multiview::{self, MultiViewParams};
+use crate::reconstruct::{foreground_mask, frame_to_sourced_splats, BackgroundPlate, SourcedSplat, VoxelFusion};
 use crate::rig::ScanPath;
 use crate::scene::{house, make_scene, Scene, SceneKind, SceneSnapshot};
 use crate::types::{Camera, RgbdFrame, Splat};
@@ -104,6 +105,9 @@ struct Stage {
     plates: Vec<BackgroundPlate>,
     static_splats: Vec<Splat>,
     dynamic_splats: Vec<Splat>,
+    /// Per camera: its splats of the current tick before the fusion
+    /// (scratch space of [`reconstruct_ring`]).
+    candidates: Vec<Vec<SourcedSplat>>,
     /// The latest exposure of every camera (for the previews).
     frames: Vec<RgbdFrame>,
     /// Position in the dance loop, seconds.
@@ -151,7 +155,8 @@ pub struct Pipeline {
     seq: AtomicU32,
     tick: u64,
     last_tick: Option<Instant>,
-    tick_hz: f32,
+    /// Smoothed interval between ticks in seconds, `0` until two have run.
+    tick_interval: f64,
     last_stats: Stats,
 }
 
@@ -159,7 +164,9 @@ pub struct Pipeline {
 #[derive(Default)]
 struct TickWork {
     capture_ms: f64,
+    /// Includes `fuse_ms`.
     reconstruct_ms: f64,
+    fuse_ms: f64,
     encode_ms: f64,
     pixels: u64,
 }
@@ -206,29 +213,31 @@ fn capture_ring(
     cameras.iter().enumerate().map(shoot).collect()
 }
 
-/// Runs `per_camera(index, out)` for every camera and concatenates the
-/// results in camera order, whatever the thread schedule.
-fn reconstruct_ring(count: usize, out: &mut Vec<Splat>, per_camera: impl Fn(usize, &mut Vec<Splat>) + Sync) {
-    out.clear();
+/// Reconstructs every camera of the ring on its own (`per_camera(index,
+/// out)` fills the cleared `out` with that camera's splats) and fuses the
+/// results into `out`: the kept splats in camera order, whatever the thread
+/// schedule. `candidates` is scratch space that keeps its allocations from
+/// one tick to the next. Returns the milliseconds the fusion took.
+fn reconstruct_ring(
+    cameras: &[Camera],
+    fusion: &MultiViewParams,
+    candidates: &mut Vec<Vec<SourcedSplat>>,
+    out: &mut Vec<Splat>,
+    per_camera: impl Fn(usize, &mut Vec<SourcedSplat>) + Sync,
+) -> f64 {
+    candidates.resize_with(cameras.len(), Vec::new);
+    let fill = |(i, list): (usize, &mut Vec<SourcedSplat>)| {
+        list.clear();
+        per_camera(i, list);
+    };
     #[cfg(feature = "par")]
-    {
-        let parts: Vec<Vec<Splat>> = (0..count)
-            .into_par_iter()
-            .map(|i| {
-                let mut part = Vec::new();
-                per_camera(i, &mut part);
-                part
-            })
-            .collect();
-        out.reserve(parts.iter().map(Vec::len).sum());
-        for part in &parts {
-            out.extend_from_slice(part);
-        }
-    }
+    candidates.par_iter_mut().enumerate().for_each(fill);
     #[cfg(not(feature = "par"))]
-    for i in 0..count {
-        per_camera(i, out);
-    }
+    candidates.iter_mut().enumerate().for_each(fill);
+    let start = Instant::now();
+    let views: Vec<multiview::View> = cameras.iter().zip(candidates.iter()).map(|(cam, splats)| multiview::View { cam, splats }).collect();
+    multiview::fuse(&views, fusion, out);
+    ms_since(start)
 }
 
 /// `frame` reduced by an integer factor so that it is at most `max_width`
@@ -457,6 +466,7 @@ impl Stage {
             plates: Vec::new(),
             static_splats: Vec::new(),
             dynamic_splats: Vec::new(),
+            candidates: Vec::new(),
             frames: Vec::new(),
             time,
             exposures: 0,
@@ -475,8 +485,8 @@ impl Stage {
             }
             stage.plates = per_camera.iter().map(|frames| BackgroundPlate::from_frames(frames)).collect();
             let (cameras, plates) = (&stage.cameras, &stage.plates);
-            reconstruct_ring(cameras.len(), &mut stage.static_splats, |i, out| {
-                frame_to_splats(plates[i].frame(), &cameras[i], &config.recon, None, out);
+            reconstruct_ring(cameras, &config.fusion, &mut stage.candidates, &mut stage.static_splats, |i, out| {
+                frame_to_sourced_splats(plates[i].frame(), &cameras[i], &config.recon, None, out);
             });
         }
         stage.refresh(scene, config, &mut TickWork::default());
@@ -494,14 +504,9 @@ impl Stage {
 
         let start = Instant::now();
         let (cameras, plates, frames) = (&self.cameras, &self.plates, &self.frames);
-        reconstruct_ring(cameras.len(), &mut self.dynamic_splats, |i, out| match plates.get(i) {
-            Some(plate) => {
-                let mask = foreground_mask(&frames[i], plate, &config.recon);
-                frame_to_splats(&frames[i], &cameras[i], &config.recon, Some(&mask), out);
-            }
-            None => {
-                frame_to_splats(&frames[i], &cameras[i], &config.recon, None, out);
-            }
+        work.fuse_ms += reconstruct_ring(cameras, &config.fusion, &mut self.candidates, &mut self.dynamic_splats, |i, out| {
+            let mask = plates.get(i).map(|plate| foreground_mask(&frames[i], plate, &config.recon));
+            frame_to_sourced_splats(&frames[i], &cameras[i], &config.recon, mask.as_deref(), out);
         });
         work.reconstruct_ms += ms_since(start);
     }
@@ -511,6 +516,7 @@ impl House {
     fn new(scene: &dyn Scene, config: &PipelineConfig) -> Self {
         let mut fusion = VoxelFusion::new(config.scan.voxel_size);
         fusion.max_range = config.scan.max_range;
+        fusion.radius_factor = config.scan.kernel;
         Self {
             snapshot: scene.snapshot_static(),
             path: ScanPath::house_default().with_speed(config.scan.speed),
@@ -607,7 +613,7 @@ impl Pipeline {
             seq: AtomicU32::new(0),
             tick: 0,
             last_tick: None,
-            tick_hz: 0.0,
+            tick_interval: 0.0,
             last_stats: Stats::default(),
         }
     }
@@ -740,9 +746,10 @@ impl Pipeline {
             scene_time: self.scene_time(),
             capture_ms: work.capture_ms as f32,
             reconstruct_ms: work.reconstruct_ms as f32,
+            fuse_ms: work.fuse_ms as f32,
             encode_ms: work.encode_ms as f32,
             total_ms: total_ms as f32,
-            tick_hz: self.tick_hz,
+            tick_hz: if self.tick_interval > 0.0 { (1.0 / self.tick_interval) as f32 } else { 0.0 },
             splats_static: saturating_u32(self.static_splats().len()),
             splats_dynamic: saturating_u32(self.dynamic_splats().len()),
             bytes: saturating_u32(bytes),
@@ -788,11 +795,12 @@ impl Pipeline {
     pub fn tick(&mut self, dt: f32) -> Vec<Outgoing> {
         let start = Instant::now();
         if let Some(last) = self.last_tick {
+            // The interval is what gets averaged, not its inverse: a host
+            // that ticks in bursts (three ticks back to back, then a pause)
+            // would otherwise report the rate of the burst.
             let interval = start.duration_since(last).as_secs_f64();
-            if interval > 1e-6 {
-                let hz = (1.0 / interval) as f32;
-                self.tick_hz = if self.tick_hz > 0.0 { 0.9 * self.tick_hz + 0.1 * hz } else { hz };
-            }
+            self.tick_interval =
+                if self.tick_interval > 0.0 { 0.9 * self.tick_interval + 0.1 * interval } else { interval };
         }
         self.last_tick = Some(start);
         self.tick += 1;

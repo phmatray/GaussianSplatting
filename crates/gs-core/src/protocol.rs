@@ -14,6 +14,7 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::NoiseModel;
+use crate::multiview::MultiViewParams;
 use crate::reconstruct::{ReconstructParams, VoxelFusion};
 use crate::rig::{RingRig, ScanPath, MAX_FOV_DEG};
 use crate::scene::SceneKind;
@@ -142,6 +143,8 @@ pub struct ScanConfig {
     pub autostart: bool,
     /// The sensor head that is carried through the house.
     pub head: ScanHead,
+    /// Tangential standard deviation of a scan splat in cells.
+    pub kernel: f32,
 }
 
 impl Default for ScanConfig {
@@ -156,6 +159,7 @@ impl Default for ScanConfig {
             frames_per_second: 6.0,
             autostart: true,
             head: ScanHead::default(),
+            kernel: 0.6,
         }
     }
 }
@@ -178,6 +182,7 @@ impl ScanConfig {
             frames_per_second: finite_clamp(self.frames_per_second, d.frames_per_second, 0.5, 60.0),
             autostart: self.autostart,
             head: self.head,
+            kernel: finite_clamp(self.kernel, d.kernel, 0.2, 1.5),
         }
     }
 }
@@ -238,6 +243,9 @@ pub struct PipelineConfig {
     pub background_subtraction: bool,
     /// Depth-to-Gaussian parameters.
     pub recon: ReconstructParams,
+    /// Live stage: fusion of the ring cameras' splats, for the static layer
+    /// and for the live one.
+    pub fusion: MultiViewParams,
     /// Home scan parameters.
     pub scan: ScanConfig,
     /// Camera feed thumbnails.
@@ -276,6 +284,7 @@ impl PipelineConfig {
             noise: NoiseModel::NONE,
             background_subtraction: true,
             recon: ReconstructParams::default(),
+            fusion: MultiViewParams::default(),
             scan: ScanConfig::default(),
             preview: PreviewConfig::default(),
         }
@@ -331,6 +340,7 @@ impl PipelineConfig {
             noise,
             background_subtraction: self.background_subtraction,
             recon: self.recon.sanitized(),
+            fusion: self.fusion.sanitized(),
             scan: self.scan.sanitized(),
             preview: self.preview.sanitized(),
         }
@@ -585,13 +595,17 @@ pub struct Stats {
     pub scene_time: f32,
     /// Time spent ray casting the sensors this tick, in milliseconds.
     pub capture_ms: f32,
-    /// Time spent turning frames into Gaussians.
+    /// Time spent turning frames into Gaussians, multi-view fusion included.
     pub reconstruct_ms: f32,
+    /// The part of `reconstruct_ms` spent in the multi-view fusion of the
+    /// ring cameras (stage).
+    pub fuse_ms: f32,
     /// Time spent encoding wire messages.
     pub encode_ms: f32,
     /// Whole tick.
     pub total_ms: f32,
-    /// Measured tick rate in Hz (smoothed), `0` until two ticks have run.
+    /// Measured tick rate in Hz: the inverse of the smoothed interval
+    /// between ticks, `0` until two ticks have run.
     pub tick_hz: f32,
     /// Splats in the static layer 0.
     pub splats_static: u32,

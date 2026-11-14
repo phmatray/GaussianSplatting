@@ -385,9 +385,8 @@ pub struct ViewerStats {
     pub sort_ms: f32,
     /// Splats held in both layers.
     pub splats_total: u32,
-    /// Splats submitted per view in the last rendered frame: those of the
-    /// visible layers, in the sorted mode minus the ones above the height
-    /// clip (the normalised mode clips in the vertex shader).
+    /// Splats drawn per view in the last rendered frame: those of the
+    /// visible layers that are not above the height clip.
     pub splats_drawn: u32,
     /// An immersive session is running.
     pub xr_active: bool,

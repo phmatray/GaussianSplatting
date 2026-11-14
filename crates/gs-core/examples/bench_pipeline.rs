@@ -5,11 +5,15 @@
 //! cargo run -p gs-core --release --features par --example bench_pipeline   # rayon
 //! ```
 //!
-//! Prints one line per scenario and a `RESULT` summary. The stage numbers are
-//! taken over two loops of the dance at the configured tick rate; the house
-//! is scanned twice, once in real-time steps (per-tick cost, sensor frames
-//! per tick, previews) and once with `ScanFinish` (time to fuse the whole
-//! path).
+//! Prints one `RESULT` line per scenario; an argument keeps the scenarios
+//! whose label contains it. The stage numbers are taken over two loops of
+//! the dance at the configured tick rate; the house is scanned twice, once in
+//! real-time steps (per-tick cost, sensor frames per tick, previews) and once
+//! with `ScanFinish` (time to fuse the whole path).
+//!
+//! Wall-clock times only mean something on an idle machine: every line
+//! carries the CPU time of the process per tick (all threads) and the load
+//! average, so that a busy machine shows.
 
 use std::time::Instant;
 
@@ -42,6 +46,26 @@ fn fingerprint(hash: &mut u64, messages: &[Outgoing]) {
 
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 
+/// CPU time this process has used so far, all threads, in milliseconds
+/// (Linux; `None` elsewhere).
+fn cpu_ms() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The fields after the command name, which may itself hold spaces.
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace().skip(11);
+    let (user, system): (f64, f64) = (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?);
+    // Clock ticks; 100 per second on every Linux this runs on.
+    Some((user + system) * 10.0)
+}
+
+/// The one-minute load average (Linux; empty elsewhere).
+fn load_average() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(|load| format!("load {load}")))
+        .unwrap_or_default()
+}
+
 fn stats_of(messages: &[Outgoing]) -> Option<Stats> {
     messages.iter().rev().find(|m| codec::peek_kind(&m.bytes) == Ok(Kind::Stats)).and_then(|m| {
         match codec::decode(&m.bytes).ok()?.body {
@@ -59,9 +83,10 @@ fn stage(label: &str, config: PipelineConfig) {
     let dt = 1.0 / pipeline.config().target_hz;
     let ticks = (2.0 * 9.6 / dt) as usize;
     let (mut total, mut capture, mut recon, mut encode) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut dynamic, mut layer_bytes, mut tick_bytes) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut dynamic, mut layer_bytes, mut tick_bytes, mut fuse) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut hash = FNV_OFFSET;
     fingerprint(&mut hash, &pipeline.snapshot());
+    let cpu_start = cpu_ms();
     for _ in 0..ticks {
         let start = Instant::now();
         let out = pipeline.tick(dt);
@@ -70,18 +95,21 @@ fn stage(label: &str, config: PipelineConfig) {
         let stats = stats_of(&out).expect("every tick emits Stats");
         capture.push(stats.capture_ms as f64);
         recon.push(stats.reconstruct_ms as f64);
+        fuse.push(stats.fuse_ms as f64);
         encode.push(stats.encode_ms as f64);
         dynamic.push(stats.splats_dynamic as f64);
         tick_bytes.push(out.iter().map(|m| m.bytes.len()).sum::<usize>() as f64);
         layer_bytes.push(out.iter().filter(|m| m.slot == SLOT_DYNAMIC).map(|m| m.bytes.len()).sum::<usize>() as f64);
     }
+    let cpu = cpu_start.zip(cpu_ms()).map_or(String::new(), |(a, b)| format!(", CPU {:.2} ms/tick", (b - a) / ticks as f64));
     let mut sorted = total.clone();
     sorted.sort_by(f64::total_cmp);
     let c = pipeline.config();
     println!(
-        "RESULT {label}: {}x{}x{} tick mean {:.2} ms, p95 {:.2}, max {:.2} (capture {:.2}, reconstruct {:.2}, encode {:.2}); \
+        "RESULT {label}: {}x{}x{} tick mean {:.2} ms, p95 {:.2}, max {:.2}{cpu} \
+         (capture {:.2}, reconstruct {:.2} of which fusion {:.2}, encode {:.2}; {}); \
          setup {:.0} ms; static {} splats, dynamic mean {:.0} max {:.0}; \
-         dynamic layer {:.0} kB/tick, all messages {:.0} kB/tick; \
+         dynamic layer {:.0} kB/tick = {:.2} MB/s at {:.0} Hz, all messages {:.0} kB/tick; \
          fingerprint {hash:016x}",
         c.rig.count,
         c.rig.width,
@@ -91,12 +119,16 @@ fn stage(label: &str, config: PipelineConfig) {
         percentile(&sorted, 1.0),
         mean(&capture),
         mean(&recon),
+        mean(&fuse),
         mean(&encode),
+        load_average(),
         setup_ms,
         pipeline.static_splats().len(),
         mean(&dynamic),
         dynamic.iter().copied().fold(0.0, f64::max),
         mean(&layer_bytes) / 1e3,
+        mean(&layer_bytes) * c.target_hz as f64 / 1e6,
+        c.target_hz,
         mean(&tick_bytes) / 1e3,
     );
 }
@@ -111,6 +143,7 @@ fn house(label: &str, mut config: PipelineConfig) {
     let mut hash = FNV_OFFSET;
     let c = *pipeline.config();
     let frame_pixels = (c.scan.width * c.scan.height) as u64;
+    let load = load_average();
     while pipeline.scan_state() == Some(ScanState::Scanning) {
         let start = Instant::now();
         let out = pipeline.tick(dt);
@@ -136,6 +169,7 @@ fn house(label: &str, mut config: PipelineConfig) {
 
     pipeline.handle_control(ControlMsg::ScanStart);
     pipeline.handle_control(ControlMsg::ScanFinish);
+    let cpu_start = cpu_ms();
     let start = Instant::now();
     let (mut finish_ticks, mut finish_worst) = (0usize, 0.0f64);
     while pipeline.scan_state() == Some(ScanState::Scanning) {
@@ -145,12 +179,14 @@ fn house(label: &str, mut config: PipelineConfig) {
         finish_ticks += 1;
     }
     let finish_s = start.elapsed().as_secs_f64();
+    let finish_cpu = cpu_start.zip(cpu_ms()).map_or(String::new(), |(a, b)| format!(", CPU {:.2} s", (b - a) / 1e3));
     println!(
         "RESULT {label}: {} x {}x{} fov {:.0}, voxel {:.0} mm, {walk_s:.1} s walk: \
          capturing tick mean {:.2} ms, p95 {:.2}, max {:.2} \
          (capture {:.2}, fuse {:.2}; {} of {} ticks capture {frames} frames, at most {most_frames} per tick; \
          {previews} previews); \
-         {} splats, {:.1} MB on the wire; ScanFinish {:.2} s in {} ticks (worst {:.1} ms); fingerprint {hash:016x}",
+         {} splats, {:.1} MB on the wire; ScanFinish {:.2} s{finish_cpu} in {} ticks (worst {:.1} ms); {load}; \
+         fingerprint {hash:016x}",
         c.scan.head.sensor_count(),
         c.scan.width,
         c.scan.height,
@@ -175,24 +211,46 @@ fn main() {
     let threads = if cfg!(feature = "par") { format!("rayon, {} threads", rayon_threads()) } else { "single-threaded".into() };
     println!("pipeline benchmark ({threads})");
 
-    stage("stage default", PipelineConfig::for_scene(SceneKind::Stage));
-    let noisy = PipelineConfig { noise: NoiseModel::realistic(), ..PipelineConfig::for_scene(SceneKind::Stage) };
-    stage("stage default + noise", noisy);
-    stage(
-        "stage default, no background subtraction",
-        PipelineConfig { background_subtraction: false, ..PipelineConfig::for_scene(SceneKind::Stage) },
-    );
-    stage("stage light", PipelineConfig::light(SceneKind::Stage));
+    let filter = std::env::args().nth(1);
+    let wanted = |label: &str| filter.as_deref().is_none_or(|f| label.contains(f));
+    let default = PipelineConfig::for_scene(SceneKind::Stage);
+    let mut stages = vec![
+        ("stage default".to_string(), default),
+        ("stage default + noise".into(), PipelineConfig { noise: NoiseModel::realistic(), ..default }),
+        ("stage default, stacked (no fusion)".into(), {
+            let mut config = default;
+            config.fusion.enabled = false;
+            config
+        }),
+        ("stage default, no background subtraction".into(), PipelineConfig { background_subtraction: false, ..default }),
+        ("stage light".into(), PipelineConfig::light(SceneKind::Stage)),
+        ("stage light + noise".into(), PipelineConfig { noise: NoiseModel::realistic(), ..PipelineConfig::light(SceneKind::Stage) }),
+    ];
     for (width, height) in [(160, 120), (240, 180), (320, 240)] {
-        let mut config = PipelineConfig::for_scene(SceneKind::Stage);
+        let mut config = default;
         (config.rig.width, config.rig.height) = (width, height);
-        stage(&format!("stage 8x{width}x{height}"), config);
+        stages.push((format!("stage 8x{width}x{height}"), config));
+        stages.push((format!("stage 8x{width}x{height} + noise"), PipelineConfig { noise: NoiseModel::realistic(), ..config }));
     }
-    house("house default", PipelineConfig::for_scene(SceneKind::House));
-    house("house light", PipelineConfig::light(SceneKind::House));
-    let mut single = PipelineConfig::for_scene(SceneKind::House);
+    for (label, config) in stages {
+        if wanted(&label) {
+            stage(&label, config);
+        }
+    }
+    let house_default = PipelineConfig::for_scene(SceneKind::House);
+    let mut single = house_default;
     single.scan.head = ScanHead::Single;
-    house("house default, single sensor", single);
+    let houses = [
+        ("house default", house_default),
+        ("house default + noise", PipelineConfig { noise: NoiseModel::realistic(), ..house_default }),
+        ("house light", PipelineConfig::light(SceneKind::House)),
+        ("house default, single sensor", single),
+    ];
+    for (label, config) in houses {
+        if wanted(label) {
+            house(label, config);
+        }
+    }
 }
 
 #[cfg(feature = "par")]

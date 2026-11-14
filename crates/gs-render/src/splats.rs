@@ -60,6 +60,36 @@ struct Layer {
     texture: WebGlTexture,
     /// Allocated texture height.
     rows: u32,
+    /// Bumped whenever the splats of this layer change.
+    version: u64,
+    /// How many centers lie above a height clip, for the statistics of the
+    /// normalised mode (which clips in the vertex shader and never looks at
+    /// the splats on the CPU otherwise).
+    clipped: ClippedCount,
+}
+
+/// Cached answer to "how many splats of a layer are above `clip_y`".
+#[derive(Clone, Copy, Default)]
+struct ClippedCount {
+    version: u64,
+    clip_y: f32,
+    count: u32,
+}
+
+impl Layer {
+    /// Splats centered above `clip_y` (`+∞` = none): O(layer) when the layer
+    /// or the clip changed since the last call, O(1) otherwise.
+    fn clipped(&mut self, clip_y: f32) -> u32 {
+        if clip_y == f32::INFINITY {
+            return 0;
+        }
+        if self.clipped.version != self.version || self.clipped.clip_y != clip_y {
+            // The comparison the vertex shader makes (NaN is not above).
+            let count = self.positions.iter().filter(|p| p[1] > clip_y).count() as u32;
+            self.clipped = ClippedCount { version: self.version, clip_y, count };
+        }
+        self.clipped.count
+    }
 }
 
 struct Uniforms {
@@ -315,6 +345,8 @@ impl SplatScene {
                 bounds: None,
                 texture: create_data_texture(gl, &layout, MIN_ROWS)?,
                 rows: MIN_ROWS,
+                version: 1,
+                clipped: ClippedCount::default(),
             })
         };
         Ok(Self {
@@ -485,6 +517,7 @@ impl SplatScene {
             layer.splats.clear();
             layer.positions.clear();
             layer.bounds = None;
+            layer.version += 1;
         }
         self.version += 1;
     }
@@ -528,6 +561,7 @@ impl SplatScene {
         l.positions.extend(l.splats[start..].iter().map(|s| s.pos));
         // From a fixed-size sample: O(1) in the layer size.
         l.bounds = RobustBounds::of(&l.positions);
+        l.version += 1;
         self.version += 1;
         if self.detached {
             // `restore` uploads everything from the CPU copy.
@@ -676,8 +710,10 @@ impl SplatScene {
         }
         let shown = [params.show_static, params.show_dynamic];
         let mut layers = Vec::with_capacity(LAYER_COUNT);
-        for (i, layer) in self.layers.iter().enumerate() {
+        let mut clipped = 0;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
             if shown[i] && !layer.splats.is_empty() {
+                clipped += layer.clipped(clip_y);
                 layers.push(LayerDraw { texture: &layer.texture, count: layer.splats.len() as u32, weight: params.layer_weights[i] });
             }
         }
@@ -690,7 +726,9 @@ impl SplatScene {
         let view =
             ViewDraw { vp, params, clip_y, quality, layers: &layers, vao: &self.pipeline.vao, splats_per_row: self.layout.splats_per_row, output };
         normalized.draw(&self.gl, &view)?;
-        self.drawn = layers.iter().map(|l| l.count).sum();
+        // The same number the sorted mode reports: the splats above the
+        // clip are submitted but culled by the vertex shader.
+        self.drawn = layers.iter().map(|l| l.count).sum::<u32>() - clipped;
         Ok(())
     }
 

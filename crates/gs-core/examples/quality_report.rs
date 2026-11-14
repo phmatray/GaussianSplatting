@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! cargo run -p gs-core --release --features par --example quality_report -- dump   <dir> <label> [--only <text>]
+//!       [--set '<JSON patch of the configuration>']
 //! cargo run -p gs-core --release --features par --example quality_report -- score  <dir> <label> [--only <text>]
 //!       [--res 1280x960] [--variants sorted:1,soft:1,hard:1] [--every <n>] [--no-temporal]
 //! cargo run -p gs-core --release --features par --example quality_report -- sheets <dir> <before> <after>
@@ -67,6 +68,25 @@ struct Scenario {
     name: String,
     scene: SceneKind,
     config: PipelineConfig,
+}
+
+/// `config` with a JSON object merged into it, key by key (as
+/// `ControlMsg::PatchConfig` does): how `dump --set` tries a variant without
+/// touching the defaults.
+fn patched(config: PipelineConfig, patch: &serde_json::Value) -> PipelineConfig {
+    fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+        match (target, patch) {
+            (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
+                for (key, value) in patch {
+                    merge(target.entry(key.clone()).or_insert(serde_json::Value::Null), value);
+                }
+            }
+            (target, patch) => *target = patch.clone(),
+        }
+    }
+    let mut value = serde_json::to_value(config).expect("a configuration is JSON");
+    merge(&mut value, patch);
+    serde_json::from_value(value).expect("the patch does not fit the configuration")
 }
 
 fn scenarios() -> Vec<Scenario> {
@@ -179,13 +199,14 @@ fn dump_house(dir: &Path, config: PipelineConfig) {
     std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap()).expect("cannot write meta.json");
 }
 
-fn dump(lab: &Lab, label: &str, only: Option<&str>) {
+fn dump(lab: &Lab, label: &str, only: Option<&str>, patch: Option<&serde_json::Value>) {
     for scenario in scenarios().into_iter().filter(|s| only.is_none_or(|o| s.name.contains(o))) {
         let dir = lab.out.join(label).join(&scenario.name);
         std::fs::create_dir_all(&dir).expect("cannot create the dump directory");
+        let config = patch.map_or(scenario.config, |patch| patched(scenario.config, patch));
         match scenario.scene {
-            SceneKind::Stage => dump_stage(&dir, scenario.config),
-            SceneKind::House => dump_house(&dir, scenario.config),
+            SceneKind::Stage => dump_stage(&dir, config),
+            SceneKind::House => dump_house(&dir, config),
         }
         lab.note(&format!("dumped {label}/{}", scenario.name));
     }
@@ -548,7 +569,10 @@ fn main() {
     let only = option(rest, "--only");
     let lab = Lab::new(PathBuf::from(dir), false, None);
     match command.as_str() {
-        "dump" => dump(&lab, label, only),
+        "dump" => {
+            let patch = option(rest, "--set").map(|text| serde_json::from_str(text).expect("--set wants a JSON object"));
+            dump(&lab, label, only, patch.as_ref());
+        }
         "score" => {
             let resolution = option(rest, "--res").map_or((1280, 960), |text| {
                 let (w, h) = text.split_once('x').expect("--res wants <width>x<height>");
