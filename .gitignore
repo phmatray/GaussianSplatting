@@ -16,3 +16,4 @@ tools/.fake_server/
 
 # Impeccable design mockups: they embed frames of real captures (private rooms).
 .impeccable/mocks/
+.impeccable/review/
