@@ -57,9 +57,17 @@ pub struct Fused {
     pub voxel_size: f32,
 }
 
+/// Splat size, in cells, of the cloud the optimisation starts from. The
+/// live path widens its splats to 0.6 to close the slits a real LiDAR leaves
+/// on screen; the optimisation learns every size itself and starts better
+/// from the tighter cloud (pose registration drifted 1.6 cm from a correct
+/// view with 0.6).
+const START_KERNEL: f32 = 0.45;
+
 /// The ingest parameters of an offline fusion.
 pub fn ingest_params(mode: CaptureMode, init: &InitParams) -> IngestParams {
-    let mut params = IngestParams { max_voxels: init.max_voxels.max(1000), ..IngestParams::default() };
+    let mut params =
+        IngestParams { max_voxels: init.max_voxels.max(1000), kernel: START_KERNEL, ..IngestParams::default() };
     if init.voxel_size <= 0.0 && init.room_voxel_size > 0.0 && mode == CaptureMode::Room {
         params.room.voxel_size = init.room_voxel_size;
     }

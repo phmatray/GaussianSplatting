@@ -97,7 +97,14 @@ pub struct IngestParams {
     /// Compensate the exposure and white balance drift of the phone's
     /// camera ([`VoxelFusion::exposure_compensation`]).
     pub exposure_compensation: bool,
-    /// Tangential standard deviation of a fused splat in cells.
+    /// Tangential standard deviation of a fused splat in cells. 0.6, above
+    /// the 0.45 the simulated scan uses: a real LiDAR leaves walls seen at
+    /// an angle with columns of empty cells, which 0.45 shows as vertical
+    /// slits (first real capture, iPhone 15 Pro Max, 2026-11-15). At 0.6
+    /// they close and objects stay sharp; 0.7 closes the last few and
+    /// softens objects visibly. On the simulated bedroom, which has no
+    /// slits, 0.6 costs about 0.8 dB: the price of the real fix until the
+    /// splats are widened only next to a hole.
     pub kernel: f32,
     /// The fusion keeps what lies within this multiple of the region's
     /// radius, so that a region that is nudged or enlarged later still has
@@ -136,7 +143,7 @@ impl Default for IngestParams {
             max_voxels: VoxelFusion::DEFAULT_MAX_VOXELS,
             blend_frames: 24,
             exposure_compensation: true,
-            kernel: 0.45,
+            kernel: 0.6,
             region_margin: 1.5,
             live_person_only: false,
             min_frames: 2,
