@@ -65,6 +65,15 @@ struct CaptureView: View {
         }
         // Filming owns the screen, as in the Camera app.
         .toolbar(capturing ? .hidden : .visible, for: .tabBar)
+        // Felt in the hand while the eyes are on the room.
+        .sensoryFeedback(trigger: engine.phase) { _, new in
+            switch new {
+            case .running: return .start
+            case .finishing: return .stop
+            case .paused: return .impact(weight: .light)
+            case .idle: return nil
+            }
+        }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             engine.startPreview(options: model.options, mode: model.mode)
@@ -135,15 +144,9 @@ struct CaptureView: View {
             HStack(alignment: .top, spacing: 12) {
                 pill
                     .frame(maxWidth: .infinity, alignment: .topLeading)
-                ViewThatFits(in: .vertical) {
-                    VStack(spacing: 0) {
-                        Spacer(minLength: 0)
-                        panel
-                    }
-                    ScrollView {
-                        panel
-                    }
-                    .scrollIndicators(.hidden)
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    panel
                 }
                 .frame(width: geometry.size.width / 3)
             }
@@ -164,8 +167,10 @@ struct CaptureView: View {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(clockText(at: context.date))
                         .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .contentTransition(.numericText())
+                        .accessibilityLabel("Durée de la capture")
+                        .accessibilityValue(clockText(at: context.date))
                 }
-                .accessibilityLabel("Durée de la capture")
                 Text(captureTitle)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
@@ -185,6 +190,7 @@ struct CaptureView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .panelGlass(cornerRadius: 22)
+        .environment(\.colorScheme, .dark)
     }
 
     private var captureTitle: String {
@@ -194,7 +200,32 @@ struct CaptureView: View {
 
     // MARK: Panel
 
+    /// Content on top, controls at the bottom. In landscape the content
+    /// scrolls when it does not fit (large text, a message, the region
+    /// slider); the controls never leave the screen.
     private var panel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if landscape {
+                ViewThatFits(in: .vertical) {
+                    panelContent
+                    ScrollView {
+                        panelContent
+                    }
+                    .scrollIndicators(.hidden)
+                }
+            } else {
+                panelContent
+            }
+            controlRow
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panelGlass(cornerRadius: 32)
+        // White on glass whatever the scene, as in the Camera app.
+        .environment(\.colorScheme, .dark)
+    }
+
+    private var panelContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             banners
             if capturing {
@@ -226,19 +257,19 @@ struct CaptureView: View {
                     .truncationMode(.middle)
                     .frame(maxWidth: .infinity)
             }
-            controlRow
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .panelGlass(cornerRadius: 32)
     }
 
     @ViewBuilder
     private var banners: some View {
         if !engine.trackingAdvice.isEmpty {
-            Label(engine.trackingAdvice, systemImage: "exclamationmark.triangle.fill")
-                .font(.footnote.weight(.medium))
-                .foregroundStyle(.yellow)
+            Label {
+                Text(engine.trackingAdvice)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+            }
+            .font(.footnote.weight(.medium))
         }
         if let notice = engine.notice {
             HStack(alignment: .top, spacing: 8) {
@@ -333,6 +364,7 @@ struct CaptureView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(metric.value)
                         .font(.title3.weight(.semibold).monospacedDigit())
+                        .contentTransition(.numericText())
                         .foregroundStyle(metric.warn ? .orange : .primary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
@@ -346,6 +378,7 @@ struct CaptureView: View {
                 .accessibilityElement(children: .combine)
             }
         }
+        .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: engine.stats)
     }
 
     private func megabytes(_ bytes: Int64) -> String {
@@ -377,12 +410,12 @@ struct CaptureView: View {
         case .file:
             return .orange
         case .server:
-            return engine.linkState == .connected ? .green : .red
+            return engine.linkState == .connected ? .green : .gray
         case .none:
             if model.pairing == nil {
                 return .gray
             }
-            return model.serverReachable == true ? .green : (model.serverReachable == false ? .red : .gray)
+            return model.serverReachable == true ? .green : .gray
         }
     }
 
@@ -461,7 +494,7 @@ struct CaptureView: View {
     @ViewBuilder
     private var trailingControl: some View {
         if recording {
-            roundButton("Recommencer", systemImage: "arrow.counterclockwise", tint: .red) {
+            roundButton("Recommencer", systemImage: "arrow.counterclockwise") {
                 confirmReset = true
             }
         } else {
@@ -481,13 +514,13 @@ struct CaptureView: View {
                 .font(.title3.weight(.semibold))
                 .frame(width: sideButton, height: sideButton)
         }
-        .roundGlassButton()
-        .tint(tint)
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.circle)
+        .tint(tint ?? .white)
     }
 
-    /// The shutter starts and ends a capture. Its ring is the share of sent
-    /// frames the server confirmed: green while it keeps up, orange when
-    /// frames pile up, red when the link is down.
+    /// The shutter starts and ends a capture; the frieze above it tells the
+    /// capture's health.
     private var shutter: some View {
         Button {
             switch engine.phase {
@@ -506,12 +539,6 @@ struct CaptureView: View {
             ZStack {
                 Circle()
                     .stroke(.white.opacity(0.9), lineWidth: 4)
-                if recording, engine.target == .server {
-                    Circle()
-                        .trim(from: 0, to: confirmedFraction)
-                        .stroke(ringColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                }
                 RoundedRectangle(cornerRadius: recording ? 8 : shutterFill / 2, style: .continuous)
                     .fill(.red)
                     .frame(width: recording ? 32 : shutterFill, height: recording ? 32 : shutterFill)
@@ -537,20 +564,7 @@ struct CaptureView: View {
         }
     }
 
-    private var confirmedFraction: CGFloat {
-        let stats = engine.stats
-        guard stats.sent > 0 else {
-            return 0
-        }
-        return CGFloat(min(1, Double(stats.acknowledged) / Double(stats.sent)))
-    }
 
-    private var ringColor: Color {
-        guard engine.linkState == .connected else {
-            return .red
-        }
-        return engine.stats.sent - engine.stats.acknowledged > 8 ? .orange : .green
-    }
 
     private var regionControls: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -592,15 +606,6 @@ private extension View {
         }
     }
 
-    /// A round control of the panel, in glass from iOS 26.
-    @ViewBuilder
-    func roundGlassButton() -> some View {
-        if #available(iOS 26.0, *) {
-            self.buttonStyle(.glass).buttonBorderShape(.circle)
-        } else {
-            self.buttonStyle(.bordered).buttonBorderShape(.circle)
-        }
-    }
 }
 
 /// What is decided once, before filming: the capture's name, and whether it
