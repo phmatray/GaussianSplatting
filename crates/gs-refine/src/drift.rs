@@ -265,6 +265,14 @@ fn residual(nodes: &[Mat4], e: &Edge) -> [f64; 6] {
     r
 }
 
+/// Perturbation of the numeric Jacobian. The poses are `f32` and meters
+/// away from the origin, so a much smaller step drowns in rounding.
+const JACOBIAN_STEP: f64 = 1e-3;
+
+fn cost(nodes: &[Mat4], edges: &[Edge]) -> f64 {
+    edges.iter().map(|e| residual(nodes, e).iter().map(|v| v * v).sum::<f64>()).sum()
+}
+
 /// Gauss-Newton on the poses (node 0 fixed), perturbing each node on the
 /// left: `exp(ξ) · T`.
 fn solve_graph(mut nodes: Vec<Mat4>, edges: &[Edge], iterations: usize) -> Vec<Mat4> {
@@ -286,14 +294,14 @@ fn solve_graph(mut nodes: Vec<Mat4>, edges: &[Edge], iterations: usize) -> Vec<M
                 }
                 for k in 0..6 {
                     let mut x = [0.0f64; 6];
-                    x[k] = 1e-6;
+                    x[k] = JACOBIAN_STEP;
                     let saved = nodes[node];
                     nodes[node] = exp6(&x) * saved;
                     let r = residual(&nodes, e);
                     nodes[node] = saved;
                     let mut col = [0.0f64; 6];
                     for i in 0..6 {
-                        col[i] = (r[i] - r0[i]) / 1e-6;
+                        col[i] = (r[i] - r0[i]) / JACOBIAN_STEP;
                     }
                     jac.push((6 * (node - 1) + k, col));
                 }
@@ -310,12 +318,18 @@ fn solve_graph(mut nodes: Vec<Mat4>, edges: &[Edge], iterations: usize) -> Vec<M
             g[i] = -g[i];
         }
         let Some(dx) = solve_dense(&h, &g, dim) else { break };
+        let mut trial = nodes.clone();
         let mut step = 0.0f64;
         for k in 1..n {
             let x = &dx[6 * (k - 1)..6 * k];
-            nodes[k] = exp6(x) * nodes[k];
+            trial[k] = exp6(x) * trial[k];
             step = step.max(x.iter().fold(0.0, |m, v| m.max(v.abs())));
         }
+        // A step that does not lower the cost is noise: keep the poses.
+        if cost(&trial, edges) >= cost(&nodes, edges) {
+            break;
+        }
+        nodes = trial;
         if step < 1e-7 {
             break;
         }
@@ -327,6 +341,9 @@ fn solve_graph(mut nodes: Vec<Mat4>, edges: &[Edge], iterations: usize) -> Vec<M
 /// loops. Loops that disagree with the rest after a first solve are dropped.
 /// Returns the poses and the loops kept.
 pub fn optimize(keyframes: &[Mat4], loops: &[Loop]) -> (Vec<Mat4>, Vec<Loop>) {
+    if loops.is_empty() {
+        return (keyframes.to_vec(), Vec::new());
+    }
     let mut edges: Vec<Edge> = keyframes
         .windows(2)
         .enumerate()
@@ -347,6 +364,9 @@ pub fn optimize(keyframes: &[Mat4], loops: &[Loop]) -> (Vec<Mat4>, Vec<Loop>) {
         .collect();
     if kept.len() == loops.len() {
         return (first, kept);
+    }
+    if kept.is_empty() {
+        return (keyframes.to_vec(), kept);
     }
     edges.truncate(odometry);
     edges.extend(kept.iter().map(loop_edge));
@@ -444,9 +464,17 @@ mod tests {
     /// brings the last pose back close to the truth and spreads the rest.
     #[test]
     fn a_loop_spreads_the_drift_over_the_walk() {
+        // Near the origin, and meters away from it as in a real room, where
+        // `f32` rounding once drowned the solver's Jacobian.
+        for origin in [Vec3::ZERO, Vec3::new(6.0, 1.0, -5.0)] {
+            walk_around(origin);
+        }
+    }
+
+    fn walk_around(origin: Vec3) {
         let step = |i: usize| {
             let angle = (i as f32 / 40.0) * std::f32::consts::TAU;
-            Mat4::from_rotation_translation(Quat::from_rotation_y(-angle), Vec3::new(angle.cos() * 2.0, 0.0, angle.sin() * 2.0))
+            Mat4::from_rotation_translation(Quat::from_rotation_y(-angle), origin + Vec3::new(angle.cos() * 2.0, 0.0, angle.sin() * 2.0))
         };
         let truth: Vec<Mat4> = (0..=40).map(step).collect();
         // Drift: 2 mm and 0.05 degree more at every step.
@@ -468,6 +496,9 @@ mod tests {
         // The middle moves too, by less than the end.
         let mid = (fixed[20].w_axis - drifted[20].w_axis).truncate().length();
         assert!(mid > 0.0 && mid < (fixed[last].w_axis - drifted[last].w_axis).truncate().length());
+        // Without a loop, nothing moves.
+        let (same, _) = optimize(&drifted, &[]);
+        assert_eq!(same, drifted);
     }
 
     #[test]
