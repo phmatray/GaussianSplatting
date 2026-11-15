@@ -94,38 +94,33 @@ struct CaptureView: View {
 
     // MARK: Layouts
 
+    /// Portrait: one panel docked above the tab bar.
     private var portraitLayout: some View {
-        VStack(spacing: 10) {
-            hud
-            banners
+        VStack(spacing: 0) {
             Spacer(minLength: 0)
-            if model.mode.usesRegion {
-                regionPanel
-            }
-            controlDeck
+            panel
         }
         .padding(.horizontal, 12)
-        .padding(.top, 4)
         .padding(.bottom, 8)
     }
 
-    /// The numbers and controls keep to the right third; the image stays clear.
+    /// Landscape: the same panel on the right third, sized to its content and
+    /// anchored low, under the thumb; the image keeps the rest.
     private var landscapeLayout: some View {
         GeometryReader { geometry in
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 8) {
-                    banners
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(spacing: 10) {
-                    hud
-                    if model.mode.usesRegion {
-                        regionPanel
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                // The panel as it is when it fits; scrolling when the
+                // numbers, a message and the region slider overflow.
+                ViewThatFits(in: .vertical) {
+                    VStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        panel
                     }
-                    Spacer(minLength: 0)
-                    controlDeck
+                    ScrollView {
+                        panel
+                    }
+                    .scrollIndicators(.hidden)
                 }
                 .frame(width: geometry.size.width / 3)
             }
@@ -133,36 +128,47 @@ struct CaptureView: View {
         .padding(10)
     }
 
+    /// Everything on one sheet of glass: status and numbers on top, then the
+    /// messages, and the controls at the bottom, under the thumb.
+    private var panel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            hud
+            banners
+            if model.mode.usesRegion {
+                regionControls
+            }
+            controlDeck
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panelGlass(cornerRadius: 30)
+    }
+
     @ViewBuilder
     private var banners: some View {
         if !engine.trackingAdvice.isEmpty {
             Label(engine.trackingAdvice, systemImage: "exclamationmark.triangle.fill")
                 .font(.footnote.weight(.medium))
-                .foregroundStyle(.black)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(.yellow, in: Capsule())
-                .frame(maxWidth: .infinity, alignment: landscape ? .leading : .center)
+                .foregroundStyle(.yellow)
         }
         if let notice = engine.notice {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "info.circle.fill")
-                    .foregroundStyle(.tint)
-                Text(notice)
+            HStack(alignment: .top, spacing: 8) {
+                Label(notice, systemImage: "info.circle.fill")
                     .font(.footnote)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button {
                     engine.notice = nil
                 } label: {
-                    Image(systemName: "xmark")
-                        .font(.footnote.weight(.semibold))
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.body)
+                        .symbolRenderingMode(.hierarchical)
                         .frame(width: 44, height: 44)
                 }
+                .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
+                .padding(.vertical, -12)
                 .accessibilityLabel("Fermer le message")
             }
-            .padding(.leading, 12)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
     }
 
@@ -207,8 +213,6 @@ struct CaptureView: View {
                 }
             }
         }
-        .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private struct Metric {
@@ -335,8 +339,6 @@ struct CaptureView: View {
                     .frame(maxWidth: .infinity)
             }
         }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 
     private static func modeSymbol(_ mode: CaptureMode) -> String {
@@ -398,8 +400,7 @@ struct CaptureView: View {
                 .font(.title3.weight(.semibold))
                 .frame(width: 52, height: 52)
         }
-        .buttonStyle(.bordered)
-        .buttonBorderShape(.circle)
+        .roundGlassButton()
         .tint(tint)
     }
 
@@ -473,7 +474,7 @@ struct CaptureView: View {
         return engine.stats.sent - engine.stats.acknowledged > 8 ? .orange : .green
     }
 
-    private var regionPanel: some View {
+    private var regionControls: some View {
         VStack(alignment: .leading, spacing: 4) {
             if engine.regionCenter == nil {
                 Label("Touchez le sujet à l'écran pour placer la zone.", systemImage: "hand.tap")
@@ -493,8 +494,33 @@ struct CaptureView: View {
             )
             .accessibilityLabel("Rayon de la zone")
         }
-        .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
+private extension View {
+    /// Liquid Glass from iOS 26; the system material before it.
+    @ViewBuilder
+    func panelGlass(cornerRadius: CGFloat) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if #available(iOS 26.0, *) {
+            // Glass behind the content, not applied to it: the shutter's red
+            // and the state colours stay what they are.
+            self.background {
+                Color.clear.glassEffect(.regular, in: shape)
+            }
+        } else {
+            self.background(.regularMaterial, in: shape)
+        }
+    }
+
+    /// A round control of the panel, in glass from iOS 26.
+    @ViewBuilder
+    func roundGlassButton() -> some View {
+        if #available(iOS 26.0, *) {
+            self.buttonStyle(.glass).buttonBorderShape(.circle)
+        } else {
+            self.buttonStyle(.bordered).buttonBorderShape(.circle)
+        }
     }
 }
 
