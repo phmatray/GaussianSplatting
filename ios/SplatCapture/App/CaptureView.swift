@@ -5,9 +5,11 @@ import SplatCaptureKit
 import SwiftUI
 import UIKit
 
-/// The capture screen: the camera image first, the numbers that judge a
-/// capture always in sight, and a shutter under the thumb, as in the Camera
-/// app. Settings that matter only before filming live in a sheet.
+
+/// The capture screen. The capture's health reads in one glance, as a frieze
+/// of one tick per frame that turns green once the server has confirmed it;
+/// the numbers sit under it and the shutter under the thumb, on one sheet of
+/// glass. A small pill at the top carries the clock and the link.
 struct CaptureView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var engine: CaptureEngine
@@ -19,6 +21,7 @@ struct CaptureView: View {
     /// Capture clock: time banked by earlier runs, and the current run's start.
     @State private var banked: TimeInterval = 0
     @State private var runStart: Date?
+    @State private var frieze = Frieze()
 
     init(engine: CaptureEngine) {
         _engine = ObservedObject(wrappedValue: engine)
@@ -33,6 +36,8 @@ struct CaptureView: View {
     }
 
     private var landscape: Bool { verticalSizeClass == .compact }
+    private var recording: Bool { engine.phase == .running || engine.phase == .paused }
+    private var capturing: Bool { engine.phase != .idle }
 
     private var captureScreen: some View {
         ZStack {
@@ -47,9 +52,7 @@ struct CaptureView: View {
                     }
                 }
             )
-            // In landscape the image runs to every edge: the notch is on a
-            // side and the tab bar floats over it.
-            .ignoresSafeArea(edges: landscape ? .all : .top)
+            .ignoresSafeArea()
 
             if landscape {
                 landscapeLayout
@@ -57,6 +60,8 @@ struct CaptureView: View {
                 portraitLayout
             }
         }
+        // Filming owns the screen, as in the Camera app.
+        .toolbar(capturing ? .hidden : .visible, for: .tabBar)
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             engine.startPreview(options: model.options, mode: model.mode)
@@ -75,6 +80,21 @@ struct CaptureView: View {
         }
         .onChange(of: engine.phase) { old, new in
             advanceClock(from: old, to: new)
+            if old == .idle {
+                frieze = Frieze()
+            }
+        }
+        .onChange(of: engine.stats) { old, new in
+            // A reset zeroes the counters: the frieze starts over.
+            if new.sent < old.sent || new.recorded < old.recorded || new.skipped < old.skipped {
+                frieze = Frieze()
+                return
+            }
+            frieze.advance(
+                written: new.recorded - old.recorded,
+                sent: new.sent - old.sent,
+                dropped: new.skipped - old.skipped,
+                acknowledged: new.acknowledged - old.acknowledged)
         }
         .sheet(isPresented: $showOptions) {
             CaptureOptionsSheet()
@@ -84,6 +104,7 @@ struct CaptureView: View {
         .confirmationDialog("Recommencer la capture ?", isPresented: $confirmReset, titleVisibility: .visible) {
             Button("Recommencer", role: .destructive) {
                 engine.reset()
+                frieze = Frieze()
                 banked = 0
                 runStart = engine.phase == .running ? Date() : nil
             }
@@ -94,24 +115,23 @@ struct CaptureView: View {
 
     // MARK: Layouts
 
-    /// Portrait: one panel docked above the tab bar.
     private var portraitLayout: some View {
         VStack(spacing: 0) {
-            Spacer(minLength: 0)
+            pill
+                .padding(.top, 4)
+            Spacer(minLength: 12)
             panel
         }
         .padding(.horizontal, 12)
-        .padding(.bottom, 8)
+        .padding(.bottom, capturing ? 4 : 8)
     }
 
-    /// Landscape: the same panel on the right third, sized to its content and
-    /// anchored low, under the thumb; the image keeps the rest.
+    /// Landscape: the pill over the image, the panel on the right third.
     private var landscapeLayout: some View {
         GeometryReader { geometry in
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-                // The panel as it is when it fits; scrolling when the
-                // numbers, a message and the region slider overflow.
+            HStack(alignment: .top, spacing: 12) {
+                pill
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 ViewThatFits(in: .vertical) {
                     VStack(spacing: 0) {
                         Spacer(minLength: 0)
@@ -128,20 +148,86 @@ struct CaptureView: View {
         .padding(10)
     }
 
-    /// Everything on one sheet of glass: status and numbers on top, then the
-    /// messages, and the controls at the bottom, under the thumb.
+    // MARK: Pill
+
+    /// Before filming: the pairing state. While filming: recording dot,
+    /// clock, mode and the link's dot.
+    private var pill: some View {
+        HStack(spacing: 8) {
+            if capturing {
+                Circle()
+                    .fill(engine.phase == .running ? Color.red : Color.secondary)
+                    .frame(width: 9, height: 9)
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(clockText(at: context.date))
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                }
+                .accessibilityLabel("Durée de la capture")
+                Text(captureTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+                    .accessibilityLabel(statusLine)
+            } else {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                Text(statusLine)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .panelGlass(cornerRadius: 22)
+    }
+
+    private var captureTitle: String {
+        let name = model.captureName.isEmpty ? "Capture" : model.captureName
+        return "\(AppModel.modeLabel(model.mode)) · \(name)"
+    }
+
+    // MARK: Panel
+
     private var panel: some View {
         VStack(alignment: .leading, spacing: 14) {
-            hud
             banners
+            if capturing {
+                friezeBlock
+                metricsRow
+            }
             if model.mode.usesRegion {
                 regionControls
             }
-            controlDeck
+            if !capturing {
+                Picker("Mode", selection: $model.mode) {
+                    ForEach(CaptureMode.allCases, id: \.self) { mode in
+                        // The narrow landscape panel shows symbols; their
+                        // names stay for VoiceOver.
+                        if landscape {
+                            Image(systemName: Self.modeSymbol(mode))
+                                .accessibilityLabel(AppModel.modeLabel(mode))
+                                .tag(mode)
+                        } else {
+                            Text(AppModel.modeLabel(mode)).tag(mode)
+                        }
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text(destinationLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity)
+            }
+            controlRow
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .panelGlass(cornerRadius: 30)
+        .panelGlass(cornerRadius: 32)
     }
 
     @ViewBuilder
@@ -172,47 +258,47 @@ struct CaptureView: View {
         }
     }
 
-    // MARK: Status and counters
-
-    private var hud: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
-                Text(statusLine)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(2)
-                Spacer(minLength: 4)
-                if engine.phase != .idle {
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        Text(clockText(at: context.date))
-                            .font(.subheadline.weight(.semibold).monospacedDigit())
-                            .foregroundStyle(engine.phase == .running ? .red : .secondary)
-                    }
-                    .accessibilityLabel("Durée de la capture")
+    /// One tick per recent frame: green confirmed (or written, offline),
+    /// white on its way, orange dropped.
+    private var friezeBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .bottom, spacing: 0) {
+                ForEach(0..<Frieze.capacity, id: \.self) { slot in
+                    let tick = frieze.tick(at: slot)
+                    Capsule()
+                        .fill(tick.map(Self.tickColor) ?? Color.white.opacity(0.18))
+                        .frame(width: 3, height: slot % 10 == 0 ? 18 : 12)
+                        .frame(maxWidth: .infinity)
                 }
             }
-            if engine.phase != .idle {
-                HStack(alignment: .firstTextBaseline, spacing: 0) {
-                    ForEach(metrics, id: \.label) { metric in
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(metric.value)
-                                .font(.headline.monospacedDigit())
-                                .foregroundStyle(metric.warn ? .orange : .primary)
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.7)
-                            Text(metric.label)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .accessibilityElement(children: .combine)
-                    }
+            .frame(height: 18)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: frieze)
+            HStack {
+                Text("Les \(Frieze.capacity) dernières images")
+                Spacer()
+                if engine.stats.skipped > 0 {
+                    Text("\(engine.stats.skipped.formatted()) ignorées")
+                        .foregroundStyle(.orange)
                 }
             }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(friezeSummary)
+    }
+
+    private static func tickColor(_ tick: Frieze.Tick) -> Color {
+        switch tick {
+        case .confirmed: return .green
+        case .inFlight: return .white.opacity(0.9)
+        case .dropped: return .orange
+        }
+    }
+
+    private var friezeSummary: String {
+        "Dernières images : \(frieze.count(of: .confirmed)) confirmées, "
+            + "\(frieze.count(of: .inFlight)) en route, \(frieze.count(of: .dropped)) ignorées"
     }
 
     private struct Metric {
@@ -221,9 +307,6 @@ struct CaptureView: View {
         var warn = false
     }
 
-    /// What judges a capture while filming: to the server, frames out, frames
-    /// confirmed, frames dropped and the splats the server holds; to a file,
-    /// frames and size.
     private var metrics: [Metric] {
         let stats = engine.stats
         if engine.target == .file {
@@ -239,6 +322,26 @@ struct CaptureView: View {
             Metric(label: "Ignorées", value: stats.skipped.formatted(), warn: stats.skipped > 0),
             Metric(label: "Splats", value: stats.serverSplats.formatted(.number.notation(.compactName))),
         ]
+    }
+
+    private var metricsRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            ForEach(metrics, id: \.label) { metric in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(metric.value)
+                        .font(.title3.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(metric.warn ? .orange : .primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Text(metric.label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .combine)
+            }
+        }
     }
 
     private func megabytes(_ bytes: Int64) -> String {
@@ -306,41 +409,6 @@ struct CaptureView: View {
 
     // MARK: Controls
 
-    private var controlDeck: some View {
-        VStack(spacing: 12) {
-            if engine.phase == .idle {
-                Picker("Mode", selection: $model.mode) {
-                    ForEach(CaptureMode.allCases, id: \.self) { mode in
-                        // The narrow landscape panel shows symbols; their
-                        // names stay for VoiceOver.
-                        if landscape {
-                            Image(systemName: Self.modeSymbol(mode))
-                                .accessibilityLabel(AppModel.modeLabel(mode))
-                                .tag(mode)
-                        } else {
-                            Text(AppModel.modeLabel(mode)).tag(mode)
-                        }
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                Text(destinationLine)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-
-            HStack(spacing: 0) {
-                leadingControl
-                    .frame(maxWidth: .infinity)
-                shutter
-                trailingControl
-                    .frame(maxWidth: .infinity)
-            }
-        }
-    }
-
     private static func modeSymbol(_ mode: CaptureMode) -> String {
         switch mode {
         case .room: return "house"
@@ -354,6 +422,16 @@ struct CaptureView: View {
         let name = model.captureName.isEmpty ? "Capture" : model.captureName
         let place = model.recordOffline || model.pairing == nil ? "sur l'iPhone" : "vers le Mac"
         return "\(AppModel.modeLabel(model.mode)) · \(name) · \(place)"
+    }
+
+    private var controlRow: some View {
+        HStack(spacing: 0) {
+            leadingControl
+                .frame(maxWidth: .infinity)
+            shutter
+            trailingControl
+                .frame(maxWidth: .infinity)
+        }
     }
 
     @ViewBuilder
@@ -372,19 +450,18 @@ struct CaptureView: View {
                 engine.resume()
             }
         case .finishing:
-            Color.clear.frame(width: 52, height: 52)
+            Color.clear.frame(width: 56, height: 56)
         }
     }
 
     @ViewBuilder
     private var trailingControl: some View {
-        switch engine.phase {
-        case .running, .paused:
+        if recording {
             roundButton("Recommencer", systemImage: "arrow.counterclockwise", tint: .red) {
                 confirmReset = true
             }
-        case .idle, .finishing:
-            Color.clear.frame(width: 52, height: 52)
+        } else {
+            Color.clear.frame(width: 56, height: 56)
         }
     }
 
@@ -398,18 +475,15 @@ struct CaptureView: View {
             Label(title, systemImage: systemImage)
                 .labelStyle(.iconOnly)
                 .font(.title3.weight(.semibold))
-                .frame(width: 52, height: 52)
+                .frame(width: 56, height: 56)
         }
         .roundGlassButton()
         .tint(tint)
     }
 
-    private var recording: Bool { engine.phase == .running || engine.phase == .paused }
-
-    /// The shutter starts and ends a capture. Its ring tells the link's
-    /// health while sending: how much of what left the phone the server has
-    /// confirmed, green while it keeps up, orange when frames pile up, red
-    /// when the link is down.
+    /// The shutter starts and ends a capture. Its ring is the share of sent
+    /// frames the server confirmed: green while it keeps up, orange when
+    /// frames pile up, red when the link is down.
     private var shutter: some View {
         Button {
             switch engine.phase {
@@ -427,22 +501,22 @@ struct CaptureView: View {
         } label: {
             ZStack {
                 Circle()
-                    .stroke(.white.opacity(0.85), lineWidth: 4)
+                    .stroke(.white.opacity(0.9), lineWidth: 4)
                 if recording, engine.target == .server {
                     Circle()
                         .trim(from: 0, to: confirmedFraction)
                         .stroke(ringColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
                         .rotationEffect(.degrees(-90))
                 }
-                RoundedRectangle(cornerRadius: recording ? 8 : 31, style: .continuous)
+                RoundedRectangle(cornerRadius: recording ? 8 : 32, style: .continuous)
                     .fill(.red)
-                    .frame(width: recording ? 30 : 62, height: recording ? 30 : 62)
+                    .frame(width: recording ? 32 : 64, height: recording ? 32 : 64)
                 if engine.phase == .finishing {
                     ProgressView()
                         .tint(.white)
                 }
             }
-            .frame(width: 76, height: 76)
+            .frame(width: 80, height: 80)
             .contentShape(Circle())
             .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: engine.phase)
         }
@@ -496,6 +570,7 @@ struct CaptureView: View {
         }
     }
 }
+
 
 private extension View {
     /// Liquid Glass from iOS 26; the system material before it.
