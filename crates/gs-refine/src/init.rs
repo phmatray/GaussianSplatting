@@ -57,11 +57,10 @@ pub struct Fused {
     pub voxel_size: f32,
 }
 
-/// Splat size, in cells, of the cloud the optimisation starts from. The
-/// live path widens its splats to 0.6 to close the slits a real LiDAR leaves
-/// on screen; the optimisation learns every size itself and starts better
-/// from the tighter cloud (pose registration drifted 1.6 cm from a correct
-/// view with 0.6).
+/// Splat size, in cells, of the cloud the optimisation starts from, pinned
+/// here so that a change of the live default does not move it: the
+/// optimisation learns every size itself and starts best from the tight
+/// cloud (pose registration drifted 1.6 cm from a correct view at 0.6).
 const START_KERNEL: f32 = 0.45;
 
 /// The ingest parameters of an offline fusion.

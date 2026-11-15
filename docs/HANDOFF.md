@@ -570,14 +570,20 @@ l'arbre livré.
 - La compensation d'exposition ancre toute la carte sur les premières images.
 - Les murs vus de très près (30 à 50 cm) paraissent floconneux.
 - Sur les vraies captures, les murs vus en biais montraient des fentes
-  verticales (colonnes de cellules vides, plus fréquentes à l'horizontale
-  qu'à la verticale ; mesuré sur la capture du 2026-11-15). Ce ne sont ni des
-  splats de chant (91 % à moins de 10° du mur), ni le filtrage par confiance
-  seul. Palliatif en place : `IngestParams::kernel` passe de 0,45 à 0,6,
-  qui ferme presque toutes les fentes et coûte 0,8 dB sur la chambre simulée
-  (sans fentes). L'affinage garde 0,45 comme point de départ. Reste à faire :
-  n'élargir que les splats bordés d'un trou. Pour rejouer :
-  `gscap_ingest <capture> --kernel 0.45 --png …` contre `--kernel 0.6`.
+  verticales. Cause : la fusion travaille en colonnes perpendiculaires à
+  l'axe dominant de la normale ; sur un mur incliné de θ, deux colonnes
+  voisines sont à `voxel / cos θ` l'une de l'autre le long de la pente, et
+  les disques ronds laissent une fente entre elles. Corrigé par un
+  étirement adaptatif (`VoxelFusion::slope_stretch`, `IngestParams::
+  slope_stretch` = 2) : le disque d'une cellule plane (normales concordantes
+  à 0,9, deux échantillons au moins) est étiré de `1/cos θ` le long de la
+  pente, et seulement là ; les arêtes et les contours d'objets gardent des
+  disques ronds. Sur la capture réelle, la plupart des fentes se ferment et
+  les objets gardent leur piqué ; la chambre simulée passe à 25,58 dB
+  (25,79 avant). Restent quelques fentes là où des colonnes n'ont reçu aucun
+  échantillon : il faudra boucher les cellules vides isolées au milieu d'une
+  surface plane. Pour rejouer : `gscap_ingest <capture> --stretch 1 --png …`
+  (disques ronds) contre la valeur par défaut.
 - Un fichier de capture dont un enregistrement est abîmé est refusé en
   entier à l'import.
 - Le jeton d'appairage change à chaque démarrage du serveur : une capture

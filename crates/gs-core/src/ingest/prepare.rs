@@ -97,15 +97,15 @@ pub struct IngestParams {
     /// Compensate the exposure and white balance drift of the phone's
     /// camera ([`VoxelFusion::exposure_compensation`]).
     pub exposure_compensation: bool,
-    /// Tangential standard deviation of a fused splat in cells. 0.6, above
-    /// the 0.45 the simulated scan uses: a real LiDAR leaves walls seen at
-    /// an angle with columns of empty cells, which 0.45 shows as vertical
-    /// slits (first real capture, iPhone 15 Pro Max, 2026-11-15). At 0.6
-    /// they close and objects stay sharp; 0.7 closes the last few and
-    /// softens objects visibly. On the simulated bedroom, which has no
-    /// slits, 0.6 costs about 0.8 dB: the price of the real fix until the
-    /// splats are widened only next to a hole.
+    /// Tangential standard deviation of a fused splat in cells.
     pub kernel: f32,
+    /// Largest stretch of a fused disc along the slope of a flat surface
+    /// ([`crate::reconstruct::VoxelFusion::max_stretch`]; `1` keeps discs round). A real LiDAR
+    /// left vertical slits in walls seen at an angle to the cell grid (first
+    /// real capture, iPhone 15 Pro Max, 2026-11-15): stretching the discs of
+    /// flat cells along their slope closes them without blurring anything
+    /// else, where a wider kernel everywhere softened objects.
+    pub slope_stretch: f32,
     /// The fusion keeps what lies within this multiple of the region's
     /// radius, so that a region that is nudged or enlarged later still has
     /// its surroundings.
@@ -143,7 +143,8 @@ impl Default for IngestParams {
             max_voxels: VoxelFusion::DEFAULT_MAX_VOXELS,
             blend_frames: 24,
             exposure_compensation: true,
-            kernel: 0.6,
+            kernel: 0.45,
+            slope_stretch: 2.0,
             region_margin: 1.5,
             live_person_only: false,
             min_frames: 2,
@@ -193,6 +194,7 @@ impl IngestParams {
             blend_frames: self.blend_frames.clamp(1, VoxelFusion::MAX_BLEND_FRAMES),
             exposure_compensation: self.exposure_compensation,
             kernel: finite_clamp(self.kernel, d.kernel, 0.2, 1.5),
+            slope_stretch: finite_clamp(self.slope_stretch, d.slope_stretch, 1.0, 3.0),
             region_margin: finite_clamp(self.region_margin, d.region_margin, 1.0, 4.0),
             live_person_only: self.live_person_only,
             min_frames: self.min_frames.clamp(1, 16),

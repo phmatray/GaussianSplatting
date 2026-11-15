@@ -837,12 +837,7 @@ fn a_filmed_bedroom_is_reconstructed_like_the_simulated_scan() {
     // depth map makes up for its averaged depth and its JPEG. Its SSIM is
     // lower because it counts the whole picture, and 3 to 12 % of these
     // views the phone never looked at (the floor under the person).
-    // Since 2026-11-15 the ingest kernel is 0.6 (was 0.45): real LiDAR
-    // captures showed vertical slits in walls that 0.45 leaves open. This
-    // simulated room has no slits, so it only pays the blur: 24.97 dB,
-    // SSIM 0.815 (25.79 and 0.833 at 0.45). The bar moves with it until the
-    // splats are widened only next to a hole.
-    assert!(psnr >= 24.7 && ssim >= 0.80 && coverage >= 0.995, "PSNR {psnr:.2} dB, SSIM {ssim:.3}, coverage {coverage:.4}");
+    assert!(psnr >= 25.3 && ssim >= 0.82 && coverage >= 0.995, "PSNR {psnr:.2} dB, SSIM {ssim:.3}, coverage {coverage:.4}");
     assert!((120_000..170_000).contains(&splats), "{splats} splats");
 
     // A realistic one: noise, jitter, drift, wandering exposure, and no
@@ -859,9 +854,8 @@ fn a_filmed_bedroom_is_reconstructed_like_the_simulated_scan() {
     // compensation spreads over the whole map (there is no absolute
     // reference), and doubled fringes at 3 to 4 m, where the simulated
     // depth noise (1.4 to 2.4 cm) reaches the size of a cell: a quarter
-    // more splats than the ideal phone leaves. With the 0.6 kernel (see
-    // above): 167 967 splats, PSNR 22.89 dB, SSIM 0.782, coverage 99.90 %.
-    assert!(noisy_psnr >= 22.6 && noisy_ssim >= 0.77 && noisy_coverage >= 0.995, "PSNR {noisy_psnr:.2} dB, SSIM {noisy_ssim:.3}, coverage {noisy_coverage:.4}");
+    // more splats than the ideal phone leaves.
+    assert!(noisy_psnr >= 23.0 && noisy_ssim >= 0.78 && noisy_coverage >= 0.995, "PSNR {noisy_psnr:.2} dB, SSIM {noisy_ssim:.3}, coverage {noisy_coverage:.4}");
 }
 
 /// The yardstick for the test above: the simulated home scan (five exact

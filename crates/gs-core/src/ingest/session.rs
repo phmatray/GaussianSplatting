@@ -221,6 +221,7 @@ impl CaptureSession {
         let mut fusion = VoxelFusion::new(mode.voxel_size);
         fusion.max_range = mode.far;
         fusion.radius_factor = params.kernel;
+        fusion.max_stretch = params.slope_stretch;
         fusion.max_voxels = params.max_voxels;
         fusion.blend_frames = params.blend_frames;
         fusion.exposure_compensation = params.exposure_compensation;

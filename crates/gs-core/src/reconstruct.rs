@@ -1171,6 +1171,9 @@ pub struct VoxelFusion {
     pub refine_ratio: f32,
     /// Upper bound on the number of cells (and splats).
     pub max_voxels: usize,
+    /// Largest stretch of a cell's disc along the slope of a flat surface
+    /// (see [`VoxelFusion::slope_stretch`]); `1` keeps every disc round.
+    pub max_stretch: f32,
     /// `0` (the default): a cell is built from samples, the best view wins
     /// (see "Refinement"). Otherwise the number of frames a cell averages,
     /// each frame with the same weight (see "Real sensors").
@@ -1242,6 +1245,11 @@ impl VoxelFusion {
     const MIN_GAIN_CELLS: u32 = 64;
     /// A frame is never brightened or darkened by more than this factor.
     const MAX_GAIN: f32 = 3.0;
+    /// A disc is stretched along the slope only when the normals of its
+    /// samples agree at least this well (length of their mean, `0..=1`)...
+    const STRETCH_AGREEMENT: f32 = 0.9;
+    /// ...and come from at least this many samples.
+    const STRETCH_SAMPLES: u32 = 2;
 
     /// An empty map with cells of `voxel_size` meters (clamped to
     /// [`VoxelFusion::MIN_VOXEL_SIZE`]`..=`[`VoxelFusion::MAX_VOXEL_SIZE`];
@@ -1255,6 +1263,7 @@ impl VoxelFusion {
             opacity: 1.0,
             refine_ratio: 0.7,
             max_voxels: Self::DEFAULT_MAX_VOXELS,
+            max_stretch: 1.0,
             blend_frames: 0,
             exposure_compensation: false,
             gain: [1.0; 3],
@@ -1624,7 +1633,42 @@ impl VoxelFusion {
         // Round discs still overlap on a 45 degree slope (accumulated
         // opacity above 0.75 everywhere) and score 0.3 dB better.
         let sigma = self.radius_factor * voxel;
-        Splat::surfel(pos, n, sigma, (sigma * thickness).max(1.0e-5), rgba)
+        let thin = (sigma * thickness).max(1.0e-5);
+        let stretch = self.slope_stretch(acc, n, axis);
+        if stretch <= 1.0 {
+            return Splat::surfel(pos, n, sigma, thin, rgba);
+        }
+        // Along the slope, on the surface, the column's patch is 1 / cos
+        // longer than the cell: the disc follows it there and only there.
+        let mut up = Vec3::ZERO;
+        up[axis] = 1.0;
+        let slope = (up - n * n.dot(up)).normalize_or_zero();
+        if slope == Vec3::ZERO {
+            return Splat::surfel(pos, n, sigma, thin, rgba);
+        }
+        let across = n.cross(slope);
+        let rot = Quat::from_mat3(&Mat3::from_cols(slope, across, n));
+        Splat { pos: pos.to_array(), scale: [sigma * stretch, sigma, thin], rot: rot.to_array(), rgba }
+    }
+
+    /// How much longer a cell's disc is drawn along the slope of its surface.
+    ///
+    /// A cell is a column of the grid perpendicular to `axis`: on a surface
+    /// tilted by θ from that axis, neighbouring columns lie `voxel / cos θ`
+    /// apart along the slope, and round discs leave slits between them. A
+    /// real LiDAR shows them on every wall seen at an angle to the grid
+    /// (first real capture, 2026-11-15). Stretching every disc closes them
+    /// but turns the unreliable normals of creases and object outlines into
+    /// spikes, so a disc is stretched only when its samples agree on a flat
+    /// surface: `1 / cos θ`, capped at [`VoxelFusion::max_stretch`].
+    fn slope_stretch(&self, acc: &Accum, n: Vec3, axis: usize) -> f32 {
+        if self.max_stretch <= 1.0 || acc.count < Self::STRETCH_SAMPLES {
+            return 1.0;
+        }
+        if acc.normal.length() < Self::STRETCH_AGREEMENT * acc.count as f32 {
+            return 1.0;
+        }
+        (1.0 / n[axis].abs().max(1.0e-3)).min(self.max_stretch)
     }
 
     /// The good observations of a frame, row by row.
@@ -2474,5 +2518,32 @@ mod tests {
             (fusion.splats().to_vec(), fusion.refined())
         };
         assert_eq!(run(), run());
+    }
+
+    /// A flat cell tilted from its column's axis draws its disc longer along
+    /// the slope; disagreeing or lone samples, or a stretch of 1, stay round.
+    #[test]
+    fn flat_slanted_cells_stretch_along_their_slope() {
+        let mut fusion = VoxelFusion::new(0.024);
+        fusion.max_stretch = 2.0;
+        let tilted = Vec3::new(0.6, 0.0, 0.8);
+        let mut flat = Accum::new(tilted, 0.0, [0; 3], 0.01);
+        flat.add(tilted, 0.0, [0; 3], 0.01);
+        assert!((fusion.slope_stretch(&flat, tilted, 2) - 1.25).abs() < 1e-4);
+
+        let mut crease = Accum::new(tilted, 0.0, [0; 3], 0.01);
+        crease.add(Vec3::new(-0.6, 0.0, 0.8), 0.0, [0; 3], 0.01);
+        assert_eq!(fusion.slope_stretch(&crease, Vec3::Z, 2), 1.0);
+
+        let lone = Accum::new(tilted, 0.0, [0; 3], 0.01);
+        assert_eq!(fusion.slope_stretch(&lone, tilted, 2), 1.0);
+
+        let steep = Vec3::new(0.95, 0.0, 0.3122).normalize();
+        let mut wall = Accum::new(steep, 0.0, [0; 3], 0.01);
+        wall.add(steep, 0.0, [0; 3], 0.01);
+        assert_eq!(fusion.slope_stretch(&wall, steep, 2), 2.0, "capped");
+
+        fusion.max_stretch = 1.0;
+        assert_eq!(fusion.slope_stretch(&flat, tilted, 2), 1.0);
     }
 }
