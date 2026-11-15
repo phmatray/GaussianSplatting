@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 502,
+ "note": "uncompressed depth of 22 bytes for 4x3 pixels",
+ "valid": false
+}

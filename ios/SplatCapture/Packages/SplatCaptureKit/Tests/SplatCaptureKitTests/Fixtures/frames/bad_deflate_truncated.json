@@ -1,0 +1,6 @@
+{
+ "error": "bad_deflate",
+ "length": 493,
+ "note": "depth stream cut in half",
+ "valid": false
+}

@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 489,
+ "note": "depth and mask lengths above 2^31 whose 32-bit sum wraps around to the real payload size",
+ "valid": false
+}

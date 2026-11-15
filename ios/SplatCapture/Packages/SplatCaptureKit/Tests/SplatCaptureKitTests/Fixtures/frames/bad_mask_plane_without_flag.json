@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 516,
+ "note": "mask bytes present, flag clear",
+ "valid": false
+}

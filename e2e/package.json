@@ -1,0 +1,9 @@
+{
+  "name": "splat-live-e2e",
+  "private": true,
+  "description": "What the end-to-end scripts under e2e/ need from npm: Playwright and the IWER WebXR emulator. Run `npm install` here once, then `npx playwright install chromium`. Node finds both from every script of e2e/render, e2e/app and e2e/server.",
+  "devDependencies": {
+    "iwer": "2.8.0",
+    "playwright": "1.63.0"
+  }
+}

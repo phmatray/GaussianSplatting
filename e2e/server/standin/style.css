@@ -1,0 +1,6 @@
+body { font: 16px/1.5 system-ui, sans-serif; background: #101418; color: #e6e9ee; margin: 2rem; }
+h1 { font-size: 1.3rem; }
+th { text-align: left; padding-right: 1.5rem; color: #9fb3c8; }
+td { font-family: ui-monospace, monospace; }
+.ok { color: #6ee7a0; } .bad { color: #ff7b72; }
+img { background: #fff; vertical-align: middle; }

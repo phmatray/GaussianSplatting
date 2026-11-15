@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 480,
+ "note": "compressed depth of 0 bytes",
+ "valid": false
+}

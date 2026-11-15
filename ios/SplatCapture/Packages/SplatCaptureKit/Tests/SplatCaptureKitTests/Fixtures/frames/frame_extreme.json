@@ -1,0 +1,84 @@
+{
+ "color": {
+  "height": 65535,
+  "length": 0,
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "width": 65535
+ },
+ "compressed": false,
+ "confidence": null,
+ "depth": {
+  "height": 1,
+  "sha256": "ca2fd00fa001190744c15c317643ab092e7048ce086a243e2be9437c898de1bb",
+  "values": [
+   65535
+  ],
+  "width": 1
+ },
+ "flags": 0,
+ "index": 4294967295,
+ "intrinsics": [
+  1.401298464324817e-45,
+  3.4028234663852886e+38,
+  -0.0,
+  65535.5
+ ],
+ "intrinsics_bits": [
+  "00000001",
+  "7f7fffff",
+  "80000000",
+  "477fff80"
+ ],
+ "length": 130,
+ "mask": null,
+ "note": "frame index 2^32-1, 1x1 depth of 65535 mm, colour length 0, float edge cases",
+ "orientation": 3,
+ "reencode_identical": true,
+ "reserved": 0,
+ "stored_lengths": {
+  "color_length": 0,
+  "confidence_length": 0,
+  "depth_length": 2,
+  "mask_length": 0
+ },
+ "timestamp": 1.7976931348623157e+308,
+ "timestamp_bits": "7fefffffffffffff",
+ "tracking": 0,
+ "valid": true,
+ "world_from_cam": [
+  3.4028234663852886e+38,
+  -3.4028234663852886e+38,
+  1.1754943508222875e-38,
+  1.401298464324817e-45,
+  -0.0,
+  0.0,
+  1.0,
+  -1.0,
+  16777216.0,
+  0.10000000149011612,
+  -0.10000000149011612,
+  1.000000013351432e-10,
+  123456.7890625,
+  -1.401298464324817e-45,
+  2.5,
+  1.0
+ ],
+ "world_from_cam_bits": [
+  "7f7fffff",
+  "ff7fffff",
+  "00800000",
+  "00000001",
+  "80000000",
+  "00000000",
+  "3f800000",
+  "bf800000",
+  "4b800000",
+  "3dcccccd",
+  "bdcccccd",
+  "2edbe6ff",
+  "47f12065",
+  "80000001",
+  "40200000",
+  "3f800000"
+ ]
+}

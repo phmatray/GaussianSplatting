@@ -1,0 +1,6 @@
+{
+ "error": "bad_dimensions",
+ "length": 489,
+ "note": "deflated depth of 65535 x 65535 pixels (8.6 GB once inflated) in a frame of 489 bytes",
+ "valid": false
+}

@@ -1,0 +1,47 @@
+[
+ {
+  "error": "bad_file_magic",
+  "file": "bad_file_magic.gscap",
+  "note": "magic is GSCAP2"
+ },
+ {
+  "error": "bad_file_magic",
+  "file": "bad_file_short.gscap",
+  "note": "6 bytes"
+ },
+ {
+  "error": "bad_header",
+  "file": "bad_header_array.gscap",
+  "note": "the header is a JSON array"
+ },
+ {
+  "error": "bad_header",
+  "file": "bad_header_json.gscap",
+  "note": "not JSON"
+ },
+ {
+  "error": "bad_header",
+  "file": "bad_header_length.gscap",
+  "note": "header length beyond the end of the file"
+ },
+ {
+  "error": "bad_header",
+  "file": "bad_header_length_huge.gscap",
+  "note": "header length 2^32-1"
+ },
+ {
+  "error": "bad_header",
+  "file": "bad_header_utf8.gscap",
+  "note": "the header is not UTF-8"
+ },
+ {
+  "error": "bad_length",
+  "file": "bad_frame_record.gscap",
+  "note": "a frame record shorter than a frame header"
+ },
+ {
+  "error": "bad_length",
+  "file": "bad_frame_record_huge.gscap",
+  "note": "a frame record of 2^32-1 bytes (above the 64 MiB limit)"
+ }
+]

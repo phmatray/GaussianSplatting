@@ -1,0 +1,6 @@
+{
+ "error": "bad_magic",
+ "length": 504,
+ "note": "magic is GSCG",
+ "valid": false
+}

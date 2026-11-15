@@ -1,0 +1,6 @@
+{
+ "error": "bad_deflate",
+ "length": 505,
+ "note": "depth stream inflates to 22 bytes instead of 24",
+ "valid": false
+}

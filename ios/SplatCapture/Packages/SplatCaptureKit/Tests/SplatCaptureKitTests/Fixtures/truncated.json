@@ -1,0 +1,36 @@
+{
+ "file_length": 1499,
+ "frames": [
+  {
+   "index": 10,
+   "length": 504,
+   "sha256": "d29488ed1d59bce8a06106e52a8d4164e4b7b9b9a2e18602e72c3bf26dba56bb"
+  },
+  {
+   "index": 11,
+   "length": 516,
+   "sha256": "8256d914104562ca5c85b9d63a86a4803fa2e9c1d28dc21650a654023f14cf61"
+  }
+ ],
+ "header": {
+  "app": "0.1.0",
+  "created": "2026-11-14T09:30:00Z",
+  "device": "iPhone17,2",
+  "floor": {
+   "y": -1.25
+  },
+  "mode": "object",
+  "name": "Théière",
+  "protocol": 1,
+  "region": {
+   "center": [
+    0.5,
+    -0.25,
+    -1.5
+   ],
+   "radius": 0.75
+  }
+ },
+ "header_json_length": 189,
+ "truncated": true
+}

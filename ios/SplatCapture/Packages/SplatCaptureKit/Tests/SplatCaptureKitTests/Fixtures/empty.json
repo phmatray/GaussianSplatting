@@ -1,0 +1,14 @@
+{
+ "file_length": 124,
+ "frames": [],
+ "header": {
+  "app": "0.1.0",
+  "created": "2026-11-14T09:45:00Z",
+  "device": "iPhone17,2",
+  "mode": "room",
+  "name": "Salon",
+  "protocol": 1
+ },
+ "header_json_length": 112,
+ "truncated": false
+}

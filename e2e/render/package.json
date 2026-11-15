@@ -1,0 +1,11 @@
+{
+  "name": "gs-render-e2e",
+  "private": true,
+  "description": "Playwright checks of the gs-render harness page. Playwright itself must be resolvable (it is not installed from here).",
+  "scripts": {
+    "test": "node run.cjs"
+  },
+  "devDependencies": {
+    "iwer": "2.8.0"
+  }
+}

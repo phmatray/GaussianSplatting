@@ -1,0 +1,51 @@
+{
+  "bytes": 17984,
+  "complete": true,
+  "duration_s": 6.0,
+  "info": {
+    "created": "2026-11-14T10:00:00Z",
+    "duration_s": 6.0,
+    "name": "tiny",
+    "protocol": 1,
+    "scene": "tiny"
+  },
+  "keyframes": [
+    [
+      0.0,
+      1024
+    ],
+    [
+      1.0,
+      3337
+    ],
+    [
+      2.0,
+      5875
+    ],
+    [
+      3.0,
+      8604
+    ],
+    [
+      4.0,
+      11701
+    ],
+    [
+      5.0,
+      14210
+    ],
+    [
+      6.0,
+      16819
+    ]
+  ],
+  "layers": 33,
+  "previews": 24,
+  "problems": [],
+  "raw_bytes": 18410,
+  "records": 90,
+  "states": 1,
+  "stats": 24,
+  "stored_bytes": 15504,
+  "truncated": false
+}

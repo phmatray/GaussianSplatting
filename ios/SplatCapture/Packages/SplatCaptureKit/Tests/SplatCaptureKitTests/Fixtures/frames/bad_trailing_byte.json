@@ -1,0 +1,6 @@
+{
+ "error": "bad_length",
+ "length": 505,
+ "note": "one byte after the frame",
+ "valid": false
+}

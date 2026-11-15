@@ -1,0 +1,6 @@
+{
+ "error": "bad_deflate",
+ "length": 484,
+ "note": "depth stream starts with the reserved block type",
+ "valid": false
+}
