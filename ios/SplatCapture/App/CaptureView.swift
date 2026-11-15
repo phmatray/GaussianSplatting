@@ -36,6 +36,9 @@ struct CaptureView: View {
     }
 
     private var landscape: Bool { verticalSizeClass == .compact }
+    /// Side controls and shutter: a notch smaller on the narrow landscape panel.
+    private var sideButton: CGFloat { landscape ? 48 : 56 }
+    private var shutterFill: CGFloat { landscape ? 56 : 64 }
     private var recording: Bool { engine.phase == .running || engine.phase == .paused }
     private var capturing: Bool { engine.phase != .idle }
 
@@ -337,6 +340,7 @@ struct CaptureView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.75)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityElement(children: .combine)
@@ -450,7 +454,7 @@ struct CaptureView: View {
                 engine.resume()
             }
         case .finishing:
-            Color.clear.frame(width: 56, height: 56)
+            Color.clear.frame(width: sideButton, height: sideButton)
         }
     }
 
@@ -461,7 +465,7 @@ struct CaptureView: View {
                 confirmReset = true
             }
         } else {
-            Color.clear.frame(width: 56, height: 56)
+            Color.clear.frame(width: sideButton, height: sideButton)
         }
     }
 
@@ -475,7 +479,7 @@ struct CaptureView: View {
             Label(title, systemImage: systemImage)
                 .labelStyle(.iconOnly)
                 .font(.title3.weight(.semibold))
-                .frame(width: 56, height: 56)
+                .frame(width: sideButton, height: sideButton)
         }
         .roundGlassButton()
         .tint(tint)
@@ -508,15 +512,15 @@ struct CaptureView: View {
                         .stroke(ringColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
                         .rotationEffect(.degrees(-90))
                 }
-                RoundedRectangle(cornerRadius: recording ? 8 : 32, style: .continuous)
+                RoundedRectangle(cornerRadius: recording ? 8 : shutterFill / 2, style: .continuous)
                     .fill(.red)
-                    .frame(width: recording ? 32 : 64, height: recording ? 32 : 64)
+                    .frame(width: recording ? 32 : shutterFill, height: recording ? 32 : shutterFill)
                 if engine.phase == .finishing {
                     ProgressView()
                         .tint(.white)
                 }
             }
-            .frame(width: 80, height: 80)
+            .frame(width: landscape ? 72 : 80, height: landscape ? 72 : 80)
             .contentShape(Circle())
             .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: engine.phase)
         }
