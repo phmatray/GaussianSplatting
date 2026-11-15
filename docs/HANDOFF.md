@@ -574,6 +574,14 @@ l'arbre livré.
 - Le jeton d'appairage change à chaque démarrage du serveur : une capture
   enregistrée hors ligne puis envoyée plus tard sera souvent refusée (401) ;
   il faut alors scanner de nouveau le QR code.
+- Le certificat est renouvelé dès qu'une adresse que le Mac n'avait pas
+  apparaît, même passagère et inutile au téléphone. Constaté sur le Mac le
+  2026-11-15 : brancher l'iPhone par câble ajoute une adresse `169.254.x.y`,
+  et les ponts d'OrbStack vont et viennent ; chaque fois, l'empreinte
+  enregistrée par l'iPhone (et par un casque) cesse de valoir. Piste : ne
+  faire figurer dans le certificat que les adresses privées des interfaces
+  physiques, ou ne le renouveler que si la première adresse change
+  (`crates/gs-server/src/tls.rs`).
 
 ### Enregistrement et partage
 
