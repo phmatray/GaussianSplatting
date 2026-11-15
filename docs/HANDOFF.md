@@ -574,7 +574,21 @@ l'arbre livré.
   poses corrigées. **Effet non démontré** : sur cette capture, 6 boucles sur
   19 sont retenues, le rendu ne change pas de façon visible, et les murs n'y
   ont de toute façon que 0,3 % de blocs plans à double couche avant comme
-  après. Les dédoublements que le propriétaire voit restent à localiser.
+  après. Ce premier essai était faussé : le jacobien numérique perturbait
+  des poses `f32` de 1e-6, sous l'arrondi (corrigé, 4cd27d7). Rejoué sur
+  une seconde pièce (1 318 images) : 5 boucles sur 10, 16 cm de correction
+  moyenne, et toujours aucun gain — affinage 25,92 dB / 0,867 sans
+  correction, 25,88 dB / 0,863 avec, 0,1 % de blocs doublés dans les deux
+  modèles affinés (0,6 % dans la fusion en direct, que l'affinage résorbe).
+- Dédoublements localisés par le propriétaire (poêle et porte vitrée du
+  salon) : (1) **les vitres** — la profondeur LiDAR lit le reflet du salon
+  dans la porte (image 950 de la capture de 1 039 images), avec une
+  confiance moyenne à haute, donc une copie fantôme du salon derrière la
+  vitre ; filtrer sur la confiance ne suffit pas, il faut écarter la
+  profondeur qui tombe derrière une surface déjà vue. (2) **le poêle filmé
+  deux fois à 2 min 09 d'écart** (images 300 et 950) : 2 à 4 cm d'écart RMS
+  entre les deux passages avant recalage, que l'ICP n'aligne pas de façon
+  stable (corrections de 5 à 70 cm selon la paire).
 - La fusion ne retire jamais une surface que des images ultérieures voient
   au travers : une personne qui traverse la pièce pendant la capture laisse
   un fantôme.
