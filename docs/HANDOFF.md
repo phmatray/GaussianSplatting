@@ -564,6 +564,17 @@ l'arbre livré.
   delà, les nouvelles surfaces ne sont plus ajoutées. Une vraie maison plus
   grande l'atteindra plus tôt. Piste : une tolérance d'association qui
   croît avec la distance dans `VoxelFusion` (`crates/gs-core/src/reconstruct.rs`).
+- Dérive des poses d'ARKit, mesurée le 2026-11-15 sur la capture de 1 039
+  images (`out/captures/capture-1039-images-2026-11-15.gscap`, hors git) :
+  là où le téléphone repasse, un recalage ICP point-à-plan des cartes de
+  profondeur demande 5,2 cm de correction médiane quand les deux images ont
+  moins d'une minute d'écart, 9,1 cm au-delà de deux minutes (l'écart
+  quadratique tombe de 13-43 mm à 4-17 mm). `gs-refine recaler` (module
+  `drift`) en tire un graphe de poses et écrit une copie de la capture aux
+  poses corrigées. **Effet non démontré** : sur cette capture, 6 boucles sur
+  19 sont retenues, le rendu ne change pas de façon visible, et les murs n'y
+  ont de toute façon que 0,3 % de blocs plans à double couche avant comme
+  après. Les dédoublements que le propriétaire voit restent à localiser.
 - La fusion ne retire jamais une surface que des images ultérieures voient
   au travers : une personne qui traverse la pièce pendant la capture laisse
   un fantôme.
@@ -656,6 +667,12 @@ l'arbre livré.
   complet).
 
 ### Captures conservées
+
+- Aucun explorateur de fichiers dans l'interface : les captures, les
+  modèles affinés, les exports et les comparaisons se retrouvent par leur
+  chemin sur le disque, et un fichier ouvert puis fermé se perd (remarque du
+  propriétaire, 2026-11-15). À concevoir : une vue qui liste et ouvre tout ce
+  que le serveur garde, par capture.
 
 - Rouvrir une capture conservée (bouton œil) la réimporte et écrit un
   `.gsrec` de plus à chaque fois.

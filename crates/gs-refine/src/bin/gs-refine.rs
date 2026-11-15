@@ -4,6 +4,7 @@
 //! gs-refine <capture.gscap> -o <sortie.ply> [--preset rapide|standard|fin] [options]
 //! gs-refine info <capture.gscap>
 //! gs-refine export <capture.gscap> --format colmap|nerfstudio -o <dossier>
+//! gs-refine recaler <capture.gscap> -o <corrigée.gscap>
 //! ```
 //!
 //! Messages are in French; `gs-refine aide` lists the options.
@@ -26,7 +27,12 @@ Usage :
   gs-refine <capture.gscap> -o <sortie.ply> [options]
   gs-refine info <capture.gscap>
   gs-refine export <capture.gscap> --format colmap|nerfstudio -o <dossier>
+  gs-refine recaler <capture.gscap> -o <corrigée.gscap>
   gs-refine aide
+
+recaler : corrige la dérive des poses d'ARKit (les objets dédoublés quand on
+repasse au même endroit) et écrit une copie de la capture aux poses corrigées,
+que la fusion et l'optimisation relisent comme l'originale.
 
 Options de l'optimisation :
   -o, --sortie <fichier.ply>   fichier 3DGS écrit (lisible par la visionneuse)
@@ -500,6 +506,43 @@ fn export(args: &Args) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `gs-refine recaler`: the capture again, its poses corrected for drift.
+fn recalibrate(args: &Args) -> Result<ExitCode, String> {
+    use gs_core::ingest::{decode_frame, encode_frame, GscapWriter};
+    use gs_refine::drift::{corrected_poses, DriftParams};
+    let path = PathBuf::from(args.positional(1).ok_or("il manque le fichier de capture (.gscap)")?);
+    let out = PathBuf::from(args.value(&["-o", "--sortie"]).ok_or("il manque le fichier de sortie : -o <corrigée.gscap>")?);
+    if out == path {
+        return Err("la sortie doit être un autre fichier que la capture".to_string());
+    }
+    let capture = Capture::open(&path).map_err(|e| explain(&e.into()))?;
+    let started = Instant::now();
+    let (poses, report) = corrected_poses(&capture, &DriftParams::default());
+    let file = std::fs::File::create(&out).map_err(|e| format!("{} : {e}", out.display()))?;
+    let mut writer = GscapWriter::new(std::io::BufWriter::new(file), &capture.header, gs_core::ingest::file::HEADER_PAD)
+        .map_err(|e| format!("{} : {e}", out.display()))?;
+    for (i, pose) in poses.iter().enumerate() {
+        let bytes = capture.frame_bytes(i).map_err(|e| explain(&e.into()))?;
+        let mut frame = decode_frame(&bytes).map_err(|e| format!("image {i} : {e}"))?;
+        frame.world_from_cam = *pose;
+        let bytes = encode_frame(&frame).map_err(|e| format!("image {i} : {e}"))?;
+        writer.append(&bytes).map_err(|e| format!("{} : {e}", out.display()))?;
+    }
+    writer.into_inner().flush().map_err(|e| format!("{} : {e}", out.display()))?;
+    println!(
+        "{} : {} images, {} images clés, {} boucles trouvées dont {} retenues ; déplacement moyen {:.1} cm, au plus {:.1} cm ({:.0} s).",
+        out.display(),
+        french_number(poses.len()),
+        french_number(report.keyframes),
+        french_number(report.loops_found),
+        french_number(report.loops_kept),
+        100.0 * report.mean_shift_m,
+        100.0 * report.largest_shift_m,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn main() -> ExitCode {
     let args = Args(std::env::args().skip(1).collect());
     let command = args.0.first().map(String::as_str);
@@ -510,6 +553,7 @@ fn main() -> ExitCode {
         }
         Some("info") => args.check(1).and_then(|()| info(&args)),
         Some("export") => args.check(1).and_then(|()| export(&args)),
+        Some("recaler") => args.check(1).and_then(|()| recalibrate(&args)),
         Some(_) => args.check(0).and_then(|()| refine(&args)),
     };
     match result {
