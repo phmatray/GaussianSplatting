@@ -5,12 +5,20 @@ import SplatCaptureKit
 import SwiftUI
 import UIKit
 
-/// The capture screen: camera preview, mode, controls and counters.
+/// The capture screen: the camera image first, the numbers that judge a
+/// capture always in sight, and a shutter under the thumb, as in the Camera
+/// app. Settings that matter only before filming live in a sheet.
 struct CaptureView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var engine: CaptureEngine
     /// Compact height: an iPhone held in landscape.
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showOptions = false
+    @State private var confirmReset = false
+    /// Capture clock: time banked by earlier runs, and the current run's start.
+    @State private var banked: TimeInterval = 0
+    @State private var runStart: Date?
 
     init(engine: CaptureEngine) {
         _engine = ObservedObject(wrappedValue: engine)
@@ -23,6 +31,8 @@ struct CaptureView: View {
             NoLiDARView()
         }
     }
+
+    private var landscape: Bool { verticalSizeClass == .compact }
 
     private var captureScreen: some View {
         ZStack {
@@ -39,38 +49,12 @@ struct CaptureView: View {
             )
             // In landscape the image runs to every edge: the notch is on a
             // side and the tab bar floats over it.
-            .ignoresSafeArea(edges: verticalSizeClass == .compact ? .all : .top)
+            .ignoresSafeArea(edges: landscape ? .all : .top)
 
-            if verticalSizeClass == .compact {
-                // Landscape: the panels keep to the right third and the
-                // camera image stays visible; they scroll, the height is short.
-                GeometryReader { geometry in
-                    HStack(spacing: 0) {
-                        Spacer(minLength: 0)
-                        ScrollView {
-                            VStack(spacing: 8) {
-                                statusPanel
-                                if let notice = engine.notice {
-                                    noticePanel(notice)
-                                }
-                                controlPanel
-                            }
-                        }
-                        .scrollIndicators(.hidden)
-                        .frame(width: geometry.size.width / 3)
-                    }
-                }
-                .padding(10)
+            if landscape {
+                landscapeLayout
             } else {
-                VStack(spacing: 8) {
-                    statusPanel
-                    Spacer()
-                    if let notice = engine.notice {
-                        noticePanel(notice)
-                    }
-                    controlPanel
-                }
-                .padding(10)
+                portraitLayout
             }
         }
         .onAppear {
@@ -89,51 +73,186 @@ struct CaptureView: View {
             engine.regionRadius = newValue == .person ? 1.2 : 0.6
             engine.update(options: model.options, mode: newValue)
         }
+        .onChange(of: engine.phase) { old, new in
+            advanceClock(from: old, to: new)
+        }
+        .sheet(isPresented: $showOptions) {
+            CaptureOptionsSheet()
+                .environmentObject(model)
+                .presentationDetents([.medium])
+        }
+        .confirmationDialog("Recommencer la capture ?", isPresented: $confirmReset, titleVisibility: .visible) {
+            Button("Recommencer", role: .destructive) {
+                engine.reset()
+                banked = 0
+                runStart = engine.phase == .running ? Date() : nil
+            }
+        } message: {
+            Text("Ce qui a été filmé depuis le début est abandonné et la capture repart de zéro.")
+        }
+    }
+
+    // MARK: Layouts
+
+    private var portraitLayout: some View {
+        VStack(spacing: 10) {
+            hud
+            banners
+            Spacer(minLength: 0)
+            if model.mode.usesRegion {
+                regionPanel
+            }
+            controlDeck
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    /// The numbers and controls keep to the right third; the image stays clear.
+    private var landscapeLayout: some View {
+        GeometryReader { geometry in
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    banners
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(spacing: 10) {
+                    hud
+                    if model.mode.usesRegion {
+                        regionPanel
+                    }
+                    Spacer(minLength: 0)
+                    controlDeck
+                }
+                .frame(width: geometry.size.width / 3)
+            }
+        }
+        .padding(10)
+    }
+
+    @ViewBuilder
+    private var banners: some View {
+        if !engine.trackingAdvice.isEmpty {
+            Label(engine.trackingAdvice, systemImage: "exclamationmark.triangle.fill")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(.black)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.yellow, in: Capsule())
+                .frame(maxWidth: .infinity, alignment: landscape ? .leading : .center)
+        }
+        if let notice = engine.notice {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "info.circle.fill")
+                    .foregroundStyle(.tint)
+                Text(notice)
+                    .font(.footnote)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    engine.notice = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.footnote.weight(.semibold))
+                        .frame(width: 44, height: 44)
+                }
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Fermer le message")
+            }
+            .padding(.leading, 12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
     }
 
     // MARK: Status and counters
 
-    private var statusPanel: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
+    private var hud: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
                 Circle()
                     .fill(statusColor)
-                    .frame(width: 10, height: 10)
+                    .frame(width: 8, height: 8)
                 Text(statusLine)
-                    .font(.footnote.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
-            }
-            if !engine.trackingAdvice.isEmpty {
-                Text(engine.trackingAdvice)
-                    .font(.footnote)
-                    .foregroundStyle(.yellow)
+                Spacer(minLength: 4)
+                if engine.phase != .idle {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(clockText(at: context.date))
+                            .font(.subheadline.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(engine.phase == .running ? .red : .secondary)
+                    }
+                    .accessibilityLabel("Durée de la capture")
+                }
             }
             if engine.phase != .idle {
-                Text(counterLine)
-                    .font(.caption.monospacedDigit())
-                if engine.target == .server {
-                    Text("Serveur : \(engine.stats.serverFrames) images, \(engine.stats.serverSplats) splats")
-                        .font(.caption.monospacedDigit())
+                HStack(alignment: .firstTextBaseline, spacing: 0) {
+                    ForEach(metrics, id: \.label) { metric in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(metric.value)
+                                .font(.headline.monospacedDigit())
+                                .foregroundStyle(metric.warn ? .orange : .primary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.7)
+                            Text(metric.label)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityElement(children: .combine)
+                    }
                 }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private struct Metric {
+        let label: String
+        let value: String
+        var warn = false
+    }
+
+    /// What judges a capture while filming: to the server, frames out, frames
+    /// confirmed, frames dropped and the splats the server holds; to a file,
+    /// frames and size.
+    private var metrics: [Metric] {
+        let stats = engine.stats
+        if engine.target == .file {
+            return [
+                Metric(label: "Images", value: stats.recorded.formatted()),
+                Metric(label: "Taille", value: megabytes(stats.recordedBytes)),
+                Metric(label: "Ignorées", value: stats.skipped.formatted(), warn: stats.skipped > 0),
+            ]
+        }
+        return [
+            Metric(label: "Envoyées", value: stats.sent.formatted()),
+            Metric(label: "Confirmées", value: stats.acknowledged.formatted()),
+            Metric(label: "Ignorées", value: stats.skipped.formatted(), warn: stats.skipped > 0),
+            Metric(label: "Splats", value: stats.serverSplats.formatted(.number.notation(.compactName))),
+        ]
+    }
+
+    private func megabytes(_ bytes: Int64) -> String {
+        "\(String(format: "%.1f", locale: Locale.current, Double(bytes) / 1_000_000)) Mo"
     }
 
     private var statusLine: String {
         switch engine.target {
         case .file:
-            return "Enregistrement sur l'appareil"
+            return "Enregistrement sur l'iPhone"
         case .server:
             switch engine.linkState {
             case .connected:
-                return "Connecté au serveur \(model.pairing?.host ?? "")"
+                return "Connecté à \(model.pairing?.host ?? "serveur")"
             case .connecting:
-                return "Connexion au serveur en cours"
+                return "Connexion au serveur…"
             case .failed:
-                return engine.link.isRetrying ? "Serveur injoignable, nouvelle tentative" : "Serveur injoignable"
+                return engine.link.isRetrying ? "Serveur injoignable, nouvel essai…" : "Serveur injoignable"
             case .disconnected:
                 return "Déconnecté du serveur"
             }
@@ -156,117 +275,212 @@ struct CaptureView: View {
         }
     }
 
-    private var counterLine: String {
-        let stats = engine.stats
-        if engine.target == .file {
-            let megabytes = String(format: "%.1f", locale: Locale.current, Double(stats.recordedBytes) / 1_000_000)
-            return "Images enregistrées : \(stats.recorded) (\(megabytes) Mo), ignorées : \(stats.skipped)"
+    // MARK: Clock
+
+    private func advanceClock(from old: CapturePhase, to new: CapturePhase) {
+        switch new {
+        case .running:
+            if old == .idle {
+                banked = 0
+            }
+            runStart = Date()
+        case .paused, .finishing:
+            if let start = runStart {
+                banked += Date().timeIntervalSince(start)
+            }
+            runStart = nil
+        case .idle:
+            banked = 0
+            runStart = nil
         }
-        return "Images envoyées : \(stats.sent), confirmées : \(stats.acknowledged), ignorées : \(stats.skipped)"
     }
 
-    private func noticePanel(_ text: String) -> some View {
-        HStack(alignment: .top) {
-            Text(text)
-                .font(.footnote)
-            Spacer()
-            Button {
-                engine.notice = nil
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-            }
-            .accessibilityLabel("Fermer le message")
-        }
-        .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    private func clockText(at date: Date) -> String {
+        let total = Int(banked + (runStart.map { date.timeIntervalSince($0) } ?? 0))
+        return String(format: "%d:%02d", total / 60, total % 60)
     }
 
     // MARK: Controls
 
-    private var controlPanel: some View {
-        VStack(spacing: 10) {
+    private var controlDeck: some View {
+        VStack(spacing: 12) {
             if engine.phase == .idle {
                 Picker("Mode", selection: $model.mode) {
                     ForEach(CaptureMode.allCases, id: \.self) { mode in
-                        Text(AppModel.modeLabel(mode)).tag(mode)
+                        // The narrow landscape panel shows symbols; their
+                        // names stay for VoiceOver.
+                        if landscape {
+                            Image(systemName: Self.modeSymbol(mode))
+                                .accessibilityLabel(AppModel.modeLabel(mode))
+                                .tag(mode)
+                        } else {
+                            Text(AppModel.modeLabel(mode)).tag(mode)
+                        }
                     }
                 }
                 .pickerStyle(.segmented)
 
-                TextField("Nom de la capture", text: $model.captureName)
-                    .textFieldStyle(.roundedBorder)
-                    .submitLabel(.done)
-
-                Toggle("Enregistrer sans serveur", isOn: $model.recordOffline)
-                    .font(.footnote)
+                Text(destinationLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
-            if model.mode.usesRegion {
-                regionControls
+            HStack(spacing: 0) {
+                leadingControl
+                    .frame(maxWidth: .infinity)
+                shutter
+                trailingControl
+                    .frame(maxWidth: .infinity)
             }
-
-            // A row when it fits, a column in the narrow landscape panel.
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 12) { phaseButtons }
-                VStack(spacing: 8) { phaseButtons }
-            }
-            .frame(maxWidth: .infinity)
         }
-        .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    private static func modeSymbol(_ mode: CaptureMode) -> String {
+        switch mode {
+        case .room: return "house"
+        case .object: return "cube"
+        case .person: return "figure.stand"
+        case .live: return "dot.radiowaves.left.and.right"
+        }
+    }
+
+    private var destinationLine: String {
+        let name = model.captureName.isEmpty ? "Capture" : model.captureName
+        let place = model.recordOffline || model.pairing == nil ? "sur l'iPhone" : "vers le Mac"
+        return "\(AppModel.modeLabel(model.mode)) · \(name) · \(place)"
     }
 
     @ViewBuilder
-    private var phaseButtons: some View {
+    private var leadingControl: some View {
         switch engine.phase {
         case .idle:
-            Button("Démarrer") {
+            roundButton("Options de capture", systemImage: "slider.horizontal.3") {
+                showOptions = true
+            }
+        case .running:
+            roundButton("Pause", systemImage: "pause.fill") {
+                engine.pause()
+            }
+        case .paused:
+            roundButton("Reprendre", systemImage: "play.fill") {
+                engine.resume()
+            }
+        case .finishing:
+            Color.clear.frame(width: 52, height: 52)
+        }
+    }
+
+    @ViewBuilder
+    private var trailingControl: some View {
+        switch engine.phase {
+        case .running, .paused:
+            roundButton("Recommencer", systemImage: "arrow.counterclockwise", tint: .red) {
+                confirmReset = true
+            }
+        case .idle, .finishing:
+            Color.clear.frame(width: 52, height: 52)
+        }
+    }
+
+    private func roundButton(
+        _ title: String,
+        systemImage: String,
+        tint: Color? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.iconOnly)
+                .font(.title3.weight(.semibold))
+                .frame(width: 52, height: 52)
+        }
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.circle)
+        .tint(tint)
+    }
+
+    private var recording: Bool { engine.phase == .running || engine.phase == .paused }
+
+    /// The shutter starts and ends a capture. Its ring tells the link's
+    /// health while sending: how much of what left the phone the server has
+    /// confirmed, green while it keeps up, orange when frames pile up, red
+    /// when the link is down.
+    private var shutter: some View {
+        Button {
+            switch engine.phase {
+            case .idle:
                 engine.start(
                     mode: model.mode,
                     name: model.captureName,
                     pairing: model.pairing,
                     offline: model.recordOffline)
+            case .running, .paused:
+                engine.finish()
+            case .finishing:
+                break
             }
-            .buttonStyle(.borderedProminent)
-        case .running:
-            Button("Pause") {
-                engine.pause()
+        } label: {
+            ZStack {
+                Circle()
+                    .stroke(.white.opacity(0.85), lineWidth: 4)
+                if recording, engine.target == .server {
+                    Circle()
+                        .trim(from: 0, to: confirmedFraction)
+                        .stroke(ringColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+                RoundedRectangle(cornerRadius: recording ? 8 : 31, style: .continuous)
+                    .fill(.red)
+                    .frame(width: recording ? 30 : 62, height: recording ? 30 : 62)
+                if engine.phase == .finishing {
+                    ProgressView()
+                        .tint(.white)
+                }
             }
-            .buttonStyle(.bordered)
-            finishAndResetButtons
-        case .paused:
-            Button("Reprendre") {
-                engine.resume()
-            }
-            .buttonStyle(.borderedProminent)
-            finishAndResetButtons
-        case .finishing:
-            ProgressView()
-            Text("Fin de la capture")
-                .font(.footnote)
+            .frame(width: 76, height: 76)
+            .contentShape(Circle())
+            .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: engine.phase)
+        }
+        .buttonStyle(.plain)
+        .disabled(engine.phase == .finishing)
+        .accessibilityLabel(shutterLabel)
+    }
+
+    private var shutterLabel: String {
+        switch engine.phase {
+        case .idle: return "Démarrer la capture"
+        case .running, .paused: return "Terminer la capture"
+        case .finishing: return "Fin de la capture en cours"
         }
     }
 
-    @ViewBuilder
-    private var finishAndResetButtons: some View {
-        Button("Terminer") {
-            engine.finish()
+    private var confirmedFraction: CGFloat {
+        let stats = engine.stats
+        guard stats.sent > 0 else {
+            return 0
         }
-        .buttonStyle(.bordered)
-        Button("Réinitialiser", role: .destructive) {
-            engine.reset()
-        }
-        .buttonStyle(.bordered)
+        return CGFloat(min(1, Double(stats.acknowledged) / Double(stats.sent)))
     }
 
-    private var regionControls: some View {
-        VStack(alignment: .leading, spacing: 2) {
+    private var ringColor: Color {
+        guard engine.linkState == .connected else {
+            return .red
+        }
+        return engine.stats.sent - engine.stats.acknowledged > 8 ? .orange : .green
+    }
+
+    private var regionPanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
             if engine.regionCenter == nil {
-                Text("Touchez le sujet à l'écran pour placer la zone à capturer.")
+                Label("Touchez le sujet à l'écran pour placer la zone.", systemImage: "hand.tap")
                     .font(.footnote)
             } else {
                 Text("Rayon de la zone : \(String(format: "%.2f", locale: Locale.current, Double(engine.regionRadius))) m")
-                    .font(.footnote)
+                    .font(.footnote.monospacedDigit())
             }
             Slider(
                 value: $engine.regionRadius,
@@ -277,9 +491,45 @@ struct CaptureView: View {
                     }
                 }
             )
+            .accessibilityLabel("Rayon de la zone")
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
+/// What is decided once, before filming: the capture's name, and whether it
+/// stays on the phone.
+struct CaptureOptionsSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Nom") {
+                    TextField("Nom de la capture", text: $model.captureName)
+                        .submitLabel(.done)
+                }
+                Section {
+                    Toggle("Enregistrer sans serveur", isOn: $model.recordOffline)
+                } footer: {
+                    Text("La capture est gardée sur l'iPhone, dans l'onglet Enregistrements.")
+                }
+            }
+            .navigationTitle("Options de capture")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("OK") {
+                        dismiss()
+                    }
+                }
+            }
         }
     }
 }
+
 
 /// Shown instead of the camera on a device without LiDAR scanner.
 struct NoLiDARView: View {
