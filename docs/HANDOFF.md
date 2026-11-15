@@ -581,8 +581,12 @@ l'arbre livré.
   enregistrée par l'iPhone (et par un casque) cessait de valoir. Corrigé
   pour les adresses locales de lien, la cause constatée : elles ne sont plus
   exigées dans le certificat (`crates/gs-server/src/tls.rs`, test
-  `a_passing_link_local_address_keeps_the_certificate`). Un pont virtuel
-  nouveau (OrbStack, Docker) renouvelle encore le certificat ; à surveiller.
+  `a_passing_link_local_address_keeps_the_certificate`), puis pour toute
+  adresse secondaire : le même soir, un pont OrbStack apparu en cours de
+  session a encore renouvelé le certificat et rendu l'iPhone « injoignable ».
+  Le certificat ne se renouvelle plus que si la première adresse change, et
+  `lan.urls` n'annonce que les adresses qu'il nomme (test
+  `a_new_secondary_address_keeps_the_certificate`).
 
 ### Enregistrement et partage
 

@@ -590,8 +590,11 @@ impl Core {
     }
 
     /// Loads or creates the certificate for `addresses` and returns the TLS
-    /// configuration serving it, with its fingerprint.
-    async fn identity_for(&self, addresses: &[Ipv4Addr]) -> Result<(Arc<rustls::ServerConfig>, String), Error> {
+    /// configuration serving it, its fingerprint and the names it carries.
+    async fn identity_for(
+        &self,
+        addresses: &[Ipv4Addr],
+    ) -> Result<(Arc<rustls::ServerConfig>, String, Vec<String>), Error> {
         let (dir, addresses) = (self.cert_dir.clone(), addresses.to_vec());
         // Key generation and file access: off the async threads.
         let identity = tokio::task::spawn_blocking(move || {
@@ -602,20 +605,28 @@ impl Core {
         .map_err(|e| Error::Certificate(e.to_string()))?
         .0;
         let config = identity.server_config().map_err(|e| Error::Certificate(e.to_string()))?;
-        Ok((config, identity.fingerprint()))
+        Ok((config, identity.fingerprint(), identity.names))
     }
 
-    fn lan_info(addresses: &[Ipv4Addr], port: u16, fingerprint: String) -> LanInfo {
+    /// The URLs announced: the current addresses the certificate names. The
+    /// first address is always named; a secondary one that appeared after
+    /// the certificate was made is left out rather than announced with a
+    /// certificate that would not match it.
+    fn lan_info(addresses: &[Ipv4Addr], port: u16, fingerprint: String, names: &[String]) -> LanInfo {
         LanInfo {
             enabled: true,
-            urls: addresses.iter().map(|ip| format!("https://{ip}:{port}")).collect(),
+            urls: addresses
+                .iter()
+                .filter(|ip| names.contains(&ip.to_string()))
+                .map(|ip| format!("https://{ip}:{port}"))
+                .collect(),
             fingerprint,
         }
     }
 
     async fn open_lan(self: &Arc<Self>) -> Result<LanListener, Error> {
         let addresses = (self.addresses)();
-        let (config, fingerprint) = self.identity_for(&addresses).await?;
+        let (config, fingerprint, names) = self.identity_for(&addresses).await?;
 
         let wanted = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.lan_port.load(Ordering::Relaxed));
         let listener =
@@ -636,7 +647,7 @@ impl Core {
         let server = bound_idle_connections(server, self.settings.request_timeout);
         let task = tokio::spawn(server.serve(app.into_make_service()));
 
-        let info = Self::lan_info(&addresses, addr.port(), fingerprint);
+        let info = Self::lan_info(&addresses, addr.port(), fingerprint, &names);
         log::info!("LAN listener open on {addr} ({} address(es))", info.urls.len());
         self.set_lan_view(info, Some(addr));
         let watcher = tokio::spawn(watch_addresses(Arc::downgrade(self)));
@@ -664,12 +675,15 @@ impl Core {
             return;
         }
         match self.identity_for(&addresses).await {
-            Ok((config, fingerprint)) => {
+            Ok((config, fingerprint, names)) => {
                 // New handshakes get the new certificate; established
                 // connections are not disturbed.
                 listener.tls.reload_from_config(config);
                 log::info!("LAN addresses changed: {:?} -> {addresses:?}", listener.addresses);
-                self.set_lan_view(Self::lan_info(&addresses, listener.addr.port(), fingerprint), Some(listener.addr));
+                self.set_lan_view(
+                    Self::lan_info(&addresses, listener.addr.port(), fingerprint, &names),
+                    Some(listener.addr),
+                );
                 listener.addresses = addresses;
             }
             // The old URLs stay announced; the next poll tries again.
