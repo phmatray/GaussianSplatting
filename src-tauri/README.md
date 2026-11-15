@@ -115,6 +115,15 @@ développement, et `gs-server` embarque sa propre copie de l'interface pour la
 servir aux casques du réseau local. Les deux lisent `crates/gs-app/dist` à la
 compilation : ce dossier doit exister.
 
+La ligne de commande Tauri 2 n'active pas `custom-protocol`, seulement
+`tauri/custom-protocol` (la fenêtre). La copie de l'interface du serveur passe
+donc par une seconde fonctionnalité, `embed-dist`, que `tauri.conf.json`
+demande dans `build.features`. Sans elle, le binaire de `cargo tauri build`
+servait la page d'explication aux casques et ne savait pas écrire d'archive
+de partage (constaté sur le Mac le 2026-11-15). Pour vérifier un binaire : le
+journal de démarrage doit dire `serving the frontend from: embedded web
+build`, et non `placeholder page`.
+
 ## Variables d'environnement
 
 | Variable | Effet |
