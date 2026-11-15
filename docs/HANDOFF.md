@@ -83,8 +83,8 @@ en section 6.
 ### Sur le MacBook Pro M5 Max, le 2026-11-15
 
 Première passe sur la vraie machine (macOS 27, Rust 1.96, Xcode avec le SDK
-iOS 27.2). Étapes 1 à 4 de la section 3 faites ; les étapes 5 à 7 attendent
-un iPhone et un casque.
+iOS 27.2). Étapes 1 à 6 de la section 3 faites ; l'étape 7 attend un
+casque.
 
 | Vérification | Résultat |
 | --- | --- |
@@ -93,7 +93,7 @@ un iPhone et un casque.
 | `python3 -m unittest discover -s tools` | 88 réussis (Python 3.15) |
 | `e2e/render` | 379 sur 379 |
 | `e2e/app` | 463 sur 465 : `soak` (connu, section 6) et `stage` en tête de passe, qui passe 39 sur 39 seul, deux fois. `webkit` se saute. |
-| `e2e/server` | `hostile.py --quick` et `abuse.py` passent (premier passage de leur repli `ps`/`lsof` sous macOS). `capture.py`, `browser.cjs`, `real-frontend.cjs` et `share.cjs` échouent tous à la poignée de main TLS sur l'adresse réseau du Mac : le pare-feu de macOS bloque `target/release/gs-server`, non signé (risque 2 ci-dessous). |
+| `e2e/server` | `hostile.py --quick` et `abuse.py` passent (premier passage de leur repli `ps`/`lsof` sous macOS). `capture.py`, `browser.cjs`, `real-frontend.cjs` et `share.cjs` échouaient à la poignée de main TLS sur l'adresse réseau du Mac (pare-feu de macOS, risque 2) ; une fois l'exception posée pour `target/release/gs-server`, ils passent tous, ainsi que `refine.py`. |
 | Visionneuse, Chrome | Metal (« ANGLE Metal Renderer: Apple M5 Max »), mode normalisé. 120 i/s, plafond de l'écran, dans les deux modes de mélange jusqu'à 270 000 splats : l'écart de 3 à 5 fois mesuré sur SwiftShader n'apparaît pas. |
 | Visionneuse, Safari et WebKit | Mode normalisé accepté (demi-flottants disponibles), maison terminée de 756 000 splats à 60 i/s, pièces ouvertes vues de dessus. |
 | Application de bureau (WKWebView) | Fenêtre, scène, enregistrement, export d'un `.gsrec` vers Téléchargements, archive de partage, `reveal` dans le Finder : tout fonctionne. Le bouton VR ouvre la section « Casque VR », qui dit que la vue web ne peut pas ouvrir de session, sans erreur. Lancée depuis un terminal, l'application hérite de ses autorisations : la demande d'accès à Téléchargements d'une `.app` lancée seule n'a pas été vue. |
@@ -102,6 +102,21 @@ un iPhone et un casque.
 | Espace libre | `storage.free_bytes` égale `df` ; le Finder annonce 33 Go de plus (purgeable), comme prévu au risque 8. |
 | Affinage, chambre réaliste de 220 images | `rapide` : 23,7 s à 17 fils (défaut du serveur), 26,3 s à 12, 29,7 s à 18, 40,6 s à 6 ; résultats identiques au bit près entre 6 et 17 fils. `standard` : 2 min 38 s, 1,3 Go de mémoire. |
 | Brush (Rust, wgpu sur Metal) | Compilé depuis les sources (`1388f74`). Lit nos exports COLMAP et nerfstudio ; ses `.ply` s'ouvrent dans notre visionneuse, à l'endroit et à l'échelle. 5 000 itérations en 98 s, 30 000 en 8 min 24 s. Jugé à l'œil seulement (pas d'outil du dépôt pour noter un `.ply` étranger), à l'intérieur de la chambre et à des points de vue proches mais pas identiques : plus lisse et plus flou que `gs-refine standard`, même tache sombre là où le capteur n'a rien vu. Sur données simulées, il ne fait pas mieux ; la question reste ouverte pour une capture réelle. OpenSplat n'a pas été essayé. |
+
+Premières données réelles, le même soir (iPhone 15 Pro Max, iOS 27.0.1,
+signé avec l'équipe Atypical Consulting) :
+
+| Étape | Résultat |
+| --- | --- |
+| 5, faux serveur | 371 images en 64,5 s, 50,7 Mo, trajet de 16,8 m, suivi normal partout. `gscap.py verify` : rien à signaler. Point principal (480,6 ; 361,2) pour 960×720, focale 667 px ; orientation 0 (paysage) sur toutes les images. `gscap_ingest` : 371 images utilisées, 466 000 splats, sol à -0,68 m, plafond à 2,62 m. Fichier conservé : `out/captures/premiere-capture-reelle-2026-11-15.gscap` (hors git). |
+| 6, vrai serveur | Poignée de main WebSocket depuis `URLSessionWebSocketTask` acceptée (`/ingest` → 101, risque 3 levé). 360 images reçues, 360 utilisées, 462 584 splats ; la pièce est reconnaissable, ni quart de tour ni miroir. Capture et enregistrement conservés. |
+| Affinage `rapide` de la capture réelle | 85 s à 17 fils, 740 000 gaussiennes. Défaut neuf, absent des captures simulées : de longues traînées en aiguilles (gaussiennes très étirées) sur un mur. Non analysé. |
+| 7, casque | Pas fait. |
+
+Pour joindre le Mac, le pare-feu de macOS a demandé une exception par
+exécutable : `target/release/gs-server` et, pour `tools/fake_server.py`,
+`…/python@3.15/…/Resources/Python.app` (pas le `python3.15` de la ligne de
+commande). À refaire après une recompilation ou une mise à jour de Python.
 
 Défauts trouvés et corrigés ce jour-là (branche `fix/macos-first-contact`) :
 
