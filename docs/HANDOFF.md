@@ -578,10 +578,11 @@ l'arbre livré.
   apparaît, même passagère et inutile au téléphone. Constaté sur le Mac le
   2026-11-15 : brancher l'iPhone par câble ajoute une adresse `169.254.x.y`,
   et les ponts d'OrbStack vont et viennent ; chaque fois, l'empreinte
-  enregistrée par l'iPhone (et par un casque) cesse de valoir. Piste : ne
-  faire figurer dans le certificat que les adresses privées des interfaces
-  physiques, ou ne le renouveler que si la première adresse change
-  (`crates/gs-server/src/tls.rs`).
+  enregistrée par l'iPhone (et par un casque) cessait de valoir. Corrigé
+  pour les adresses locales de lien, la cause constatée : elles ne sont plus
+  exigées dans le certificat (`crates/gs-server/src/tls.rs`, test
+  `a_passing_link_local_address_keeps_the_certificate`). Un pont virtuel
+  nouveau (OrbStack, Docker) renouvelle encore le certificat ; à surveiller.
 
 ### Enregistrement et partage
 

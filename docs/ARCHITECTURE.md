@@ -238,7 +238,8 @@ frames are capped at `pipeline::MAX_CONTROL_JSON`. A connection that sends no
 complete request within 15 s is closed (`POST /api/lan` answers 408). While
 LAN is on, `lan.urls` and `lan.fingerprint` follow the machine's addresses
 (checked every 5 s; the certificate is renewed if it does not name the new
-address). The LAN listener has no authentication: anyone on the network can
+address, link-local addresses `169.254/16` excepted: they come and go with
+a USB cable and no device on the Wi-Fi uses them). The LAN listener has no authentication: anyone on the network can
 watch and send control messages, which is why it is off by default.
 
 The Tauri shell starts the server in-process, keeps its files under the

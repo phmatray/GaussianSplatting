@@ -92,7 +92,11 @@ pub fn fingerprint(cert_der: &[u8]) -> String {
 
 fn required_names(lan: &[Ipv4Addr]) -> Vec<String> {
     let mut names: Vec<String> = LOCAL_NAMES.iter().map(|n| n.to_string()).collect();
-    for ip in lan.iter().take(MAX_ADDRESSES) {
+    // Link-local addresses (169.254/16) come and go with a USB cable or an
+    // AWDL link, and no phone or headset on the Wi-Fi uses them. Requiring
+    // them renewed the certificate, and broke every pairing, each time an
+    // iPhone was plugged in (seen on a Mac, 2026-11-15).
+    for ip in lan.iter().filter(|ip| !ip.is_link_local()).take(MAX_ADDRESSES) {
         let name = ip.to_string();
         if !names.contains(&name) {
             names.push(name);
@@ -312,6 +316,18 @@ mod tests {
         let (third, fresh) = load_or_create(Some(dir.path()), &[ip(20)], now()).unwrap();
         assert!(!fresh);
         assert_eq!(third.fingerprint(), second.fingerprint());
+    }
+
+    /// What happened on a Mac when an iPhone was plugged in by cable.
+    #[test]
+    fn a_passing_link_local_address_keeps_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = load_or_create(Some(dir.path()), &[ip(20)], now()).unwrap();
+        let cable = Ipv4Addr::new(169, 254, 107, 197);
+        let (second, fresh) = load_or_create(Some(dir.path()), &[ip(20), cable], now()).unwrap();
+        assert!(!fresh, "a link-local address renewed the certificate");
+        assert_eq!(second.fingerprint(), first.fingerprint());
+        assert!(!second.names.contains(&cable.to_string()));
     }
 
     #[test]
