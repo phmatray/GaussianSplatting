@@ -137,8 +137,19 @@ async fn lan_listener_opens_and_closes_on_request() {
         let lan_loopback = loopback(lan_port);
         let mut addresses = vec![lan_loopback];
         addresses.extend(gs_server::lan_ipv4().into_iter().map(|ip| SocketAddr::new(IpAddr::V4(ip), lan_port)));
-        for addr in &addresses {
-            let stream = tls_stream(*addr, &tls, &[b"http/1.1"]).await.unwrap_or_else(|e| panic!("TLS to {addr}: {e}"));
+        for (i, addr) in addresses.iter().enumerate() {
+            let stream = match tls_stream(*addr, &tls, &[b"http/1.1"]).await {
+                Ok(stream) => stream,
+                // macOS refuses to connect to some of its own virtual
+                // bridges (OrbStack, Docker): the system says no before any
+                // packet leaves. Such an address is ranked last; the first
+                // LAN address, the one in the QR code, must still answer.
+                Err(e) if i >= 2 && e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    eprintln!("note: {addr} not reachable from this machine ({e}), skipped");
+                    continue;
+                }
+                Err(e) => panic!("TLS to {addr}: {e}"),
+            };
             let presented = stream.get_ref().1.peer_certificates().unwrap()[0].to_vec();
             assert_eq!(gs_server::fingerprint(&presented), fingerprint, "/api/info announces another certificate");
             let over_tls = request_on(Box::new(stream), "GET", &addr.to_string(), "/api/info", &[], &[]).await;

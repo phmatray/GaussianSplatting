@@ -98,7 +98,33 @@ pub(crate) fn bind_near(ip: IpAddr, port: u16) -> io::Result<TcpListener> {
     let mut last_error = None;
     for offset in 0..PORT_ATTEMPTS {
         let Some(candidate) = port.checked_add(offset) else { break };
-        match TcpListener::bind(SocketAddr::new(ip, candidate)) {
+        let bound = if port == 0 {
+            TcpListener::bind(SocketAddr::new(ip, candidate))
+        } else {
+            // std sets SO_REUSEADDR, and with it macOS (unlike Linux) lets
+            // `127.0.0.1:P` and `0.0.0.0:P` be bound by two listeners at
+            // once; loopback clients then reach the wrong one. Count the
+            // port as taken when its counterpart is.
+            let counterpart = match ip {
+                IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            };
+            // The probe is closed before the real bind: on Linux, holding it
+            // would make every port look taken.
+            let probe = TcpListener::bind(SocketAddr::new(counterpart, candidate));
+            match probe {
+                Err(err) if err.kind() == io::ErrorKind::AddrInUse => Err(err),
+                // Free, or not bindable at all (no IPv6 loopback…): only
+                // "taken" says anything about the port.
+                other => {
+                    drop(other);
+                    TcpListener::bind(SocketAddr::new(ip, candidate))
+                }
+            }
+        };
+        match bound {
             Ok(listener) => return Ok(listener),
             // Only "taken" is worth another port; anything else (no
             // permission, no such address) would fail the same way.
@@ -207,6 +233,21 @@ mod tests {
         let second = bind_near(ip, taken).unwrap();
         let got = second.local_addr().unwrap().port();
         assert!(got > taken && got < taken.saturating_add(PORT_ATTEMPTS), "{taken} then {got}");
+    }
+
+    /// macOS would let both of these bind the same port.
+    #[test]
+    fn loopback_and_wildcard_never_share_a_port() {
+        let (loopback, any) = (IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        for (held, wanted) in [(any, loopback), (loopback, any)] {
+            let first = bind_near(held, 0).unwrap();
+            let taken = first.local_addr().unwrap().port();
+            if taken > u16::MAX - PORT_ATTEMPTS {
+                continue;
+            }
+            let second = bind_near(wanted, taken).unwrap();
+            assert_ne!(second.local_addr().unwrap().port(), taken, "{held} then {wanted}");
+        }
     }
 
     #[test]
