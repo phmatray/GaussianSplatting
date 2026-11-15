@@ -9,6 +9,8 @@ import UIKit
 struct CaptureView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var engine: CaptureEngine
+    /// Compact height: an iPhone held in landscape.
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     init(engine: CaptureEngine) {
         _engine = ObservedObject(wrappedValue: engine)
@@ -35,17 +37,41 @@ struct CaptureView: View {
                     }
                 }
             )
-            .ignoresSafeArea(edges: .top)
+            // In landscape the image runs to every edge: the notch is on a
+            // side and the tab bar floats over it.
+            .ignoresSafeArea(edges: verticalSizeClass == .compact ? .all : .top)
 
-            VStack(spacing: 8) {
-                statusPanel
-                Spacer()
-                if let notice = engine.notice {
-                    noticePanel(notice)
+            if verticalSizeClass == .compact {
+                // Landscape: the panels keep to the right third and the
+                // camera image stays visible; they scroll, the height is short.
+                GeometryReader { geometry in
+                    HStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        ScrollView {
+                            VStack(spacing: 8) {
+                                statusPanel
+                                if let notice = engine.notice {
+                                    noticePanel(notice)
+                                }
+                                controlPanel
+                            }
+                        }
+                        .scrollIndicators(.hidden)
+                        .frame(width: geometry.size.width / 3)
+                    }
                 }
-                controlPanel
+                .padding(10)
+            } else {
+                VStack(spacing: 8) {
+                    statusPanel
+                    Spacer()
+                    if let notice = engine.notice {
+                        noticePanel(notice)
+                    }
+                    controlPanel
+                }
+                .padding(10)
             }
-            .padding(10)
         }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
@@ -179,39 +205,46 @@ struct CaptureView: View {
                 regionControls
             }
 
-            HStack(spacing: 12) {
-                switch engine.phase {
-                case .idle:
-                    Button("Démarrer") {
-                        engine.start(
-                            mode: model.mode,
-                            name: model.captureName,
-                            pairing: model.pairing,
-                            offline: model.recordOffline)
-                    }
-                    .buttonStyle(.borderedProminent)
-                case .running:
-                    Button("Pause") {
-                        engine.pause()
-                    }
-                    .buttonStyle(.bordered)
-                    finishAndResetButtons
-                case .paused:
-                    Button("Reprendre") {
-                        engine.resume()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    finishAndResetButtons
-                case .finishing:
-                    ProgressView()
-                    Text("Fin de la capture")
-                        .font(.footnote)
-                }
+            // A row when it fits, a column in the narrow landscape panel.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) { phaseButtons }
+                VStack(spacing: 8) { phaseButtons }
             }
             .frame(maxWidth: .infinity)
         }
         .padding(10)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    @ViewBuilder
+    private var phaseButtons: some View {
+        switch engine.phase {
+        case .idle:
+            Button("Démarrer") {
+                engine.start(
+                    mode: model.mode,
+                    name: model.captureName,
+                    pairing: model.pairing,
+                    offline: model.recordOffline)
+            }
+            .buttonStyle(.borderedProminent)
+        case .running:
+            Button("Pause") {
+                engine.pause()
+            }
+            .buttonStyle(.bordered)
+            finishAndResetButtons
+        case .paused:
+            Button("Reprendre") {
+                engine.resume()
+            }
+            .buttonStyle(.borderedProminent)
+            finishAndResetButtons
+        case .finishing:
+            ProgressView()
+            Text("Fin de la capture")
+                .font(.footnote)
+        }
     }
 
     @ViewBuilder
