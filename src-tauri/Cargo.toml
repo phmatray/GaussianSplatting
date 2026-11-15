@@ -21,10 +21,15 @@ tokio = { version = "1.54", features = ["signal", "time"] }
 [features]
 # Release mode: the window loads the bundled frontend (`tauri://localhost`)
 # instead of the development server, and the embedded HTTP server carries
-# its own copy of the web build for headsets on the LAN. `tauri build`
-# enables this feature by itself; with plain cargo pass
-# `--features custom-protocol`. Both need `crates/gs-app/dist` to exist.
-custom-protocol = ["tauri/custom-protocol", "gs-server/embed-dist"]
+# its own copy of the web build for headsets on the LAN. With plain cargo
+# pass `--features custom-protocol`. Both need `crates/gs-app/dist` to exist.
+custom-protocol = ["tauri/custom-protocol", "embed-dist"]
+# The embedded server's copy of the web build (headsets, share archives).
+# The Tauri 2 CLI enables `tauri/custom-protocol` only, never the feature
+# above, so `tauri.conf.json` asks for this one in `build.features`: without
+# it `cargo tauri build` shipped a server with no viewer to serve or share.
+# Harmless in `cargo tauri dev`, where the server is given the dist folder.
+embed-dist = ["gs-server/embed-dist"]
 # End-to-end checks only (`e2e/server/tauri-real.sh`): once a second the
 # shell asks the window what it shows and logs the answer. Never part of a
 # normal build.
