@@ -100,6 +100,13 @@ impl Inner {
     fn on_pointer_move(&self, e: &PointerEvent) {
         let mut pointers = self.pointers.borrow_mut();
         let Some(index) = pointers.active.iter().position(|p| p.id == e.pointer_id()) else { return };
+        // A mouse moving with no button held is hovering: its release was
+        // lost (a file dialog, a focus change took it), and the camera must
+        // not follow the hover. Touch and pen report no buttons the same way.
+        if !pointers.active[index].touch && e.pointer_type() == "mouse" && e.buttons() == 0 {
+            pointers.active.remove(index);
+            return;
+        }
         let (x, y) = (e.client_x() as f32, e.client_y() as f32);
         let before = pointers.centroid_and_spread();
         let pointer = &mut pointers.active[index];
@@ -190,6 +197,9 @@ pub(super) fn attach(inner: &Rc<Inner>) -> Result<(), JsValue> {
     listen(canvas, "pointermove", true, |i, e| i.on_pointer_move(e.unchecked_ref()))?;
     listen(canvas, "pointerup", true, |i, e| i.on_pointer_up(e.unchecked_ref()))?;
     listen(canvas, "pointercancel", true, |i, e| i.on_pointer_up(e.unchecked_ref()))?;
+    // A capture lost without a pointerup (the window lost the focus) ends
+    // the drag as well.
+    listen(canvas, "lostpointercapture", true, |i, e| i.on_pointer_up(e.unchecked_ref()))?;
     listen(canvas, "wheel", false, |i, e| i.on_wheel(e.unchecked_ref()))?;
     // Right-drag pans: no context menu on the canvas.
     listen(canvas, "contextmenu", false, |_, e| e.prevent_default())?;

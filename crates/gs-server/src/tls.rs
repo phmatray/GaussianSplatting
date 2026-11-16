@@ -92,7 +92,11 @@ pub fn fingerprint(cert_der: &[u8]) -> String {
 
 fn required_names(lan: &[Ipv4Addr]) -> Vec<String> {
     let mut names: Vec<String> = LOCAL_NAMES.iter().map(|n| n.to_string()).collect();
-    for ip in lan.iter().take(MAX_ADDRESSES) {
+    // Link-local addresses (169.254/16) come and go with a USB cable or an
+    // AWDL link, and no phone or headset on the Wi-Fi uses them. Requiring
+    // them renewed the certificate, and broke every pairing, each time an
+    // iPhone was plugged in (seen on a Mac, 2026-11-15).
+    for ip in lan.iter().filter(|ip| !ip.is_link_local()).take(MAX_ADDRESSES) {
         let name = ip.to_string();
         if !names.contains(&name) {
             names.push(name);
@@ -193,9 +197,13 @@ fn load(dir: &Path) -> Result<Identity, String> {
 /// Returns the identity to serve on the LAN listener for the addresses
 /// `lan`, and whether it was newly generated.
 ///
-/// The identity stored in `dir` is reused when it is intact, names every
-/// address in `lan` and is more than 30 days from its expiry. Otherwise a
-/// new one is generated and stored. A new certificate also keeps the
+/// The identity stored in `dir` is reused when it is intact, names the
+/// first address of `lan` (the most plausible one, the address in the QR
+/// code) and is more than 30 days from its expiry. Otherwise a new one is
+/// generated and stored, naming every current address. Requiring only the
+/// first address keeps the certificate, and every pairing pinned to it,
+/// when a secondary address comes or goes: a USB cable's link-local address,
+/// a container or VM bridge (seen on a Mac running OrbStack, 2026-11-15). A new certificate also keeps the
 /// addresses of the one it replaces (up to 16 in total), so that a laptop
 /// moving between two networks settles on one certificate instead of
 /// asking for a new acceptance at every move.
@@ -208,10 +216,11 @@ pub(crate) fn load_or_create(
     now: OffsetDateTime,
 ) -> Result<(Identity, bool), rcgen::Error> {
     let mut names = required_names(lan);
+    let primary = required_names(&lan[..lan.len().min(1)]);
     if let Some(dir) = dir {
         match load(dir) {
             Ok(stored) => {
-                let covers = names.iter().all(|name| stored.names.contains(name));
+                let covers = primary.iter().all(|name| stored.names.contains(name));
                 let fresh_enough = stored.not_after - now.unix_timestamp() > RENEW_BEFORE.whole_seconds();
                 if covers && fresh_enough {
                     return Ok((stored, false));
@@ -312,6 +321,34 @@ mod tests {
         let (third, fresh) = load_or_create(Some(dir.path()), &[ip(20)], now()).unwrap();
         assert!(!fresh);
         assert_eq!(third.fingerprint(), second.fingerprint());
+    }
+
+    /// What happened on a Mac when an iPhone was plugged in by cable.
+    #[test]
+    fn a_passing_link_local_address_keeps_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = load_or_create(Some(dir.path()), &[ip(20)], now()).unwrap();
+        let cable = Ipv4Addr::new(169, 254, 107, 197);
+        let (second, fresh) = load_or_create(Some(dir.path()), &[ip(20), cable], now()).unwrap();
+        assert!(!fresh, "a link-local address renewed the certificate");
+        assert_eq!(second.fingerprint(), first.fingerprint());
+        assert!(!second.names.contains(&cable.to_string()));
+    }
+
+    /// What happened on the same Mac when OrbStack added a bridge.
+    #[test]
+    fn a_new_secondary_address_keeps_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = load_or_create(Some(dir.path()), &[ip(20), Ipv4Addr::new(192, 168, 139, 3)], now()).unwrap();
+        let bridge = Ipv4Addr::new(192, 168, 158, 0);
+        let lan = [ip(20), Ipv4Addr::new(192, 168, 139, 3), bridge];
+        let (second, fresh) = load_or_create(Some(dir.path()), &lan, now()).unwrap();
+        assert!(!fresh, "a secondary address renewed the certificate");
+        assert_eq!(second.fingerprint(), first.fingerprint());
+        // A new first address still renews it, keeping the old names.
+        let (third, fresh) = load_or_create(Some(dir.path()), &[bridge], now()).unwrap();
+        assert!(fresh);
+        assert!(third.names.contains(&ip(20).to_string()));
     }
 
     #[test]

@@ -14,5 +14,6 @@ pub mod rate;
 pub mod refine;
 pub mod render;
 pub mod replay;
+pub mod rooms;
 pub mod share;
 pub mod source;

@@ -268,6 +268,22 @@ pub struct Ui {
     pub capture: RwSignal<Option<CaptureView>>,
     pub import: RwSignal<Option<ImportView>>,
     pub pair: RwSignal<PairView>,
+    /// Which of the two workspaces is shown.
+    pub workspace: RwSignal<Workspace>,
+    /// Key of the room open in the gallery ([`crate::logic::rooms::Room::key`]).
+    pub room: RwSignal<Option<String>>,
+    /// The version of that room on show: `capture`, `refined:<file>` or
+    /// `take:<id>`.
+    pub version: RwSignal<Option<String>>,
+    /// The version shown before it, which "Comparer" brings back.
+    pub compare: RwSignal<Option<String>>,
+}
+
+/// The live capture, or the gallery of filmed rooms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Workspace {
+    Direct,
+    Rooms,
 }
 
 impl Ui {
@@ -322,6 +338,10 @@ impl Ui {
             capture: RwSignal::new(None),
             import: RwSignal::new(None),
             pair: RwSignal::new(PairView::default()),
+            workspace: RwSignal::new(Workspace::Direct),
+            room: RwSignal::new(None),
+            version: RwSignal::new(None),
+            compare: RwSignal::new(None),
         }
     }
 

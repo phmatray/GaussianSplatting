@@ -14,7 +14,8 @@
       "script": "trunk build --release",
       "cwd": "../crates/gs-app"
     },
-    "frontendDist": "../crates/gs-app/dist"
+    "frontendDist": "../crates/gs-app/dist",
+    "features": ["embed-dist"]
   },
   "app": {
     "withGlobalTauri": true,

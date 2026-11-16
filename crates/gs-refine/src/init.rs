@@ -50,6 +50,9 @@ pub struct Fused {
     /// `y` on the way to viewers) and whether it is more than a guess.
     pub floor_y: f32,
     pub floor_known: bool,
+    /// The room's walls, behind which the fusion kept nothing; the result
+    /// is cut behind them too (training can grow splats there).
+    pub walls: Vec<gs_core::walls::Wall>,
     /// Region of interest in capture coordinates (object, person).
     pub region: Option<CaptureRegion>,
     pub frames_used: u32,
@@ -57,9 +60,16 @@ pub struct Fused {
     pub voxel_size: f32,
 }
 
+/// Splat size, in cells, of the cloud the optimisation starts from, pinned
+/// here so that a change of the live default does not move it: the
+/// optimisation learns every size itself and starts best from the tight
+/// cloud (pose registration drifted 1.6 cm from a correct view at 0.6).
+const START_KERNEL: f32 = 0.45;
+
 /// The ingest parameters of an offline fusion.
 pub fn ingest_params(mode: CaptureMode, init: &InitParams) -> IngestParams {
-    let mut params = IngestParams { max_voxels: init.max_voxels.max(1000), ..IngestParams::default() };
+    let mut params =
+        IngestParams { max_voxels: init.max_voxels.max(1000), kernel: START_KERNEL, ..IngestParams::default() };
     if init.voxel_size <= 0.0 && init.room_voxel_size > 0.0 && mode == CaptureMode::Room {
         params.room.voxel_size = init.room_voxel_size;
     }
@@ -92,5 +102,13 @@ pub fn fuse(capture: &Capture, frames: &[usize], init: &InitParams, mut progress
     }
     session.finish();
     let (floor_y, floor_known) = session.floor();
-    Ok(Some(Fused { splats: session.static_splats(), floor_y, floor_known, region: session.region(), frames_used: session.frames_used(), voxel_size }))
+    Ok(Some(Fused {
+        splats: session.static_splats(),
+        floor_y,
+        floor_known,
+        region: session.region(),
+        frames_used: session.frames_used(),
+        voxel_size,
+        walls: session.walls().to_vec(),
+    }))
 }

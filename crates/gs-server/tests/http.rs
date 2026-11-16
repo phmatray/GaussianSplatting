@@ -5,7 +5,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
 use common::*;
@@ -119,8 +119,11 @@ async fn lan_listener_opens_and_closes_on_request() {
         let lan_port = server.lan_port();
         let urls: Vec<String> =
             info["lan"]["urls"].as_array().unwrap().iter().map(|u| u.as_str().unwrap().to_string()).collect();
-        let expected: Vec<String> = gs_server::lan_ipv4().iter().map(|ip| format!("https://{ip}:{lan_port}")).collect();
-        assert_eq!(urls, expected, "one URL per LAN address, in order");
+        // Link-local addresses (169.254/16, a USB cable) are not announced:
+        // the certificate does not name them and no Wi-Fi device uses them.
+        let lan: Vec<Ipv4Addr> = gs_server::lan_ipv4().into_iter().filter(|ip| !ip.is_link_local()).collect();
+        let expected: Vec<String> = lan.iter().map(|ip| format!("https://{ip}:{lan_port}")).collect();
+        assert_eq!(urls, expected, "one URL per routable LAN address, in order");
         // The same port and certificate every time: a headset keeps its
         // bookmark and its trust.
         match &first {
@@ -136,9 +139,20 @@ async fn lan_listener_opens_and_closes_on_request() {
         let tls = server.tls();
         let lan_loopback = loopback(lan_port);
         let mut addresses = vec![lan_loopback];
-        addresses.extend(gs_server::lan_ipv4().into_iter().map(|ip| SocketAddr::new(IpAddr::V4(ip), lan_port)));
-        for addr in &addresses {
-            let stream = tls_stream(*addr, &tls, &[b"http/1.1"]).await.unwrap_or_else(|e| panic!("TLS to {addr}: {e}"));
+        addresses.extend(lan.iter().map(|ip| SocketAddr::new(IpAddr::V4(*ip), lan_port)));
+        for (i, addr) in addresses.iter().enumerate() {
+            let stream = match tls_stream(*addr, &tls, &[b"http/1.1"]).await {
+                Ok(stream) => stream,
+                // macOS refuses to connect to some of its own virtual
+                // bridges (OrbStack, Docker): the system says no before any
+                // packet leaves. Such an address is ranked last; the first
+                // LAN address, the one in the QR code, must still answer.
+                Err(e) if i >= 2 && e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    eprintln!("note: {addr} not reachable from this machine ({e}), skipped");
+                    continue;
+                }
+                Err(e) => panic!("TLS to {addr}: {e}"),
+            };
             let presented = stream.get_ref().1.peer_certificates().unwrap()[0].to_vec();
             assert_eq!(gs_server::fingerprint(&presented), fingerprint, "/api/info announces another certificate");
             let over_tls = request_on(Box::new(stream), "GET", &addr.to_string(), "/api/info", &[], &[]).await;

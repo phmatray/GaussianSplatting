@@ -109,6 +109,7 @@
 //!   within 0.1 dB instead.
 
 pub mod dataset;
+pub mod drift;
 pub mod export;
 pub mod init;
 pub mod job;

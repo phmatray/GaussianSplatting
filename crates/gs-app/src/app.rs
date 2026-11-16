@@ -9,8 +9,8 @@ use wasm_bindgen::JsCast;
 use crate::core::{self, with_core};
 use crate::dom;
 use crate::logic::replay::{SKIP_S, STEP_S};
-use crate::state::Ui;
-use crate::ui::{Overlays, Panel, ShareDialog, Timeline, TopBar};
+use crate::state::{Ui, Workspace};
+use crate::ui::{Overlays, Panel, Rooms, ShareDialog, Timeline, TopBar};
 
 /// Up to this window width the panel starts closed and is a sheet at the
 /// bottom (the same breakpoint as in `style.css`).
@@ -110,16 +110,27 @@ fn install_window_listeners(ui: Ui) {
     let _ = window_event_listener_untyped("fullscreenchange", move |_| ui.fullscreen.set(dom::is_fullscreen()));
 
     // Drag and drop of a splat file anywhere on the window.
+    // The drop target stays up while files are dragged over the window.
+    // `dragleave` cannot say when they leave it: WebKit (Safari, the macOS
+    // desktop app) gives no related target for a move between two elements,
+    // which made the target blink at every movement. `dragover` fires
+    // continuously while files are over the window; the target goes away a
+    // moment after the last one.
+    let drag_serial = StoredValue::new(0u32);
     let _ = window_event_listener(ev::dragover, move |event| {
         if dragged_files(&event) {
             event.prevent_default();
-            ui.dragging.set(true);
-        }
-    });
-    let _ = window_event_listener(ev::dragleave, move |event| {
-        // Leaving the window, not moving between two elements of the page.
-        if event.related_target().is_none() {
-            ui.dragging.set(false);
+            Ui::set_if_changed(ui.dragging, true);
+            drag_serial.update_value(|n| *n = n.wrapping_add(1));
+            let serial = drag_serial.get_value();
+            set_timeout(
+                move || {
+                    if drag_serial.get_value() == serial {
+                        ui.dragging.set(false);
+                    }
+                },
+                std::time::Duration::from_millis(250),
+            );
         }
     });
     let _ = window_event_listener(ev::drop, move |event| {
@@ -161,6 +172,8 @@ pub fn App() -> impl IntoView {
             class:panel-open=move || ui.panel_open.get() && !ui.embed.get()
             class:embed=move || ui.embed.get()
             class:replay=move || ui.replay.with(Option::is_some)
+            class:ws-rooms=move || ui.workspace.get() == Workspace::Rooms
+            class:room-open=move || ui.workspace.get() == Workspace::Rooms && ui.room.with(Option::is_some)
         >
             <div class="viewport">
                 <canvas id="view" node_ref=canvas></canvas>
@@ -168,6 +181,7 @@ pub fn App() -> impl IntoView {
             // The embedded viewer is the canvas and its small controls.
             <Show when=move || !ui.embed.get()>
                 <TopBar />
+                <Rooms />
                 <Panel />
             </Show>
             <Overlays />

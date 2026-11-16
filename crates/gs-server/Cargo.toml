@@ -53,6 +53,8 @@ percent-encoding = "2"
 crc32fast = "1"
 miniz_oxide.workspace = true
 log = { version = "0.4", features = ["std"] }
+# Turns a capture's portrait frame upright for the gallery.
+jpeg-encoder = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 # Free space of a volume (`statvfs`), to say "the disk is full" in time.
@@ -67,5 +69,3 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tempfile = "3"
 flate2 = "1"
-# The simulated phone of the gs-core tests (tests/common/phone.rs) writes JPEGs.
-jpeg-encoder = "0.7"

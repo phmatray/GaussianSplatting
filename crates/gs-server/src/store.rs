@@ -128,6 +128,10 @@ pub struct CaptureEntry {
     /// capture its phone has finished is no longer `capturing`, although
     /// its file stays held (not deletable) for as long as it is on show.
     pub capturing: bool,
+    /// Frames in the file and seconds between the first and the last, once
+    /// the file is complete (0 while a phone is still filming it).
+    pub frames: u32,
+    pub duration_s: f64,
 }
 
 /// What is kept next to a refined result (`<stem>.json`): where it comes
@@ -159,6 +163,34 @@ pub struct RefinedMeta {
     /// in the coordinates of the result, meters rounded to the millimeter).
     /// `None` for an object or a person, which are looked at from around.
     pub view: Option<[f64; 6]>,
+    /// Held-out score of the result (views kept out of training), when
+    /// the report beside it has one.
+    pub psnr: Option<f64>,
+    pub ssim: Option<f64>,
+}
+
+impl RefinedMeta {
+    /// Reads the description beside a result: the server's own (this
+    /// structure, the optimiser's report under `report`) or the bare report
+    /// the `gs-refine` command line writes (capture described by its path
+    /// and name, score under `refined`).
+    pub(crate) fn from_json(value: &serde_json::Value) -> Self {
+        let mut meta: RefinedMeta = serde_json::from_value(value.clone()).unwrap_or_default();
+        let report = value.get("report").unwrap_or(value);
+        if let Some(capture) = value.get("capture").filter(|c| c.is_object()) {
+            let text = |key: &str| capture.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            meta.capture = Path::new(&text("path")).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+            meta.title = text("name");
+            meta.mode = text("mode");
+            meta.gaussians = value.get("gaussians").and_then(|v| v.as_u64()).unwrap_or_default();
+            meta.iterations = value.get("result_iteration").and_then(|v| v.as_u64()).unwrap_or_default() as u32;
+            meta.elapsed_s = value.get("wall_s").and_then(|v| v.as_f64()).unwrap_or_default();
+        }
+        let score = report.get("refined");
+        meta.psnr = score.and_then(|s| s.get("psnr")).and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+        meta.ssim = score.and_then(|s| s.get("ssim")).and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+        meta
+    }
 }
 
 /// One refined result as `GET /api/refined` lists it.
@@ -235,6 +267,9 @@ pub(crate) struct Store {
     /// Those of the busy files that are complete on disk for now and may be
     /// read ([`Hold::set_settled`]).
     settled: Mutex<HashSet<(Kind, String)>>,
+    /// Frames and duration of complete captures, by file name and size:
+    /// counting reads the whole file, once.
+    capture_lengths: Mutex<std::collections::HashMap<(String, u64), (u32, f64)>>,
 }
 
 /// A file of the store that is being written. While this exists the file
@@ -384,6 +419,54 @@ fn capture_header(prefix: &[u8]) -> Option<GscapHeader> {
     }
 }
 
+/// Frames of a `.gscap` and the seconds from the first to the last.
+fn count_frames(path: &Path) -> Option<(u32, f64)> {
+    use gs_core::ingest::{FrameHeader, GscapParser, ParsedItem};
+    let mut reader = File::open(path).ok()?;
+    let mut parser = GscapParser::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    let (mut frames, mut first, mut last) = (0u32, None::<f64>, 0.0f64);
+    loop {
+        loop {
+            match parser.next_item() {
+                Ok(Some(ParsedItem::Frame(bytes))) => {
+                    if let Ok(header) = FrameHeader::parse(bytes) {
+                        frames += 1;
+                        first.get_or_insert(header.timestamp);
+                        last = header.timestamp;
+                    }
+                }
+                Ok(Some(ParsedItem::Header(_))) => {}
+                Ok(None) => break,
+                Err(_) => return Some((frames, (last - first.unwrap_or(last)).max(0.0))),
+            }
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => return Some((frames, (last - first.unwrap_or(last)).max(0.0))),
+            Ok(read) => parser.push(&chunk[..read]),
+        }
+    }
+}
+
+/// A colour frame as the phone was held: portrait frames are stored in the
+/// sensor's landscape and turned a quarter, upside-down ones a half.
+fn turn_upright(jpeg: &[u8], orientation: gs_core::ingest::Orientation) -> Option<Vec<u8>> {
+    use gs_core::ingest::Orientation;
+    let image = gs_core::ingest::image::decode_jpeg(jpeg, 640, 480).ok()?;
+    let (w, h) = (image.width as usize, image.height as usize);
+    let at = |x: usize, y: usize| &image.rgb[(y * w + x) * 3..(y * w + x) * 3 + 3];
+    let (out_w, out_h, pixels): (usize, usize, Vec<u8>) = match orientation {
+        Orientation::LandscapeNative => return None,
+        // Turned clockwise: the output row y is the input column y.
+        Orientation::Portrait => (h, w, (0..w).flat_map(|y| (0..h).flat_map(move |x| at(y, h - 1 - x).to_vec())).collect()),
+        Orientation::PortraitUpsideDown => (h, w, (0..w).flat_map(|y| (0..h).flat_map(move |x| at(w - 1 - y, x).to_vec())).collect()),
+        Orientation::LandscapeFlipped => (w, h, (0..h).flat_map(|y| (0..w).flat_map(move |x| at(w - 1 - x, h - 1 - y).to_vec())).collect()),
+    };
+    let mut out = Vec::new();
+    jpeg_encoder::Encoder::new(&mut out, 82).encode(&pixels, out_w as u16, out_h as u16, jpeg_encoder::ColorType::Rgb).ok()?;
+    Some(out)
+}
+
 impl Store {
     /// `captures` defaults to a directory `captures` next to `recordings`.
     pub fn new(recordings: Option<PathBuf>, captures: Option<PathBuf>) -> Self {
@@ -399,6 +482,7 @@ impl Store {
             problem: Mutex::new(None),
             busy: Mutex::new(HashSet::new()),
             settled: Mutex::new(HashSet::new()),
+            capture_lengths: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -632,10 +716,11 @@ impl Store {
     fn refined_entry(&self, file: &str, path: &Path, meta: &fs::Metadata) -> RefinedEntry {
         let described = path.with_extension(&REFINED_META_EXT[1..]);
         let small = fs::symlink_metadata(&described).is_ok_and(|m| m.is_file() && m.len() <= MAX_REFINED_META);
-        let mut info: RefinedMeta = small
+        let mut info = small
             .then(|| fs::read(&described).ok())
             .flatten()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map(|value| RefinedMeta::from_json(&value))
             .unwrap_or_default();
         let name = file.strip_suffix(REFINED_EXT).unwrap_or(file).to_string();
         if info.title.is_empty() {
@@ -658,6 +743,68 @@ impl Store {
         Some(self.refined_entry(file, &path, &meta))
     }
 
+    /// A photograph of a capture to show it by: the colour image of a frame
+    /// a few seconds in (the first ones often point at the floor), or of
+    /// the last frame of a shorter capture. Reads the file up to that frame.
+    pub fn capture_photo(&self, file: &str) -> Option<Vec<u8>> {
+        use gs_core::ingest::{decode_frame, GscapParser, Orientation, ParsedItem};
+        // Frames held in native landscape are stored upright and served as
+        // they are; a capture filmed only otherwise gets its frame turned.
+        // ponytail: fixed frame; pick by sharpness if thumbnails disappoint.
+        const PHOTO_FRAME: usize = 120;
+        let mut reader = File::open(self.existing(Kind::Capture, file)?).ok()?;
+        let mut parser = GscapParser::new();
+        let (mut chunk, mut seen, mut turned) = (vec![0u8; 1 << 20], 0usize, 0usize);
+        let mut fallback: Option<(Vec<u8>, Orientation)> = None;
+        let mut upright: Option<Vec<u8>> = None;
+        'read: loop {
+            loop {
+                match parser.next_item() {
+                    Ok(Some(ParsedItem::Frame(bytes))) => {
+                        let Ok(frame) = decode_frame(bytes) else { continue };
+                        if frame.color.is_empty() {
+                            continue;
+                        }
+                        if frame.orientation == Orientation::LandscapeNative {
+                            upright = Some(frame.color);
+                            seen += 1;
+                            if seen > PHOTO_FRAME {
+                                break 'read;
+                            }
+                        } else if upright.is_none() && turned <= PHOTO_FRAME {
+                            fallback = Some((frame.color, frame.orientation));
+                            turned += 1;
+                        }
+                    }
+                    Ok(Some(ParsedItem::Header(_))) => {}
+                    Ok(None) => break,
+                    Err(_) => break 'read,
+                }
+            }
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => parser.push(&chunk[..read]),
+            }
+        }
+        if upright.is_some() {
+            return upright;
+        }
+        let (jpeg, orientation) = fallback?;
+        Some(turn_upright(&jpeg, orientation).unwrap_or(jpeg))
+    }
+
+    /// Frames of a complete capture and the seconds they span, read once
+    /// per file and size (frame headers only, no image is decoded).
+    fn capture_length(&self, file: &str, path: &Path, size: u64) -> (u32, f64) {
+        let key = (file.to_string(), size);
+        if let Some(known) = self.capture_lengths.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return *known;
+        }
+        let length = count_frames(path).unwrap_or((0, 0.0));
+        self.capture_lengths.lock().unwrap_or_else(|e| e.into_inner()).insert(key, length);
+        length
+    }
+
     /// Every raw capture of the directory, newest first.
     pub fn list_captures(&self) -> Vec<CaptureEntry> {
         self.files(Kind::Capture)
@@ -665,6 +812,8 @@ impl Store {
             .map(|(file, path, meta)| {
                 let header = read_prefix(&path).ok().and_then(|prefix| capture_header(&prefix)).unwrap_or_default();
                 let name = file.strip_suffix(CAPTURE_EXT).unwrap_or(&file).to_string();
+                let capturing = self.is_growing(Kind::Capture, &file);
+                let (frames, duration_s) = if capturing { (0, 0.0) } else { self.capture_length(&file, &path, meta.len()) };
                 CaptureEntry {
                     title: if header.name.is_empty() { name.clone() } else { header.name },
                     name,
@@ -673,7 +822,9 @@ impl Store {
                     created: header.created,
                     size: meta.len(),
                     url: url_of(Kind::Capture, &file),
-                    capturing: self.is_growing(Kind::Capture, &file),
+                    capturing,
+                    frames,
+                    duration_s,
                     file,
                 }
             })

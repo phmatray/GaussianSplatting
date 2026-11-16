@@ -158,6 +158,7 @@ pub(crate) fn router(core: Arc<Core>, listener: Listener, stop: watch::Receiver<
         .route(INGEST_PATH, get(ingest::upgrade))
         .route("/recordings/{file}", get(api::recording_file).delete(api::delete_recording))
         .route("/captures/{file}", get(api::capture_file).delete(api::delete_capture))
+        .route("/captures/{file}/photo", get(api::capture_photo))
         .route("/refined/{file}", get(api::refined_file).delete(api::delete_refined))
         .route("/api/share/refined/{file}", get(api::refined_share_zip))
         .route("/api/share/{file}", get(api::share_zip));

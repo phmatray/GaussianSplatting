@@ -496,6 +496,8 @@ impl Refiner {
             elapsed_s: report.wall_s,
             beyond_sensor,
             view: view.filter(|view| view.iter().all(|c| c.is_finite())),
+            psnr: report.refined.as_ref().map(|s| f64::from(s.psnr)).filter(|v| v.is_finite()),
+            ssim: report.refined.as_ref().map(|s| f64::from(s.ssim)).filter(|v| v.is_finite()),
         };
         match self.write_result(&format!("{stem}-{}", preset.name()), &gs_core::io::write_ply(&splats), &meta, &report) {
             Ok(entry) => Ended::Refined { entry, iterations: outcome.iterations_done },

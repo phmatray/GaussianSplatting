@@ -1,0 +1,529 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-16T00:20:34+00:00",
+  "title": "Design System: Splat Live (web and desktop interface)",
+  "extensions": {
+    "colorMeta": {
+      "night-ground": {
+        "role": "neutral",
+        "displayName": "Night Ground",
+        "canonical": "oklch(15.9% 0.014 264.1)",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#23252a",
+          "#3f4249",
+          "#5d6169",
+          "#7e828b",
+          "#a1a5ae",
+          "#c5c9d2",
+          "#ebeff5"
+        ]
+      },
+      "night-glass": {
+        "role": "neutral",
+        "displayName": "Night Glass",
+        "canonical": "rgba(15, 19, 28, 0.84)",
+        "tonalRamp": [
+          "#090b10",
+          "#22252c",
+          "#3d424c",
+          "#5c616d",
+          "#7d828e",
+          "#9fa5b2",
+          "#c4c9d5",
+          "#eaeef8"
+        ]
+      },
+      "night-glass-strong": {
+        "role": "neutral",
+        "displayName": "Night Glass Strong",
+        "canonical": "rgba(12, 15, 23, 0.94)",
+        "tonalRamp": [
+          "#090b0f",
+          "#22252c",
+          "#3e424b",
+          "#5d616c",
+          "#7e828d",
+          "#a0a5b0",
+          "#c5c9d4",
+          "#ebeef7"
+        ]
+      },
+      "dialog-slate": {
+        "role": "neutral",
+        "displayName": "Dialog Slate",
+        "canonical": "oklch(19.2% 0.019 266.0)",
+        "tonalRamp": [
+          "#090b10",
+          "#22252c",
+          "#3d424c",
+          "#5c616d",
+          "#7d828e",
+          "#9fa5b2",
+          "#c4c9d5",
+          "#eaeef8"
+        ]
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "rgba(255, 255, 255, 0.09)",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "hairline-strong": {
+        "role": "neutral",
+        "displayName": "Hairline Strong",
+        "canonical": "rgba(255, 255, 255, 0.16)",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "control-wash": {
+        "role": "neutral",
+        "displayName": "Control Wash",
+        "canonical": "rgba(255, 255, 255, 0.06)",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "control-wash-hover": {
+        "role": "neutral",
+        "displayName": "Control Wash Hover",
+        "canonical": "rgba(255, 255, 255, 0.11)",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "moonlit-text": {
+        "role": "neutral",
+        "displayName": "Moonlit Text",
+        "canonical": "oklch(94.0% 0.010 267.4)",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#232529",
+          "#404247",
+          "#5f6167",
+          "#808288",
+          "#a2a5ab",
+          "#c6c9cf",
+          "#eceef3"
+        ]
+      },
+      "slate-muted": {
+        "role": "neutral",
+        "displayName": "Slate Muted",
+        "canonical": "oklch(71.1% 0.031 264.4)",
+        "tonalRamp": [
+          "#080b13",
+          "#1f2531",
+          "#3a4252",
+          "#586174",
+          "#798396",
+          "#9ba5b9",
+          "#c0c9dc",
+          "#e7effe"
+        ]
+      },
+      "slate-faint": {
+        "role": "neutral",
+        "displayName": "Slate Faint",
+        "canonical": "oklch(55.9% 0.034 267.0)",
+        "tonalRamp": [
+          "#080b13",
+          "#1f2532",
+          "#3a4253",
+          "#586175",
+          "#798298",
+          "#9ba5bb",
+          "#c0c9de",
+          "#e7eeff"
+        ]
+      },
+      "signal-sky": {
+        "role": "primary",
+        "displayName": "Signal Sky",
+        "canonical": "oklch(79.1% 0.126 233.7)",
+        "tonalRamp": [
+          "#000d23",
+          "#002a4a",
+          "#004976",
+          "#006b9d",
+          "#048dc1",
+          "#42b1e7",
+          "#77d6ff",
+          "#b1f9ff"
+        ]
+      },
+      "periwinkle-tail": {
+        "role": "primary",
+        "displayName": "Periwinkle Tail",
+        "canonical": "oklch(76.3% 0.122 257.1)",
+        "tonalRamp": [
+          "#000926",
+          "#022350",
+          "#13407d",
+          "#2f61a5",
+          "#5083ca",
+          "#72a7f1",
+          "#9bccff",
+          "#caf1ff"
+        ]
+      },
+      "sky-ink": {
+        "role": "primary",
+        "displayName": "Sky Ink",
+        "canonical": "oklch(17.6% 0.028 244.2)",
+        "tonalRamp": [
+          "#060c11",
+          "#1d262e",
+          "#37444f",
+          "#546370",
+          "#758592",
+          "#97a7b5",
+          "#bccbd9",
+          "#e4f0fb"
+        ]
+      },
+      "splat-violet": {
+        "role": "secondary",
+        "displayName": "Splat Violet",
+        "canonical": "oklch(70.9% 0.159 293.5)",
+        "tonalRamp": [
+          "#0f002b",
+          "#2b1057",
+          "#492987",
+          "#6849b1",
+          "#896bd7",
+          "#ab8ffe",
+          "#ceb6ff",
+          "#f2e0ff"
+        ]
+      },
+      "score-green": {
+        "role": "tertiary",
+        "displayName": "Score Green",
+        "canonical": "oklch(77.3% 0.153 163.2)",
+        "tonalRamp": [
+          "#001402",
+          "#003414",
+          "#00572b",
+          "#007a47",
+          "#009e67",
+          "#0ec289",
+          "#64e5af",
+          "#a7ffda"
+        ]
+      },
+      "caution-amber": {
+        "role": "status",
+        "displayName": "Caution Amber",
+        "canonical": "oklch(83.7% 0.164 84.4)",
+        "tonalRamp": [
+          "#1c0400",
+          "#3f1a00",
+          "#663500",
+          "#8b5400",
+          "#af7600",
+          "#d49a00",
+          "#f6c043",
+          "#ffe88f"
+        ]
+      },
+      "alarm-coral": {
+        "role": "status",
+        "displayName": "Alarm Coral",
+        "canonical": "oklch(71.1% 0.166 22.2)",
+        "tonalRamp": [
+          "#260000",
+          "#520005",
+          "#810017",
+          "#ac2933",
+          "#d35053",
+          "#fc7474",
+          "#ff9f9c",
+          "#ffcfca"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Workspace page title, one per screen."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Brand name, modal titles; 16px in the room info card."
+      },
+      "title-card": {
+        "displayName": "Title Card",
+        "purpose": "Room card and orphan row titles."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Base text; controls at 550."
+      },
+      "meta": {
+        "displayName": "Meta",
+        "purpose": "Facts lines under titles, hints."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Uppercase heading of a card group or panel section; never an eyebrow over another heading."
+      },
+      "score": {
+        "displayName": "Score",
+        "purpose": "dB quality score on version cards, tabular, Score Green."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "URLs, tokens, fingerprints."
+      }
+    },
+    "shadows": [
+      {
+        "name": "panel-float",
+        "value": "0 18px 50px rgba(0, 0, 0, 0.45)",
+        "purpose": "Settings panel; refine form at 0.5."
+      },
+      {
+        "name": "pill-float",
+        "value": "0 10px 30px rgba(0, 0, 0, 0.4)",
+        "purpose": "Centred notice pill."
+      },
+      {
+        "name": "modal",
+        "value": "0 30px 80px rgba(0, 0, 0, 0.6)",
+        "purpose": "Dialog card over a 66 % night scrim."
+      },
+      {
+        "name": "card-lift",
+        "value": "0 14px 34px rgba(0, 0, 0, 0.45)",
+        "purpose": "Room card hover, with translateY(-2px)."
+      },
+      {
+        "name": "selection-ring",
+        "value": "0 0 0 1px rgba(92, 200, 255, 0.35)",
+        "purpose": "Doubles the selected version's sky border."
+      },
+      {
+        "name": "status-halo",
+        "value": "0 0 0 3px rgba(52, 211, 153, 0.18)",
+        "purpose": "Connection dot halo; status colour at 18 %."
+      }
+    ],
+    "blur": [
+      {
+        "name": "glass",
+        "value": "blur(14px)",
+        "purpose": "Tabs, badges, icon buttons, info card."
+      },
+      {
+        "name": "panel",
+        "value": "blur(18px) saturate(1.2)",
+        "purpose": "Settings panel."
+      },
+      {
+        "name": "scrim",
+        "value": "blur(4px)",
+        "purpose": "Modal backdrop."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state",
+        "value": "0.15s",
+        "purpose": "Background, border and colour changes on controls."
+      },
+      {
+        "name": "card-lift",
+        "value": "0.18s cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Room card hover lift."
+      },
+      {
+        "name": "panel-slide",
+        "value": "0.22s ease",
+        "purpose": "Settings panel slide and the reflow of tools and strip."
+      },
+      {
+        "name": "pulse",
+        "value": "0.9s ease-in-out infinite (opacity 0.6)",
+        "purpose": "Pending mode, connecting dot, loading version."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "prefers-reduced-motion: reduce",
+        "purpose": "Animations disabled."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "compact",
+        "value": "760px"
+      },
+      {
+        "name": "narrow",
+        "value": "920px"
+      },
+      {
+        "name": "medium",
+        "value": "1080px"
+      },
+      {
+        "name": "tiny",
+        "value": "380px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Button",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Ordinary action: Control Wash fill, hairline border, 8px corners.",
+      "html": "<button class=\"ds-btn\"><svg class=\"ds-icon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 15.5V4.5M7.5 9l4.5-4.5 4.5 4.5M5 20h14\"/></svg> Importer un .gscap</button>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-icon{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-btn{display:inline-flex;align-items:center;gap:8px;min-height:36px;padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--control);color:var(--text);font:inherit;font-weight:550;cursor:pointer;transition:background .15s,border-color .15s}.ds-btn:hover{background:var(--control-hover);border-color:var(--line-strong)}.ds-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one primary action of a view: sky-to-periwinkle gradient, sky ink text.",
+      "html": "<button class=\"ds-btn-primary\">Comparer</button>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-btn-primary{display:inline-flex;align-items:center;gap:8px;min-height:36px;padding:7px 12px;border:1px solid transparent;border-radius:8px;background:linear-gradient(135deg,var(--accent) 0%,#7fb4ff 100%);color:var(--accent-ink);font:inherit;font-weight:550;cursor:pointer}.ds-btn-primary:hover{background:linear-gradient(135deg,#7dd4ff 0%,#9cc5ff 100%)}.ds-btn-primary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": "icon-button",
+      "description": "36px glass circle for secondary tools (download, share, delete).",
+      "html": "<button class=\"ds-icon-btn\" aria-label=\"Télécharger\"><svg class=\"ds-icon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 4v11M7.5 11l4.5 4.5 4.5-4.5M5 20h14\"/></svg></button>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-icon{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid var(--line);border-radius:50%;background:var(--glass);backdrop-filter:blur(14px);color:var(--text);cursor:pointer;transition:background .15s,border-color .15s}.ds-icon-btn .ds-icon{width:18px;height:18px}.ds-icon-btn:hover{background:var(--control-hover);border-color:var(--line-strong)}.ds-icon-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}"
+    },
+    {
+      "name": "Workspace Tabs",
+      "kind": "nav",
+      "refersTo": "workspace-tab",
+      "description": "Direct | Pièces segmented switch in the top bar; active tab gets a 14 % sky wash.",
+      "html": "<nav class=\"ds-ws\"><button class=\"ds-ws-tab\"><svg class=\"ds-icon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 3.5a8.5 8.5 0 1 0 0 17a8.5 8.5 0 0 0 0-17zM12 9a3 3 0 1 0 0 6a3 3 0 0 0 0-6z\"/></svg>Direct</button><button class=\"ds-ws-tab ds-on\" aria-current=\"page\"><svg class=\"ds-icon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M12 4l8 4-8 4-8-4zM4 12l8 4 8-4M4 16l8 4 8-4\"/></svg>Pièces</button></nav>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-icon{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-ws{display:inline-flex;gap:2px;padding:3px;border-radius:10px;background:var(--glass);border:1px solid var(--line)}.ds-ws-tab{display:flex;align-items:center;gap:7px;padding:6px 13px;border:0;border-radius:8px;background:transparent;color:var(--muted);font:inherit;font-weight:550;cursor:pointer;transition:background .15s,color .15s}.ds-ws-tab:hover{color:var(--text)}.ds-ws-tab.ds-on{background:rgba(92,200,255,.14);color:var(--text)}.ds-ws-tab.ds-on .ds-icon{color:var(--accent)}.ds-ws-tab:focus-visible{outline:2px solid var(--accent);outline-offset:2px}"
+    },
+    {
+      "name": "Status Badge",
+      "kind": "chip",
+      "refersTo": "status-badge",
+      "description": "Glass pill with a haloed connection dot and the server name.",
+      "html": "<span class=\"ds-badge\"><i class=\"ds-dot\"></i>Serveur natif</span>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;background:var(--glass);border:1px solid var(--line);font-size:13px}.ds-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,.18)}"
+    },
+    {
+      "name": "Room Card",
+      "kind": "card",
+      "refersTo": "room-card",
+      "description": "Gallery card led by a 4:3 capture photograph; title, facts, best score in green.",
+      "html": "<button class=\"ds-room\"><span class=\"ds-room-photo\"><span class=\"ds-room-initial\">C</span></span><span class=\"ds-room-title\">Capture 2026-11-15 20h12m24</span><span class=\"ds-room-meta\">Pièce · 135 Mo · 5 versions</span><span class=\"ds-room-score\">26,1 dB</span></button>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-room{display:flex;flex-direction:column;width:280px;padding:0;overflow:hidden;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.03);color:var(--text);font:inherit;text-align:left;cursor:pointer;transition:border-color .18s,transform .18s cubic-bezier(.16,1,.3,1),box-shadow .18s}.ds-room:hover{border-color:rgba(92,200,255,.45);transform:translateY(-2px);box-shadow:0 14px 34px rgba(0,0,0,.45)}.ds-room:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.ds-room-photo{display:grid;place-items:center;aspect-ratio:4/3;background:radial-gradient(ellipse at 40% 45%,#1f2a3d 0%,#10141d 70%)}.ds-room-initial{font-size:54px;font-weight:650;color:rgba(255,255,255,.16)}.ds-room-title{padding:12px 14px 0;font-size:15px;font-weight:600}.ds-room-meta{padding:2px 14px 0;color:var(--muted);font-size:12.5px}.ds-room-score{padding:8px 14px 13px;color:var(--ok);font-weight:650;font-variant-numeric:tabular-nums}"
+    },
+    {
+      "name": "Version Strip",
+      "kind": "custom",
+      "refersTo": "version-card",
+      "description": "Signature: the room's versions; selected = sky outline and wash, comparison target = dashed violet, add slot = dashed hairline.",
+      "html": "<div class=\"ds-strip\"><h3>Versions de cette pièce</h3><ul><li class=\"ds-v ds-capture\"><button><b>Capture brute</b><span>Fusion en direct · 135 Mo</span></button></li><li class=\"ds-v ds-other\"><button><b>salon-1039-standard-poses</b><span>2,0 M gaussiennes · 22 min 38</span><em>24,1 dB</em></button></li><li class=\"ds-v ds-on\"><button aria-pressed=\"true\"><b>salon-1039-standard</b><span>2,0 M gaussiennes · 11 min 22</span><em>26,1 dB · meilleure</em></button></li><li class=\"ds-v ds-add\"><button>+ Nouvel affinage</button></li></ul></div>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-strip{padding:12px 16px 14px;background:#0a0d13}.ds-strip h3{margin:0 0 10px;font-size:12px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}.ds-strip ul{display:flex;gap:12px;margin:0;padding:0;list-style:none;overflow-x:auto}.ds-v{flex:none;width:236px}.ds-v button{display:flex;flex-direction:column;align-items:flex-start;gap:3px;width:100%;min-height:104px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.035);color:var(--text);font:inherit;text-align:left;cursor:pointer;transition:border-color .15s,background .15s}.ds-v button:hover{border-color:var(--line-strong);background:rgba(255,255,255,.06)}.ds-v button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.ds-v b{font-weight:600}.ds-v span{color:var(--muted);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}.ds-v em{margin-top:auto;font-style:normal;color:var(--ok);font-size:18px;font-weight:650;font-variant-numeric:tabular-nums}.ds-capture b::before{content:'';display:inline-block;width:7px;height:7px;margin-right:7px;border-radius:50%;background:var(--faint)}.ds-on button{border-color:rgba(92,200,255,.7);background:rgba(92,200,255,.09);box-shadow:0 0 0 1px rgba(92,200,255,.35)}.ds-other button{border-color:rgba(167,139,250,.6);border-style:dashed}.ds-add button{align-items:center;justify-content:center;border-style:dashed;color:var(--muted)}.ds-add button:hover{color:var(--text)}"
+    },
+    {
+      "name": "Glass Info Card",
+      "kind": "card",
+      "refersTo": "glass-card",
+      "description": "Floating card over the 3D view: Night Glass, blur, hairline, 12px corners.",
+      "html": "<div class=\"ds-glass\"><h2>Capture 2026-11-15 20h12m24</h2><p>Pièce · 135 Mo · iPhone 15 Pro Max</p></div>",
+      "css": ":host{--bg:#0a0d13;--glass:rgba(15,19,28,.84);--line:rgba(255,255,255,.09);--line-strong:rgba(255,255,255,.16);--text:#e8ebf2;--muted:#98a2b6;--faint:#6b7489;--accent:#5cc8ff;--accent-2:#a78bfa;--accent-ink:#06121c;--ok:#34d399;--control:rgba(255,255,255,.06);--control-hover:rgba(255,255,255,.11);font-family:\"Inter\", \"Segoe UI\", system-ui, -apple-system, sans-serif;font-size:14px;color:var(--text)}.ds-glass{max-width:360px;padding:12px 14px;border-radius:12px;background:var(--glass);border:1px solid var(--line);backdrop-filter:blur(14px)}.ds-glass h2{margin:0;font-size:16px;font-weight:650}.ds-glass p{margin:2px 0 0;color:var(--muted);font-size:12.5px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Night Gallery",
+    "overview": "**Creative North Star: \"The Night Gallery\"**\n\nThe interface is a set of dark glass cards floating over the reconstruction itself: the full-window 3D canvas is always the ground, and every control sits above it on translucent night panels with a hairline edge. Nothing competes with the splats. Colour comes from three sources only: the sky-blue signal of what is selected or primary, the green of a quality score, and the photographs and splats of the rooms themselves.\n\nThe interface has two workspaces, Direct (live capture) and Pièces (the archive). The archive is a gallery of filmed rooms, each card led by a real photograph from the capture. An opened room puts its 3D view first, with a small info card at top left, its actions at top right, and a strip of its versions along the bottom edge. Density is moderate and technical: dB scores, megabytes, gaussian counts and durations are shown as they are, in tabular figures. All UI text is French.",
+    "keyCharacteristics": [
+      "Full-window 3D canvas under everything; UI floats on glass (`backdrop-filter: blur(14px)` to `blur(18px)`).",
+      "Hairline borders at 9 % white, raised to 16 % on hover and on strong surfaces.",
+      "One signal colour (sky) for selection and the primary action, green reserved for scores.",
+      "Real capture photographs on room cards; an initial letter placeholder only when the photo fails.",
+      "Inter-first system stack with intermediate weights (550, 650).",
+      "One responsive breakpoint at 760 px."
+    ],
+    "rules": [
+      {
+        "name": "The One Signal Rule",
+        "body": "Signal Sky means \"this one\": the selected version, the active tab, focus, the primary action. Never use it for decoration or for a second, competing emphasis on the same screen.",
+        "section": "colors"
+      },
+      {
+        "name": "The Green Means Quality Rule",
+        "body": "Score Green is reserved for measured quality and healthy connection. A missing score is shown in Slate Faint (\"pas encore affinée\", \"sans score\"), never in green.",
+        "section": "colors"
+      },
+      {
+        "name": "The Violet Is Identity Rule",
+        "body": "Violet marks the brand, recordings, WebXR readiness and the comparison target. It never fills a primary action and never marks the selection.",
+        "section": "colors"
+      },
+      {
+        "name": "The Weight Not Size Rule",
+        "body": "Hierarchy inside cards comes from weight and colour (600 title, muted meta, green score), not from a larger size.",
+        "section": "typography"
+      },
+      {
+        "name": "The Glass Over Scene Rule",
+        "body": "Anything that floats over the 3D view is Night Glass with a blur and a hairline. Opaque surfaces are only the gallery sheet and the modal.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** keep the 3D canvas full-window under every surface and float controls on Night Glass with blur and a hairline.",
+      "**Do** mark the selected item with a sky border, a 9 % sky wash and the 1px sky ring, and the comparison target with a dashed violet border.",
+      "**Do** show quality as a dB figure in Score Green with tabular numerals, and the absence of a score in Slate Faint text.",
+      "**Do** lead every room card with a real photograph taken from the capture, at 4:3.",
+      "**Do** write all interface text in French and keep the technical facts (Mo, M gaussiennes, min, dB) as they are.",
+      "**Do** draw icons as inline 24×24 line SVGs with a round 1.8px stroke in `currentColor`.",
+      "**Do** collapse to the 760px layout: icon-only tabs, a taller strip, tools above the strip."
+    ],
+    "donts": [
+      "**Don't** fill a primary action or mark a selection with violet; violet is identity, recordings, WebXR readiness and the comparison target.",
+      "**Don't** use green for anything but measured quality or a healthy connection.",
+      "**Don't** put a solid opaque bar or panel over the 3D view; only the gallery sheet and the modal are opaque.",
+      "**Don't** add a stock or generated image to a room card; when the capture photo is missing, show the initial letter.",
+      "**Don't** put an uppercase label above another heading as an eyebrow; a label is the only heading of its group.",
+      "**Don't** apply this system to the iPhone app (`ios/SplatCapture`)."
+    ]
+  }
+}

@@ -46,6 +46,9 @@ targets:
         PRODUCT_NAME: SplatCapture
         INFOPLIST_FILE: Support/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
+        # App/Assets.xcassets: the icon of the desktop app, full bleed and
+        # opaque (iOS draws its own rounded mask).
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1,2"
 
 schemes:

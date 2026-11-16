@@ -152,6 +152,11 @@ pub struct CaptureSession {
     auto_region: Option<CaptureRegion>,
     floor: Floor,
     ceiling: Option<f32>,
+    /// Splats the end of the capture dropped as behind a wall.
+    walls_cut: usize,
+    /// The walls the end of a room capture found (top down, so the same in
+    /// capture and viewer coordinates).
+    walls: Vec<crate::walls::Wall>,
     /// A person mask has been seen: frames without one show nobody.
     mask_seen: bool,
     /// Highest frame index taken so far (see [`CaptureSession::restart`]).
@@ -221,6 +226,7 @@ impl CaptureSession {
         let mut fusion = VoxelFusion::new(mode.voxel_size);
         fusion.max_range = mode.far;
         fusion.radius_factor = params.kernel;
+        fusion.max_stretch = params.slope_stretch;
         fusion.max_voxels = params.max_voxels;
         fusion.blend_frames = params.blend_frames;
         fusion.exposure_compensation = params.exposure_compensation;
@@ -234,6 +240,8 @@ impl CaptureSession {
             auto_region: None,
             floor: Floor::default(),
             ceiling: None,
+            walls_cut: 0,
+            walls: Vec::new(),
             mask_seen: false,
             last_index: None,
             region_is_recent: false,
@@ -353,6 +361,16 @@ impl CaptureSession {
     /// every `y` on the way to viewers), and whether it is more than a guess.
     pub fn floor(&self) -> (f32, bool) {
         (self.floor.y(), self.floor.known())
+    }
+
+    /// Splats the end of a room capture dropped as behind a wall.
+    pub fn walls_cut(&self) -> usize {
+        self.walls_cut
+    }
+
+    /// The walls the end of a room capture cut behind (empty otherwise).
+    pub fn walls(&self) -> &[crate::walls::Wall] {
+        &self.walls
     }
 
     /// The region of interest in effect, in capture coordinates.
@@ -1066,6 +1084,7 @@ impl CaptureSession {
                 self.merge_layers();
                 self.drop_specks();
                 self.estimate_levels();
+                self.cut_behind_walls();
                 self.bounds = Aabb::from_points(self.fusion.splats().iter().map(Splat::position).chain(self.path.iter().copied()));
             }
             reply.to_viewers.push(self.encode_state());
@@ -1081,6 +1100,27 @@ impl CaptureSession {
 }
 
 impl CaptureSession {
+    /// At the end of a room capture: drops what stands behind the room's
+    /// walls (reflections in mirrors and windows, the room next door).
+    fn cut_behind_walls(&mut self) {
+        if self.mode() != CaptureMode::Room || !self.params.cut_behind_walls || self.fusion.is_empty() {
+            return;
+        }
+        let walls = crate::walls::find_walls(self.fusion.splats(), self.floor.y(), self.ceiling, &self.path);
+        if walls.is_empty() {
+            return;
+        }
+        let behind = crate::walls::behind_walls(self.fusion.splats(), &walls);
+        let mut index = 0;
+        let removed = self.fusion.retain(|_, _| {
+            let keep = !behind[index];
+            index += 1;
+            keep
+        });
+        self.walls_cut = removed;
+        self.walls = walls;
+    }
+
     /// The final pass over the fused cloud: drops the cells that fewer than
     /// [`IngestParams::min_frames`] frames built and that stand alone, with
     /// fewer than three occupied cells among the 26 around them. That is

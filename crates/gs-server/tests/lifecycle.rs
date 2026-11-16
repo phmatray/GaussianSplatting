@@ -19,7 +19,7 @@ fn alive_tasks() -> usize {
 }
 
 fn open_files() -> usize {
-    std::fs::read_dir("/proc/self/fd").map_or(0, |dir| dir.count())
+    std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count())
 }
 
 /// A WebSocket handshake written by hand, on a socket the test then

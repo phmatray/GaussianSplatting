@@ -3,7 +3,6 @@
 use leptos::prelude::*;
 
 use super::phone::PhoneSection;
-use super::refine::CapturesSection;
 use super::sections::{CamerasSection, CaptureSection, DisplaySection, FileSection, StatsSection, VrSection};
 use super::takes::RecordSection;
 use crate::state::use_ui;
@@ -21,7 +20,6 @@ pub fn Panel() -> impl IntoView {
                 <StatsSection />
                 <VrSection />
                 <PhoneSection />
-                <CapturesSection />
                 <FileSection />
                 <p class="panel-foot">"Raccourcis\u{a0}: H masque l'interface, P met en pause, R enregistre."</p>
             </div>

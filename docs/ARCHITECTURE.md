@@ -237,8 +237,12 @@ CORS on the loopback listener allows only those Tauri origins; control text
 frames are capped at `pipeline::MAX_CONTROL_JSON`. A connection that sends no
 complete request within 15 s is closed (`POST /api/lan` answers 408). While
 LAN is on, `lan.urls` and `lan.fingerprint` follow the machine's addresses
-(checked every 5 s; the certificate is renewed if it does not name the new
-address). The LAN listener has no authentication: anyone on the network can
+(checked every 5 s). The certificate is renewed only when it does not name
+the first address, the one in the QR code; a renewed certificate names every
+current address except link-local ones (`169.254/16`). `lan.urls` lists only
+the current addresses the certificate names, so a secondary address that
+appears later (a USB cable, a container bridge) neither renews the
+certificate, which would break every pinned pairing, nor gets announced. The LAN listener has no authentication: anyone on the network can
 watch and send control messages, which is why it is off by default.
 
 The Tauri shell starts the server in-process, keeps its files under the

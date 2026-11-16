@@ -190,6 +190,17 @@ async function run({ browser, url }) {
   const e1 = await eye(page);
   s = await state(page);
   check('stage: dragging orbits around the target', dist(e0, e1) > 0.3 && Math.abs(dist(e1, s.target) - dist(e0, s.target)) < 0.05, `eye moved ${dist(e0, e1).toFixed(2)} m`);
+  // A press whose release was lost (a file dialog took it): hovering
+  // afterwards, no button held, must not turn the camera.
+  await page.evaluate(() => {
+    const view = document.getElementById('view');
+    const at = (type, x, buttons) => view.dispatchEvent(new PointerEvent(type, { pointerId: 7, pointerType: 'mouse', clientX: x, clientY: 400, button: 0, buttons, bubbles: true }));
+    at('pointerdown', 400, 1);
+    for (let i = 1; i <= 20; i++) at('pointermove', 400 + i * 15, 0);
+  });
+  await sleep(400);
+  const eHover = await eye(page);
+  check('stage: hovering after a lost release leaves the camera still', dist(e1, eHover) < 0.01, `eye moved ${dist(e1, eHover).toFixed(3)} m`);
   await page.mouse.wheel(0, -400);
   await sleep(600);
   const e2 = await eye(page);

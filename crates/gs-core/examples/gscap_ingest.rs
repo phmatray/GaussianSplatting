@@ -13,7 +13,10 @@
 //! from where the phone started and from above. The same recording can be
 //! run again with other parameters of its mode, to see what suits the real
 //! sensor: `--voxel METERS` (cell size), `--far METERS` (depth beyond it is
-//! not used), `--min-confidence 0|1|2`, `--max-voxels N`, `--layer-window CELLS`.
+//! not used), `--min-confidence 0|1|2`, `--max-voxels N`, `--layer-window CELLS`,
+//! `--kernel CELLS` (tangential standard deviation of a splat, in cells),
+//! `--stretch MAX` (largest stretch of a flat cell's disc along its slope; 1: round),
+//! `--keep-behind-walls` (a room keeps what stands behind its walls).
 
 use std::io::Read;
 use std::time::Instant;
@@ -43,7 +46,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.first() else {
         eprintln!(
-            "usage: gscap_ingest <file.gscap> [--png out.png] [--ply out.ply] [--voxel M] [--far M] [--min-confidence 0|1|2] [--max-voxels N] [--layer-window CELLS]"
+            "usage: gscap_ingest <file.gscap> [--png out.png] [--ply out.ply] [--voxel M] [--far M] [--min-confidence 0|1|2] [--max-voxels N] [--layer-window CELLS] [--kernel CELLS] [--stretch MAX]"
         );
         std::process::exit(2);
     };
@@ -82,6 +85,9 @@ fn main() {
                     params.min_confidence = number("--min-confidence").map_or(params.min_confidence, |v| v as u8);
                     params.max_voxels = number("--max-voxels").map_or(params.max_voxels, |v| v as usize);
                     params.layer_window = number("--layer-window").map_or(params.layer_window, |v| v as f32);
+                    params.kernel = number("--kernel").map_or(params.kernel, |v| v as f32);
+                    params.slope_stretch = number("--stretch").map_or(params.slope_stretch, |v| v as f32);
+                    params.cut_behind_walls = !std::env::args().any(|a| a == "--keep-behind-walls");
                     session = Some(CaptureSession::from_header(&header, params).unwrap_or_else(|e| panic!("{e}")));
                 }
                 Ok(Some(ParsedItem::Frame(bytes))) => {
@@ -142,7 +148,7 @@ fn main() {
         state.ceiling_height,
         state.capture.as_ref().and_then(|c| c.region)
     );
-    println!("bounds {:?} .. {:?}", state.bounds.min, state.bounds.max);
+    println!("bounds {:?} .. {:?}; {} splats cut behind the walls", state.bounds.min, state.bounds.max, session.walls_cut());
     for (name, values) in ["total", "colour + depth", "fusion", "encoding"].iter().zip(&mut times) {
         values.sort_by(f64::total_cmp);
         let mean = values.iter().sum::<f64>() / values.len().max(1) as f64;

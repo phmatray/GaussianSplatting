@@ -156,14 +156,26 @@ impl Lcg {
     }
 }
 
+/// A wave in [-1, 1] of period 1, built from operations that IEEE 754
+/// rounds exactly. `sin` and `cos` come from the platform's libm and differ
+/// in the last bit between glibc and macOS, which made the shared fixture
+/// depend on the machine that wrote it.
+fn wave(x: f32) -> f32 {
+    let t = x - x.floor();
+    4.0 * (t - 0.5).abs() - 1.0
+}
+
 pub fn splats(n: usize, seed: u32) -> Vec<Splat> {
     (0..n)
         .map(|i| {
             let f = (i as u32 * 31 + seed * 17) as f32;
+            // A rotation about Y; |s| + |c| = 1, so the norm is never zero.
+            let (s, c) = (wave(f * 0.016), wave(f * 0.016 + 0.25));
+            let norm = (s * s + c * c).sqrt();
             Splat {
-                pos: [(f * 0.37).sin() * 3.0, (f * 0.11).cos() + 1.0, (f * 0.23).sin() * 2.0 + seed as f32 * 0.1],
+                pos: [wave(f * 0.059) * 3.0, wave(f * 0.0175 + 0.25) + 1.0, wave(f * 0.037) * 2.0 + seed as f32 * 0.1],
                 scale: [0.01 + (i % 5) as f32 * 0.002, 0.02, 0.001],
-                rot: gs_core::glam::Quat::from_rotation_y(f * 0.1).to_array(),
+                rot: [0.0, s / norm, 0.0, c / norm],
                 rgba: [(i * 7) as u8, seed as u8, 200, 216],
             }
         })

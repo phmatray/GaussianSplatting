@@ -80,10 +80,71 @@ indépendant, chargé de le réfuter. Ces vérificateurs ont trouvé et corrigé
 vrais défauts à chaque fois ; leurs listes de points restants sont reprises
 en section 6.
 
+### Sur le MacBook Pro M5 Max, le 2026-11-15
+
+Première passe sur la vraie machine (macOS 27, Rust 1.96, Xcode avec le SDK
+iOS 27.2). Étapes 1 à 6 de la section 3 faites ; l'étape 7 attend un
+casque.
+
+| Vérification | Résultat |
+| --- | --- |
+| `cargo test --no-fail-fast` | 783 réussis, 7 ignorés, après quatre correctifs propres à macOS (ci-dessous). Le seul échec restant d'une passe complète est le contrôle de cadence `a_client_that_never_reads…` (16,5 Hz pour 17 à 22), qui passe 3 fois sur 3 seul. |
+| `cargo clippy` natif et wasm32 | 0 avertissement |
+| `python3 -m unittest discover -s tools` | 88 réussis (Python 3.15) |
+| `e2e/render` | 379 sur 379 |
+| `e2e/app` | 463 sur 465 : `soak` (connu, section 6) et `stage` en tête de passe, qui passe 39 sur 39 seul, deux fois. `webkit` se saute. |
+| `e2e/server` | `hostile.py --quick` et `abuse.py` passent (premier passage de leur repli `ps`/`lsof` sous macOS). `capture.py`, `browser.cjs`, `real-frontend.cjs` et `share.cjs` échouaient à la poignée de main TLS sur l'adresse réseau du Mac (pare-feu de macOS, risque 2) ; une fois l'exception posée pour `target/release/gs-server`, ils passent tous, ainsi que `refine.py`. |
+| Visionneuse, Chrome | Metal (« ANGLE Metal Renderer: Apple M5 Max »), mode normalisé. 120 i/s, plafond de l'écran, dans les deux modes de mélange jusqu'à 270 000 splats : l'écart de 3 à 5 fois mesuré sur SwiftShader n'apparaît pas. |
+| Visionneuse, Safari et WebKit | Mode normalisé accepté (demi-flottants disponibles), maison terminée de 756 000 splats à 60 i/s, pièces ouvertes vues de dessus. |
+| Application de bureau (WKWebView) | Fenêtre, scène, enregistrement, export d'un `.gsrec` vers Téléchargements, archive de partage, `reveal` dans le Finder : tout fonctionne. Le bouton VR ouvre la section « Casque VR », qui dit que la vue web ne peut pas ouvrir de session, sans erreur. Lancée depuis un terminal, l'application hérite de ses autorisations : la demande d'accès à Téléchargements d'une `.app` lancée seule n'a pas été vue. |
+| `SplatCaptureKit` | `swift test` : 35 sur 35 du premier coup. L'échantillon `.gscap` écrit par Swift est accepté par `tools/gscap.py verify` et par `gscap_ingest`. |
+| Application iPhone | Compile sans erreur ni avertissement Swift (`xcodebuild`, `generic/platform=iOS`, sans signature). Jamais installée ni lancée. |
+| Espace libre | `storage.free_bytes` égale `df` ; le Finder annonce 33 Go de plus (purgeable), comme prévu au risque 8. |
+| Affinage, chambre réaliste de 220 images | `rapide` : 23,7 s à 17 fils (défaut du serveur), 26,3 s à 12, 29,7 s à 18, 40,6 s à 6 ; résultats identiques au bit près entre 6 et 17 fils. `standard` : 2 min 38 s, 1,3 Go de mémoire. |
+| Brush (Rust, wgpu sur Metal) | Compilé depuis les sources (`1388f74`). Lit nos exports COLMAP et nerfstudio ; ses `.ply` s'ouvrent dans notre visionneuse, à l'endroit et à l'échelle. 5 000 itérations en 98 s, 30 000 en 8 min 24 s. Jugé à l'œil seulement (pas d'outil du dépôt pour noter un `.ply` étranger), à l'intérieur de la chambre et à des points de vue proches mais pas identiques : plus lisse et plus flou que `gs-refine standard`, même tache sombre là où le capteur n'a rien vu. Sur données simulées, il ne fait pas mieux ; la question reste ouverte pour une capture réelle. OpenSplat n'a pas été essayé. |
+
+Premières données réelles, le même soir (iPhone 15 Pro Max, iOS 27.0.1,
+signé avec l'équipe Atypical Consulting) :
+
+| Étape | Résultat |
+| --- | --- |
+| 5, faux serveur | 371 images en 64,5 s, 50,7 Mo, trajet de 16,8 m, suivi normal partout. `gscap.py verify` : rien à signaler. Point principal (480,6 ; 361,2) pour 960×720, focale 667 px ; orientation 0 (paysage) sur toutes les images. `gscap_ingest` : 371 images utilisées, 466 000 splats, sol à -0,68 m, plafond à 2,62 m. Fichier conservé : `out/captures/premiere-capture-reelle-2026-11-15.gscap` (hors git). |
+| 6, vrai serveur | Poignée de main WebSocket depuis `URLSessionWebSocketTask` acceptée (`/ingest` → 101, risque 3 levé). 360 images reçues, 360 utilisées, 462 584 splats ; la pièce est reconnaissable, ni quart de tour ni miroir. Capture et enregistrement conservés. |
+| Affinage `rapide` de la capture réelle | 85 s à 17 fils, 740 000 gaussiennes. Défaut neuf, absent des captures simulées : de longues traînées en aiguilles (gaussiennes très étirées) sur un mur. Non analysé. |
+| 7, casque | Pas fait. |
+
+Pour joindre le Mac, le pare-feu de macOS a demandé une exception par
+exécutable : `target/release/gs-server` et, pour `tools/fake_server.py`,
+`…/python@3.15/…/Resources/Python.app` (pas le `python3.15` de la ligne de
+commande). À refaire après une recompilation ou une mise à jour de Python.
+
+Défauts trouvés et corrigés ce jour-là (branche `fix/macos-first-contact`) :
+
+- les tests de `hostile.rs` et `lifecycle.rs` comptaient les sockets dans
+  `/proc/self/fd`, absent de macOS : le premier expirait, le second ne
+  vérifiait rien. Ils lisent `/dev/fd` ;
+- `the_fixtures_are_valid_and_play` dépendait du `libm` de la plateforme
+  (`sin`, `cos`) : le fichier d'exemple `rust_tiny.gsrec` a été régénéré à
+  partir de splats calculés sans eux ;
+- `lan_listener_opens_and_closes_on_request` exigeait de joindre toutes les
+  adresses listées, y compris les ponts d'OrbStack que macOS refuse ; la
+  première adresse, celle du QR code, reste exigée ;
+- `bind_near` : avec `SO_REUSEADDR`, macOS laisse deux écoutes tenir
+  `127.0.0.1:P` et `0.0.0.0:P` ; le port compte désormais comme pris quand
+  son jumeau l'est ;
+- `cargo tauri build` livrait un serveur sans interface embarquée (la CLI
+  Tauri 2 n'active pas la fonctionnalité `custom-protocol` de l'application) :
+  casques servis par la page d'explication, archive de partage impossible.
+  Voir `src-tauri/README.md` ;
+- les messages passaient sous le fond des fenêtres de dialogue : un export
+  lancé depuis « Partager » ne disait ni sa réussite ni son échec.
+
 ### Écrit, jamais compilé ni exécuté
 
 - **Toute l'application iPhone** (`ios/SplatCapture`, Swift). Aucune
-  chaîne d'outils Swift n'était disponible. Le code a été relu contre la
+  chaîne d'outils Swift n'était disponible. (Depuis le 2026-11-15, elle
+  compile sur le Mac et les tests du paquet passent ; elle n'a toujours tourné
+  sur aucun appareil. La suite de ce paragraphe date d'avant.) Le code a été relu contre la
   documentation des API, et ses formats sont vérifiés indirectement : les
   mêmes fichiers d'exemple (`ios/SplatCapture/Fixtures`) sont lus par les
   tests Swift (jamais lancés), Python et Rust (lancés). Il faut s'attendre à
@@ -503,16 +564,85 @@ l'arbre livré.
   delà, les nouvelles surfaces ne sont plus ajoutées. Une vraie maison plus
   grande l'atteindra plus tôt. Piste : une tolérance d'association qui
   croît avec la distance dans `VoxelFusion` (`crates/gs-core/src/reconstruct.rs`).
+- Dérive des poses d'ARKit, mesurée le 2026-11-15 sur la capture de 1 039
+  images (`out/captures/capture-1039-images-2026-11-15.gscap`, hors git) :
+  là où le téléphone repasse, un recalage ICP point-à-plan des cartes de
+  profondeur demande 5,2 cm de correction médiane quand les deux images ont
+  moins d'une minute d'écart, 9,1 cm au-delà de deux minutes (l'écart
+  quadratique tombe de 13-43 mm à 4-17 mm). `gs-refine recaler` (module
+  `drift`) en tire un graphe de poses et écrit une copie de la capture aux
+  poses corrigées. **Effet non démontré** : sur cette capture, 6 boucles sur
+  19 sont retenues, le rendu ne change pas de façon visible, et les murs n'y
+  ont de toute façon que 0,3 % de blocs plans à double couche avant comme
+  après. Ce premier essai était faussé : le jacobien numérique perturbait
+  des poses `f32` de 1e-6, sous l'arrondi (corrigé, 4cd27d7). Rejoué sur
+  une seconde pièce (1 318 images) : 5 boucles sur 10, 16 cm de correction
+  moyenne, et toujours aucun gain — affinage 25,92 dB / 0,867 sans
+  correction, 25,88 dB / 0,863 avec, 0,1 % de blocs doublés dans les deux
+  modèles affinés (0,6 % dans la fusion en direct, que l'affinage résorbe).
+- Dédoublements localisés par le propriétaire (poêle et porte vitrée du
+  salon) : (1) **les vitres** — la profondeur LiDAR lit le reflet du salon
+  dans la porte (image 950 de la capture de 1 039 images), avec une
+  confiance moyenne à haute, donc une copie fantôme du salon derrière la
+  vitre ; filtrer sur la confiance ne suffit pas, il faut écarter la
+  profondeur qui tombe derrière une surface déjà vue. (2) **le poêle filmé
+  deux fois à 2 min 09 d'écart** (images 300 et 950) : 2 à 4 cm d'écart RMS
+  entre les deux passages avant recalage, que l'ICP n'aligne pas de façon
+  stable (corrections de 5 à 70 cm selon la paire).
+- **Reflets coupés derrière les murs** (choix du propriétaire, 2026-11-16 :
+  « couper hors des murs », ce qu'une porte ouverte montre de la pièce
+  voisine part aussi). `gs_core::walls` trouve les murs (grands plans
+  verticaux du sol au plafond, vus de dessus comme des segments) ; à la fin
+  d'une capture en mode pièce, ce qui est derrière un mur, dans son étendue,
+  du côté opposé aux caméras, est retiré ; l'affinage coupe son résultat
+  derrière les mêmes murs. Garde-fous mesurés : un mur filmé des deux côtés
+  (marche à travers deux pièces) ne coupe rien ; un plan collé à moins d'un
+  mètre devant un mur est un meuble (armoire jusqu'au plafond) ; un plan à
+  quelques degrés d'un mur est ce mur ; ce qui est sur un mur n'est jamais
+  retiré. Sur les vraies captures : salon 113 k splats coupés sur 490 k,
+  pièce 2 137 k sur 989 k, vue de dessus nette, murs intacts. Les tests de
+  qualité de fusion mesurent sans la coupe (la porte de la chambre montre le
+  couloir) ; la chambre simulée vérifie que la coupe ne retire rien dans la
+  pièce (11 216 retirés, 0 dedans). `gscap_ingest --keep-behind-walls`
+  compare.
 - La fusion ne retire jamais une surface que des images ultérieures voient
   au travers : une personne qui traverse la pièce pendant la capture laisse
   un fantôme.
 - La compensation d'exposition ancre toute la carte sur les premières images.
 - Les murs vus de très près (30 à 50 cm) paraissent floconneux.
+- Sur les vraies captures, les murs vus en biais montraient des fentes
+  verticales. Cause : la fusion travaille en colonnes perpendiculaires à
+  l'axe dominant de la normale ; sur un mur incliné de θ, deux colonnes
+  voisines sont à `voxel / cos θ` l'une de l'autre le long de la pente, et
+  les disques ronds laissent une fente entre elles. Corrigé par un
+  étirement adaptatif (`VoxelFusion::slope_stretch`, `IngestParams::
+  slope_stretch` = 2) : le disque d'une cellule plane (normales concordantes
+  à 0,9, deux échantillons au moins) est étiré de `1/cos θ` le long de la
+  pente, et seulement là ; les arêtes et les contours d'objets gardent des
+  disques ronds. Sur la capture réelle, la plupart des fentes se ferment et
+  les objets gardent leur piqué ; la chambre simulée passe à 25,58 dB
+  (25,79 avant). Restent quelques fentes là où des colonnes n'ont reçu aucun
+  échantillon : il faudra boucher les cellules vides isolées au milieu d'une
+  surface plane. Pour rejouer : `gscap_ingest <capture> --stretch 1 --png …`
+  (disques ronds) contre la valeur par défaut.
 - Un fichier de capture dont un enregistrement est abîmé est refusé en
   entier à l'import.
 - Le jeton d'appairage change à chaque démarrage du serveur : une capture
   enregistrée hors ligne puis envoyée plus tard sera souvent refusée (401) ;
   il faut alors scanner de nouveau le QR code.
+- Le certificat est renouvelé dès qu'une adresse que le Mac n'avait pas
+  apparaît, même passagère et inutile au téléphone. Constaté sur le Mac le
+  2026-11-15 : brancher l'iPhone par câble ajoute une adresse `169.254.x.y`,
+  et les ponts d'OrbStack vont et viennent ; chaque fois, l'empreinte
+  enregistrée par l'iPhone (et par un casque) cessait de valoir. Corrigé
+  pour les adresses locales de lien, la cause constatée : elles ne sont plus
+  exigées dans le certificat (`crates/gs-server/src/tls.rs`, test
+  `a_passing_link_local_address_keeps_the_certificate`), puis pour toute
+  adresse secondaire : le même soir, un pont OrbStack apparu en cours de
+  session a encore renouvelé le certificat et rendu l'iPhone « injoignable ».
+  Le certificat ne se renouvelle plus que si la première adresse change, et
+  `lan.urls` n'annonce que les adresses qu'il nomme (test
+  `a_new_secondary_address_keeps_the_certificate`).
 
 ### Enregistrement et partage
 
@@ -567,6 +697,12 @@ l'arbre livré.
   complet).
 
 ### Captures conservées
+
+- Aucun explorateur de fichiers dans l'interface : les captures, les
+  modèles affinés, les exports et les comparaisons se retrouvent par leur
+  chemin sur le disque, et un fichier ouvert puis fermé se perd (remarque du
+  propriétaire, 2026-11-15). À concevoir : une vue qui liste et ouvre tout ce
+  que le serveur garde, par capture.
 
 - Rouvrir une capture conservée (bouton œil) la réimporte et écrit un
   `.gsrec` de plus à chaque fois.
