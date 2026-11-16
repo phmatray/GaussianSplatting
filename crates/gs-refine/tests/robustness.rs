@@ -394,7 +394,10 @@ fn files_cut_short_are_used_as_far_as_they_go() {
 fn the_written_ply_is_the_cloud_the_optimiser_drew() {
     let dir = scratch("ply");
     let written = write_capture(&dir.join("a.gscap"), "bedroom", 30, small_sim(), |_, _| {});
-    let mut job = prepare(&written.path, tiny_config(120));
+    // The file against the optimiser's own picture: nothing cut between them.
+    let mut config = tiny_config(120);
+    config.init.cut_behind_walls = false;
+    let mut job = prepare(&written.path, config);
     job.run(&CancelToken::default(), &mut |_| {}).unwrap();
     let splats = job.splats();
     // Through both file formats and back: the same splats.

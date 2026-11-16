@@ -120,14 +120,14 @@ impl Inner {
         let mut nav = self.nav.borrow_mut();
         if pointers.active.len() == 1 {
             if pointer.pan {
-                nav.pan(dx, dy, self.fov_y.get(), viewport_height);
+                nav.pan(dx, dy, self.view_fov_y(), viewport_height);
             } else {
                 nav.rotate(dx, dy, pointer.touch);
             }
         } else {
             // Two (or more) fingers: the centroid pans, the spread zooms.
             let (center, spread) = pointers.centroid_and_spread();
-            nav.pan(center[0] - before.0[0], center[1] - before.0[1], self.fov_y.get(), viewport_height);
+            nav.pan(center[0] - before.0[0], center[1] - before.0[1], self.view_fov_y(), viewport_height);
             if before.1 > 1.0 && spread > 1.0 {
                 nav.zoom(before.1 / spread);
             }

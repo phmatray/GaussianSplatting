@@ -33,11 +33,14 @@ pub struct InitParams {
     /// Multiplies the opacity of the fused splats, which are fully opaque:
     /// the optimiser needs room to blend neighbours and to learn.
     pub opacity: f32,
+    /// A room drops what stands behind its walls, in the starting cloud and
+    /// in the result (`gs_core::walls`).
+    pub cut_behind_walls: bool,
 }
 
 impl Default for InitParams {
     fn default() -> Self {
-        Self { voxel_size: 0.0, room_voxel_size: 0.0, max_voxels: 3_000_000, splat_scale: 1.4, opacity: 0.7 }
+        Self { voxel_size: 0.0, room_voxel_size: 0.0, max_voxels: 3_000_000, splat_scale: 1.4, opacity: 0.7, cut_behind_walls: true }
     }
 }
 
@@ -69,7 +72,7 @@ const START_KERNEL: f32 = 0.45;
 /// The ingest parameters of an offline fusion.
 pub fn ingest_params(mode: CaptureMode, init: &InitParams) -> IngestParams {
     let mut params =
-        IngestParams { max_voxels: init.max_voxels.max(1000), kernel: START_KERNEL, ..IngestParams::default() };
+        IngestParams { max_voxels: init.max_voxels.max(1000), kernel: START_KERNEL, cut_behind_walls: init.cut_behind_walls, ..IngestParams::default() };
     if init.voxel_size <= 0.0 && init.room_voxel_size > 0.0 && mode == CaptureMode::Room {
         params.room.voxel_size = init.room_voxel_size;
     }
