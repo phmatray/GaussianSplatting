@@ -307,6 +307,9 @@ pub struct RefineJob {
     pub trainer: Trainer<CpuRasterizer>,
     holdout: Vec<ViewInfo>,
     fused: Vec<Splat>,
+    /// Walls of the room; a job resumed from a checkpoint has none (the
+    /// result is then not cut behind them).
+    walls: Vec<gs_core::walls::Wall>,
     pool: rayon::ThreadPool,
     cache: ViewCache,
     checkpoint: Option<PathBuf>,
@@ -477,6 +480,7 @@ impl RefineJob {
             trainer,
             holdout,
             fused: fused.splats,
+            walls: fused.walls,
             pool,
             checkpoint: None,
             wall_s: 0.0,
@@ -530,7 +534,15 @@ impl RefineJob {
     /// The result as viewer splats, for `gs_core::io::write_ply` and
     /// `write_splat`.
     pub fn splats(&self) -> Vec<Splat> {
-        self.result().0.to_splats()
+        let splats = self.result().0.to_splats();
+        if self.walls.is_empty() {
+            return splats;
+        }
+        // Training grows splats where the photographs ask for them, also
+        // in a mirror or a window: what stands behind the walls goes, as it
+        // went from the fusion.
+        let behind = gs_core::walls::behind_walls(&splats, &self.walls);
+        splats.into_iter().zip(behind).filter(|(_, b)| !b).map(|(s, _)| s).collect()
     }
 
     /// Width and views of an evaluation.
@@ -1036,6 +1048,7 @@ impl RefineJob {
             trainer,
             holdout,
             fused,
+            walls: Vec::new(),
             checkpoint: Some(checkpoint.to_path_buf()),
             wall_s: header.wall_s,
             cpu_s: header.cpu_s,

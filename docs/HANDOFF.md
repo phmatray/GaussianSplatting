@@ -589,6 +589,22 @@ l'arbre livré.
   deux fois à 2 min 09 d'écart** (images 300 et 950) : 2 à 4 cm d'écart RMS
   entre les deux passages avant recalage, que l'ICP n'aligne pas de façon
   stable (corrections de 5 à 70 cm selon la paire).
+- **Reflets coupés derrière les murs** (choix du propriétaire, 2026-11-16 :
+  « couper hors des murs », ce qu'une porte ouverte montre de la pièce
+  voisine part aussi). `gs_core::walls` trouve les murs (grands plans
+  verticaux du sol au plafond, vus de dessus comme des segments) ; à la fin
+  d'une capture en mode pièce, ce qui est derrière un mur, dans son étendue,
+  du côté opposé aux caméras, est retiré ; l'affinage coupe son résultat
+  derrière les mêmes murs. Garde-fous mesurés : un mur filmé des deux côtés
+  (marche à travers deux pièces) ne coupe rien ; un plan collé à moins d'un
+  mètre devant un mur est un meuble (armoire jusqu'au plafond) ; un plan à
+  quelques degrés d'un mur est ce mur ; ce qui est sur un mur n'est jamais
+  retiré. Sur les vraies captures : salon 113 k splats coupés sur 490 k,
+  pièce 2 137 k sur 989 k, vue de dessus nette, murs intacts. Les tests de
+  qualité de fusion mesurent sans la coupe (la porte de la chambre montre le
+  couloir) ; la chambre simulée vérifie que la coupe ne retire rien dans la
+  pièce (11 216 retirés, 0 dedans). `gscap_ingest --keep-behind-walls`
+  compare.
 - La fusion ne retire jamais une surface que des images ultérieures voient
   au travers : une personne qui traverse la pièce pendant la capture laisse
   un fantôme.

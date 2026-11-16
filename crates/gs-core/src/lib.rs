@@ -19,6 +19,7 @@ pub mod scene;
 pub mod sort;
 pub mod splat;
 pub mod types;
+pub mod walls;
 
 pub use glam;
 pub use types::{Aabb, Camera, RgbdFrame, Splat};

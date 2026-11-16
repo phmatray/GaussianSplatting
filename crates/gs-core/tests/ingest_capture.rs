@@ -603,8 +603,11 @@ fn noise_jitter_and_the_cell_cap_keep_the_map_single_layered_and_bounded() {
         }
         session
     };
-    let clean = fuse(&ideal.1, IngestParams::default());
-    let rough = fuse(&noisy.1, IngestParams::default());
+    // The cells themselves are counted: what an opening shows of the next
+    // room stays (the cut behind walls has its own test).
+    let keep = IngestParams { cut_behind_walls: false, ..IngestParams::default() };
+    let clean = fuse(&ideal.1, keep);
+    let rough = fuse(&noisy.1, keep);
     let (a, b) = (clean.static_splats().len(), rough.static_splats().len());
     // Noise of 1.5 mm at 1 m (1 cm at 2.6 m, 2.4 cm on the far wall) and
     // poses off by 3 mm plus drift: were surfaces doubled, there would be
@@ -823,11 +826,40 @@ fn score_room(session: &CaptureSession, phone: &Phone, exposures: &Exposures, ro
 }
 
 #[test]
+fn the_cut_behind_walls_drops_only_what_stands_outside_the_filmed_room() {
+    // The bedroom filmed twice, with and without the cut: every splat the cut
+    // drops stands outside the bedroom (what the door shows of the hall),
+    // none inside it.
+    let sim = PhoneSim { color_width: 192, color_height: 144, ..PhoneSim::default() };
+    let (cut, phone, _) = film_bedroom(sim, IngestParams::default(), 160, true);
+    let (kept, _, _) = film_bedroom(sim, IngestParams { cut_behind_walls: false, ..IngestParams::default() }, 160, true);
+    let key = |s: &Splat| s.pos.map(f32::to_bits);
+    let remaining: std::collections::HashSet<[u32; 3]> = cut.static_splats().iter().map(key).collect();
+    let dropped: Vec<Splat> = kept.static_splats().into_iter().filter(|s| !remaining.contains(&key(s))).collect();
+    let bedroom = gs_core::scene::house::ROOMS.iter().find(|r| r.name == "bedroom").unwrap();
+    let inside = phone
+        .world
+        .to_scene(&dropped, 0.0)
+        .iter()
+        .filter(|s| {
+            let p = s.position();
+            p.x > bedroom.min[0] + 0.1 && p.x < bedroom.max[0] - 0.1 && p.z > bedroom.min[1] + 0.1 && p.z < bedroom.max[1] - 0.1
+        })
+        .count();
+    println!("{} dropped of {}, {inside} inside the bedroom", dropped.len(), kept.static_splats().len());
+    assert!(dropped.len() > 1000, "the hall seen through the door goes: {} dropped", dropped.len());
+    assert_eq!(inside, 0, "{inside} of {} dropped splats were inside the bedroom", dropped.len());
+}
+
+#[test]
 fn a_filmed_bedroom_is_reconstructed_like_the_simulated_scan() {
     // An ideal phone: 256x192 LiDAR depth, colour 1.5 times finer (the
     // ray caster's cost is the colour image; the examples use 960x720).
     let sim = PhoneSim { color_width: 384, color_height: 288, ..PhoneSim::default() };
-    let (session, phone, exposures) = film_bedroom(sim, IngestParams::default(), 220, true);
+    // The fusion against the simulated scan: what the door shows of the hall
+    // is scored too, so the cut behind walls is off (its own test follows).
+    let keep = IngestParams { cut_behind_walls: false, ..IngestParams::default() };
+    let (session, phone, exposures) = film_bedroom(sim, keep, 220, true);
     let (psnr, ssim, coverage, splats) = score_room(&session, &phone, &exposures, "bedroom", "ideal phone");
     // Measured: 141 898 splats of 2.4 cm; where the phone has looked, PSNR
     // 25.79 dB, SSIM 0.833, coverage 99.79 %. The simulated scan head (five
@@ -843,7 +875,8 @@ fn a_filmed_bedroom_is_reconstructed_like_the_simulated_scan() {
     // A realistic one: noise, jitter, drift, wandering exposure, and no
     // floor message.
     let sim = PhoneSim { color_width: 384, color_height: 288, ..PhoneSim::realistic() };
-    let (session, phone, exposures) = film_bedroom(sim, IngestParams::default(), 220, false);
+    let keep = IngestParams { cut_behind_walls: false, ..IngestParams::default() };
+    let (session, phone, exposures) = film_bedroom(sim, keep, 220, false);
     let (floor, known) = session.floor();
     assert!(known && (floor - phone.world.floor_y()).abs() < 0.02, "floor found at {floor}, truly {}", phone.world.floor_y());
     let ceiling = session.state().ceiling_height.unwrap();

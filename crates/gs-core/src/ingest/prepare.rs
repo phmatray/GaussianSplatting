@@ -106,6 +106,11 @@ pub struct IngestParams {
     /// flat cells along their slope closes them without blurring anything
     /// else, where a wider kernel everywhere softened objects.
     pub slope_stretch: f32,
+    /// At the end of a room capture, what stands behind the room's walls is
+    /// dropped: reflections in mirrors and windows, which the depth sensor
+    /// places behind the glass, and what an open door shows of the next
+    /// room ([`crate::walls`]). Chosen by the owner on 2026-11-16.
+    pub cut_behind_walls: bool,
     /// The fusion keeps what lies within this multiple of the region's
     /// radius, so that a region that is nudged or enlarged later still has
     /// its surroundings.
@@ -145,6 +150,7 @@ impl Default for IngestParams {
             exposure_compensation: true,
             kernel: 0.45,
             slope_stretch: 2.0,
+            cut_behind_walls: true,
             region_margin: 1.5,
             live_person_only: false,
             min_frames: 2,
@@ -195,6 +201,7 @@ impl IngestParams {
             exposure_compensation: self.exposure_compensation,
             kernel: finite_clamp(self.kernel, d.kernel, 0.2, 1.5),
             slope_stretch: finite_clamp(self.slope_stretch, d.slope_stretch, 1.0, 3.0),
+            cut_behind_walls: self.cut_behind_walls,
             region_margin: finite_clamp(self.region_margin, d.region_margin, 1.0, 4.0),
             live_person_only: self.live_person_only,
             min_frames: self.min_frames.clamp(1, 16),

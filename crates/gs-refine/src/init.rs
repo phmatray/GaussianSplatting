@@ -50,6 +50,9 @@ pub struct Fused {
     /// `y` on the way to viewers) and whether it is more than a guess.
     pub floor_y: f32,
     pub floor_known: bool,
+    /// The room's walls, behind which the fusion kept nothing; the result
+    /// is cut behind them too (training can grow splats there).
+    pub walls: Vec<gs_core::walls::Wall>,
     /// Region of interest in capture coordinates (object, person).
     pub region: Option<CaptureRegion>,
     pub frames_used: u32,
@@ -99,5 +102,13 @@ pub fn fuse(capture: &Capture, frames: &[usize], init: &InitParams, mut progress
     }
     session.finish();
     let (floor_y, floor_known) = session.floor();
-    Ok(Some(Fused { splats: session.static_splats(), floor_y, floor_known, region: session.region(), frames_used: session.frames_used(), voxel_size }))
+    Ok(Some(Fused {
+        splats: session.static_splats(),
+        floor_y,
+        floor_known,
+        region: session.region(),
+        frames_used: session.frames_used(),
+        voxel_size,
+        walls: session.walls().to_vec(),
+    }))
 }
