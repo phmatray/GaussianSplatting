@@ -9,8 +9,8 @@ use wasm_bindgen::JsCast;
 use crate::core::{self, with_core};
 use crate::dom;
 use crate::logic::replay::{SKIP_S, STEP_S};
-use crate::state::Ui;
-use crate::ui::{Overlays, Panel, ShareDialog, Timeline, TopBar};
+use crate::state::{Ui, Workspace};
+use crate::ui::{Overlays, Panel, Rooms, ShareDialog, Timeline, TopBar};
 
 /// Up to this window width the panel starts closed and is a sheet at the
 /// bottom (the same breakpoint as in `style.css`).
@@ -161,6 +161,8 @@ pub fn App() -> impl IntoView {
             class:panel-open=move || ui.panel_open.get() && !ui.embed.get()
             class:embed=move || ui.embed.get()
             class:replay=move || ui.replay.with(Option::is_some)
+            class:ws-rooms=move || ui.workspace.get() == Workspace::Rooms
+            class:room-open=move || ui.workspace.get() == Workspace::Rooms && ui.room.with(Option::is_some)
         >
             <div class="viewport">
                 <canvas id="view" node_ref=canvas></canvas>
@@ -168,6 +170,7 @@ pub fn App() -> impl IntoView {
             // The embedded viewer is the canvas and its small controls.
             <Show when=move || !ui.embed.get()>
                 <TopBar />
+                <Rooms />
                 <Panel />
             </Show>
             <Overlays />

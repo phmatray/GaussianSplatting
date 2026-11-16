@@ -577,6 +577,19 @@ pub(crate) async fn capture_file(
     stored_file(&state, Kind::Capture, &file, &method, &headers, &query).await
 }
 
+/// `GET /captures/{file}/photo`: a JPEG of the room, for the gallery.
+pub(crate) async fn capture_photo(State(state): State<AppState>, UrlPath(file): UrlPath<String>) -> Response {
+    if let Some(refusal) = loopback_only(&state) {
+        return refusal;
+    }
+    let store = state.core.store.clone();
+    match tokio::task::spawn_blocking(move || store.capture_photo(&file)).await {
+        Ok(Some(jpeg)) => ([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=86400")], jpeg).into_response(),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "not_found", "no photograph in this capture"),
+        Err(err) => internal("photo d'une capture", err),
+    }
+}
+
 pub(crate) async fn delete_capture(
     State(state): State<AppState>,
     UrlPath(file): UrlPath<String>,

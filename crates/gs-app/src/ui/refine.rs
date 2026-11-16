@@ -6,10 +6,9 @@ use leptos::prelude::*;
 
 use super::icons::Icon;
 use super::takes::CopyField;
-use super::widgets::{Section, Segmented};
+use super::widgets::Segmented;
 use crate::core::with_core;
-use crate::logic::refine::{self, KeptCapture, Preset, Refined};
-use crate::logic::source::SourceKind;
+use crate::logic::refine::{self, Preset};
 use crate::state::use_ui;
 use crate::tauri;
 
@@ -19,7 +18,7 @@ const DELETE_CONFIRM: std::time::Duration = std::time::Duration::from_secs(4);
 /// A bin that asks once more: the first click arms it for a few seconds,
 /// the second one deletes.
 #[component]
-fn ConfirmDelete(class: &'static str, what: String, on_delete: Callback<()>) -> impl IntoView {
+pub(super) fn ConfirmDelete(class: &'static str, what: String, on_delete: Callback<()>) -> impl IntoView {
     let armed = RwSignal::new(false);
     let click = move |_| {
         if armed.get_untracked() {
@@ -55,7 +54,7 @@ fn ConfirmDelete(class: &'static str, what: String, on_delete: Callback<()>) -> 
 
 /// The form that starts a refinement (or a dataset export) of one capture.
 #[component]
-fn RefineForm(file: String) -> impl IntoView {
+pub(super) fn RefineForm(file: String) -> impl IntoView {
     let ui = use_ui();
     let preset = RwSignal::new(0usize);
     let beyond = RwSignal::new(0usize);
@@ -109,136 +108,10 @@ fn RefineForm(file: String) -> impl IntoView {
     }
 }
 
-#[component]
-fn CaptureRow(capture: KeptCapture) -> impl IntoView {
-    let ui = use_ui();
-    let file = capture.file.clone();
-    let refinable = capture.refinable();
-    let open_form = {
-        let file = file.clone();
-        Signal::derive(move || ui.refining.with(|open| open.as_deref() == Some(file.as_str())))
-    };
-    let toggle_form = {
-        let file = file.clone();
-        move |_| ui.refining.update(|open| *open = if open.as_deref() == Some(file.as_str()) { None } else { Some(file.clone()) })
-    };
-    let importing = move || ui.import.with(|i| i.as_ref().is_some_and(|i| !i.progress.done));
-    let (open_file, delete_file, form_file) = (file.clone(), file.clone(), file.clone());
-    let label = |action: &str| format!("{action} «\u{a0}{}\u{a0}»", capture.title);
-    let (open_label, refine_label) = (label("Rouvrir"), label("Affiner"));
-    view! {
-        <li class="take capture" class:open=move || open_form.get() data-file=file data-mode=capture.mode.clone()>
-            <div class="take-text">
-                <span class="take-title">{capture.title.clone()}</span>
-                <span class="take-meta">{capture.meta()}</span>
-            </div>
-            <div class="take-actions">
-                <button
-                    type="button"
-                    class="icon-btn capture-open"
-                    title="Rouvrir cette capture dans la visionneuse"
-                    aria-label=open_label
-                    disabled=move || capture.capturing || importing()
-                    on:click=move |_| with_core(|core| core.open_capture(&open_file))
-                >
-                    <Icon name="eye" />
-                </button>
-                <Show when=move || refinable>
-                    <button
-                        type="button"
-                        class="icon-btn capture-refine"
-                        class:active=move || open_form.get()
-                        title="Affiner cette capture, ou l'exporter"
-                        aria-label=refine_label.clone()
-                        aria-expanded=move || open_form.get().to_string()
-                        on:click=toggle_form.clone()
-                    >
-                        <Icon name="sparkle" />
-                    </button>
-                </Show>
-                <ConfirmDelete class="capture-delete" what=capture.title.clone() on_delete=Callback::new(move |()| with_core(|core| core.delete_capture(&delete_file))) />
-            </div>
-            <Show when=move || open_form.get()>
-                <RefineForm file=form_file.clone() />
-            </Show>
-        </li>
-    }
-}
-
-#[component]
-fn RefinedRow(result: Refined) -> impl IntoView {
-    let ui = use_ui();
-    let file = result.file.clone();
-    let loading = {
-        let file = file.clone();
-        Signal::derive(move || ui.refined_loading.with(|loading| loading.as_deref() == Some(file.as_str())))
-    };
-    let shown = {
-        let file = file.clone();
-        Signal::derive(move || ui.file.with(|shown| shown.as_ref().is_some_and(|shown| shown.name == file)))
-    };
-    let label = |action: &str| format!("{action} «\u{a0}{}\u{a0}»", result.title);
-    let (view_label, download_label, share_label) = (label("Voir"), label("Télécharger"), label("Partager"));
-    let (view_file, delete_file) = (file.clone(), file.clone());
-    let (download_result, share_result) = (result.clone(), result.clone());
-    view! {
-        <li class="take refined" class:playing=move || shown.get() data-file=file data-preset=result.preset.clone()>
-            <div class="take-text">
-                <span class="take-title">{result.title.clone()}</span>
-                <span class="take-meta">{result.meta()}</span>
-            </div>
-            <div class="take-actions">
-                <button
-                    type="button"
-                    class="icon-btn refined-view"
-                    title="Voir le résultat"
-                    aria-label=view_label
-                    disabled=move || ui.refined_loading.with(Option::is_some)
-                    class:active=move || loading.get()
-                    on:click=move |_| with_core(|core| core.view_refined(&view_file))
-                >
-                    <Icon name="eye" />
-                </button>
-                <button
-                    type="button"
-                    class="icon-btn refined-download"
-                    title="Télécharger le fichier .ply"
-                    aria-label=download_label
-                    on:click=move |_| with_core(|core| core.download_refined(&download_result))
-                >
-                    <Icon name="download" />
-                </button>
-                <Show when=move || ui.lan_admin.get()>
-                    <button
-                        type="button"
-                        class="icon-btn refined-share"
-                        title="Partager"
-                        aria-label=share_label.clone()
-                        on:click={
-                            let share_result = share_result.clone();
-                            move |_| with_core(|core| core.share_refined(&share_result))
-                        }
-                    >
-                        <Icon name="send" />
-                    </button>
-                    <ConfirmDelete
-                        class="refined-delete"
-                        what=result.title.clone()
-                        on_delete={
-                            let delete_file = delete_file.clone();
-                            Callback::new(move |()| with_core(|core| core.delete_refined(&delete_file)))
-                        }
-                    />
-                </Show>
-            </div>
-        </li>
-    }
-}
-
 /// The job running on the server: what it does, how far it is, the way
 /// to stop it.
 #[component]
-fn JobCard() -> impl IntoView {
+pub(super) fn JobCard() -> impl IntoView {
     let ui = use_ui();
     let job = move || ui.job.get().unwrap_or_default();
     let fraction = move || job().fraction();
@@ -295,7 +168,7 @@ fn JobCard() -> impl IntoView {
 
 /// How the latest job ended, and what it left.
 #[component]
-fn LastJob() -> impl IntoView {
+pub(super) fn LastJob() -> impl IntoView {
     let ui = use_ui();
     let last = move || ui.job_end.get().unwrap_or_default();
     let result = move || last().result.filter(|_| last().is_done());
@@ -337,59 +210,5 @@ fn LastJob() -> impl IntoView {
             </Show>
             <button type="button" id="refine-dismiss" class="btn wide" on:click=move |_| with_core(|core| core.dismiss_job_end())>"Fermer"</button>
         </div>
-    }
-}
-
-#[component]
-pub fn CapturesSection() -> impl IntoView {
-    let ui = use_ui();
-    let server = move || ui.source.get() == Some(SourceKind::Server);
-    let admin = move || server() && ui.lan_admin.get();
-    let low = move || ui.storage.with(|storage| storage.as_ref().and_then(|storage| storage.low_text()));
-    view! {
-        <Section id="section-captures" title="Captures et affinage" icon="layers">
-            <Show when=move || ui.source.get() == Some(SourceKind::Worker)>
-                <p class="hint" id="captures-absent">{refine::ABSENT_HINT}</p>
-            </Show>
-            <Show when=admin>
-                <Show when=move || low().is_some()>
-                    <p class="warning" id="storage-low" role="status">{low}</p>
-                </Show>
-                <Show when=move || ui.job.with(Option::is_some)>
-                    <JobCard />
-                </Show>
-                <Show when=move || ui.job.with(Option::is_none) && ui.job_end.with(Option::is_some)>
-                    <LastJob />
-                </Show>
-                <p class="section-lead">"Captures conservées sur cet ordinateur"</p>
-                <Show
-                    when=move || !ui.captures.with(Vec::is_empty)
-                    fallback=|| view! {
-                        <p class="hint" id="captures-empty">
-                            "Aucune capture pour l'instant. Celles d'un iPhone et les fichiers .gscap importés sont conservés ici, pour être rouverts ou affinés."
-                        </p>
-                    }
-                >
-                    <ul class="takes" id="captures" aria-label="Captures conservées">
-                        <For each=move || ui.captures.get() key=|capture| (capture.file.clone(), capture.size, capture.capturing) let:capture>
-                            <CaptureRow capture=capture />
-                        </For>
-                    </ul>
-                </Show>
-            </Show>
-            <Show when=move || server() && !ui.lan_admin.get()>
-                <p class="hint" id="captures-remote">
-                    "Les captures se gèrent et s'affinent sur l'ordinateur qui exécute Splat Live. Les captures affinées s'ouvrent ici."
-                </p>
-            </Show>
-            <Show when=move || server() && !ui.refined.with(Vec::is_empty)>
-                <p class="section-lead">"Captures affinées"</p>
-                <ul class="takes" id="refined" aria-label="Captures affinées">
-                    <For each=move || ui.refined.get() key=|result| (result.file.clone(), result.size) let:result>
-                        <RefinedRow result=result />
-                    </For>
-                </ul>
-            </Show>
-        </Section>
     }
 }

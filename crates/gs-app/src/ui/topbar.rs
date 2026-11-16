@@ -7,7 +7,7 @@ use super::icons::Icon;
 use super::takes::RecordButton;
 use crate::core::with_core;
 use crate::logic::source::Link;
-use crate::state::use_ui;
+use crate::state::{use_ui, Workspace};
 
 #[component]
 fn ModeButton(id: &'static str, scene: SceneKind, label: &'static str, short: &'static str, icon: &'static str) -> impl IntoView {
@@ -79,6 +79,67 @@ fn SourceBadge() -> impl IntoView {
     }
 }
 
+/// Direct (the live capture) or Pièces (the gallery of filmed rooms).
+#[component]
+fn WorkspaceTabs() -> impl IntoView {
+    let ui = use_ui();
+    let tab = move |workspace: Workspace, id: &'static str, label: &'static str, icon: &'static str| {
+        let on = move || ui.workspace.get() == workspace;
+        view! {
+            <button
+                type="button"
+                id=id
+                role="tab"
+                class="ws-tab"
+                class:active=on
+                aria-selected=move || on().to_string()
+                on:click=move |_| {
+                    if ui.workspace.get_untracked() == workspace {
+                        // A second click on Pièces goes back to the gallery.
+                        if workspace == Workspace::Rooms {
+                            ui.room.set(None);
+                        }
+                        return;
+                    }
+                    ui.workspace.set(workspace);
+                    if workspace == Workspace::Direct && ui.version.get_untracked().is_some() {
+                        super::rooms::leave_versions(ui);
+                    }
+                }
+            >
+                <Icon name=icon />
+                <span>{label}</span>
+            </button>
+        }
+    };
+    view! {
+        <nav class="workspaces" role="tablist" aria-label="Espace de travail">
+            {tab(Workspace::Direct, "ws-direct", "Direct", "capture")}
+            {tab(Workspace::Rooms, "ws-rooms", "Pièces", "layers")}
+        </nav>
+    }
+}
+
+/// Where the gallery is: Pièces, then the open room.
+#[component]
+fn RoomCrumb() -> impl IntoView {
+    let ui = use_ui();
+    let title = move || {
+        let key = ui.room.get()?;
+        let from_captures = ui.captures.with(|list| list.iter().find(|c| c.file == key).map(|c| c.title.clone()));
+        from_captures.or_else(|| key.strip_prefix("titre:").map(str::to_string))
+    };
+    view! {
+        <nav class="crumb" aria-label="Fil d'Ariane">
+            <Show when=move || title().is_some()>
+                <button type="button" class="crumb-link" on:click=move |_| ui.room.set(None)>"Pièces"</button>
+                <Icon name="chevron" />
+                <span class="crumb-here" aria-current="page">{title}</span>
+            </Show>
+        </nav>
+    }
+}
+
 #[component]
 pub fn TopBar() -> impl IntoView {
     let ui = use_ui();
@@ -101,11 +162,17 @@ pub fn TopBar() -> impl IntoView {
             <div class="brand">
                 <span class="logo" aria-hidden="true"><i></i><i></i><i></i></span>
                 <h1>"Splat Live"</h1>
+                <WorkspaceTabs />
             </div>
-            <nav class="modes" role="tablist" aria-label="Mode">
-                <ModeButton id="mode-stage" scene=SceneKind::Stage label="Scène en direct" short="Scène" icon="stage" />
-                <ModeButton id="mode-house" scene=SceneKind::House label="Scan de maison" short="Maison" icon="house" />
-            </nav>
+            <Show
+                when=move || ui.workspace.get() == Workspace::Direct
+                fallback=move || view! { <RoomCrumb /> }
+            >
+                <nav class="modes" role="tablist" aria-label="Scène de démonstration">
+                    <ModeButton id="mode-stage" scene=SceneKind::Stage label="Scène en direct" short="Scène" icon="stage" />
+                    <ModeButton id="mode-house" scene=SceneKind::House label="Scan de maison" short="Maison" icon="house" />
+                </nav>
+            </Show>
             <div class="actions">
                 <SourceBadge />
                 <RecordButton />

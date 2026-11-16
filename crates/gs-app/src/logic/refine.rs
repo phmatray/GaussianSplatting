@@ -114,31 +114,6 @@ impl KeptCapture {
     pub fn refinable(&self) -> bool {
         self.mode != "live" && !self.capturing
     }
-
-    /// `Pièce · 12,4 Mo · 14/11/2026 10:15`.
-    pub fn meta(&self) -> String {
-        let mode = match self.mode.as_str() {
-            "room" => "Pièce",
-            "object" => "Objet",
-            "person" => "Personne",
-            "live" => "Direct",
-            _ => "Capture",
-        };
-        let mut parts = vec![mode.to_string(), super::replay::size(self.size)];
-        if let Some(date) = short_date(&self.created) {
-            parts.push(date);
-        }
-        if self.capturing {
-            parts.push("en cours".to_string());
-        }
-        parts.join(" · ")
-    }
-}
-
-/// `14/11/2026 10:15` of an RFC 3339 time (as it is written: UTC).
-pub fn short_date(rfc3339: &str) -> Option<String> {
-    let ok = rfc3339.len() >= 16 && rfc3339.is_ascii() && rfc3339.as_bytes()[4] == b'-' && rfc3339.as_bytes()[10] == b'T';
-    ok.then(|| format!("{}/{}/{} {}:{}", &rfc3339[8..10], &rfc3339[5..7], &rfc3339[0..4], &rfc3339[11..13], &rfc3339[14..16]))
 }
 
 /// `GET /api/captures`.
@@ -186,6 +161,9 @@ pub struct Refined {
     pub beyond_sensor: bool,
     /// Where a refined room is first looked at from: eye, then target.
     pub view: Option<[f32; 6]>,
+    /// Held-out score, when the server's description has one.
+    pub psnr: Option<f64>,
+    pub ssim: Option<f64>,
 }
 
 impl Refined {
@@ -204,17 +182,6 @@ impl Refined {
     /// File name without `.ply`: the name of its share archive.
     pub fn stem(&self) -> &str {
         self.file.strip_suffix(".ply").unwrap_or(&self.file)
-    }
-
-    /// `Standard · 412 300 gaussiennes · 28,0 Mo`.
-    pub fn meta(&self) -> String {
-        let preset = Preset::from_id(&self.preset).map_or("Affinage", Preset::label);
-        let mut parts = vec![preset.to_string()];
-        if self.gaussians > 0 {
-            parts.push(format!("{} gaussiennes", format::count(self.gaussians)));
-        }
-        parts.push(super::replay::size(self.size));
-        parts.join(" · ")
     }
 }
 
@@ -557,7 +524,6 @@ mod tests {
         let salon = &list.captures[0];
         assert_eq!((salon.title.as_str(), salon.mode.as_str(), salon.size), ("Salon", "room", 13_002_342));
         assert!(salon.refinable());
-        assert_eq!(salon.meta(), "Pièce · 13 Mo · 14/11/2026 10:15");
         // A capture without a title is called by its file; a live one is not refined.
         assert_eq!(list.captures[1].title, "direct");
         assert!(!list.captures[1].refinable());
@@ -624,7 +590,7 @@ mod tests {
         let (bad, text) = done.text();
         assert!(!bad && text.contains("412\u{202f}300 gaussiennes") && text.contains("3 minutes"), "{text}");
         let result = done.result.clone().unwrap();
-        assert_eq!((result.stem(), result.meta().as_str()), ("a-rapide", "Rapide · 412\u{202f}300 gaussiennes · 28 Mo"));
+        assert_eq!(result.stem(), "a-rapide");
 
         let cancelled = JobEnd { outcome: "cancelled".into(), result: None, ..done.clone() };
         assert!(cancelled.text().1.contains("rien n'a été conservé") && !cancelled.is_done());

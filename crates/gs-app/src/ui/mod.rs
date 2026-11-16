@@ -6,6 +6,7 @@ mod overlays;
 mod panel;
 mod phone;
 mod refine;
+mod rooms;
 mod sections;
 mod takes;
 mod timeline;
@@ -14,6 +15,7 @@ mod widgets;
 
 pub use overlays::Overlays;
 pub use panel::Panel;
+pub use rooms::Rooms;
 pub use takes::ShareDialog;
 pub use timeline::Timeline;
 pub use topbar::TopBar;

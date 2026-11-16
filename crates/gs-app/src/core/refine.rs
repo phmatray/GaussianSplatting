@@ -182,6 +182,12 @@ impl Core {
         self.server_url(&format!("/refined/{}", encode_query_value(file)))
     }
 
+    /// The photograph the gallery shows a kept capture by.
+    pub fn capture_photo_url(&self, file: &str) -> Option<String> {
+        // `v` changes when the server's choice of photograph does.
+        self.server_url(&format!("/captures/{}/photo?v=2", encode_query_value(file)))
+    }
+
     /// Shows a kept capture again: the server ingests its file once more
     /// and every viewer is switched to it.
     pub fn open_capture(&self, file: &str) {
