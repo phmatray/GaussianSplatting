@@ -43,8 +43,10 @@ const EXTENT_MARGIN: f32 = 0.1;
 const INTERIOR_SHARE: f32 = 0.15;
 /// A plane within this angle (cosine of 10 degrees)...
 const DUPLICATE_COS: f32 = 0.985;
-/// ...and this distance of a wall along its whole length is that wall.
-const DUPLICATE_DISTANCE: f32 = 0.5;
+/// ...and this distance of a wall along its whole length is that wall:
+/// below the shallowest furniture ([`FURNITURE_DEPTH`] starts at 0.25 m),
+/// so that a bookcase found first never makes the wall behind it a duplicate.
+const DUPLICATE_DISTANCE: f32 = 0.2;
 /// A splat this close to a wall's plane, within its extent, is the wall.
 const ON_WALL: f32 = 0.12;
 /// A wall-sized plane with a wall parallel to it less than this far behind
@@ -68,6 +70,16 @@ pub struct Wall {
 }
 
 impl Wall {
+    /// The wall as eight numbers, for files (normal, offset, tangent, from,
+    /// to, cuts as 1 or 0).
+    pub fn to_array(&self) -> [f32; 8] {
+        [self.normal.x, self.normal.y, self.offset, self.tangent.x, self.tangent.y, self.from, self.to, if self.cuts { 1.0 } else { 0.0 }]
+    }
+
+    pub fn from_array(a: [f32; 8]) -> Self {
+        Self { normal: Vec2::new(a[0], a[1]), offset: a[2], tangent: Vec2::new(a[3], a[4]), from: a[5], to: a[6], cuts: a[7] > 0.5 }
+    }
+
     /// Signed distance of a top-down point into the room (negative behind
     /// the wall).
     fn inward(&self, p: Vec2) -> f32 {
@@ -157,11 +169,22 @@ pub fn find_walls(splats: &[Splat], floor: f32, ceiling: Option<f32>, cameras: &
             continue;
         }
         tried.push((normal, offset));
-        let inliers: Vec<(f32, f32)> = material
-            .iter()
-            .filter(|(p, n, _)| (p.dot(normal) - offset).abs() < INLIER_DISTANCE && n.dot(normal).abs() > INLIER_COS)
-            .map(|(p, _, y)| (p.dot(normal.perp()), *y))
-            .collect();
+        // The bin's direction and offset are coarse (2 degrees, 5 cm): over a
+        // long wall that leaves only part of it within the inlier band.
+        // Refit the plane on the inliers, then gather them again.
+        let gather = |normal: Vec2, offset: f32| -> Vec<(Vec2, f32)> {
+            material
+                .iter()
+                .filter(|(p, n, _)| (p.dot(normal) - offset).abs() < INLIER_DISTANCE && n.dot(normal).abs() > INLIER_COS)
+                .map(|(p, _, y)| (*p, *y))
+                .collect()
+        };
+        let first = gather(normal, offset);
+        if first.len() < min_votes as usize {
+            continue;
+        }
+        let (normal, offset) = refit(&first, normal).unwrap_or((normal, offset));
+        let inliers: Vec<(f32, f32)> = gather(normal, offset).into_iter().map(|(p, y)| (p.dot(normal.perp()), y)).collect();
         if inliers.len() < min_votes as usize {
             continue;
         }
@@ -213,7 +236,33 @@ pub fn find_walls(splats: &[Splat], floor: f32, ceiling: Option<f32>, cameras: &
     for (w, is_furniture) in walls.iter_mut().zip(furniture) {
         w.cuts &= !is_furniture;
     }
+    // A plane standing behind a cutting wall is no wall of this room: the
+    // reflection of the opposite wall in a mirror, or the far wall of the
+    // next room through a door. Kept, it would protect itself from the cut.
+    let ghosts: Vec<bool> = walls.iter().map(|w| walls.iter().any(|c| c.hides(w.tangent * ((w.from + w.to) / 2.0) + w.normal * w.offset))).collect();
+    let mut ghosts = ghosts.into_iter();
+    walls.retain(|_| !ghosts.next().unwrap_or(false));
     walls
+}
+
+/// The line through top-down points by least squares: its normal (turned to
+/// agree with `near`) and offset.
+fn refit(points: &[(Vec2, f32)], near: Vec2) -> Option<(Vec2, f32)> {
+    let n = points.len() as f32;
+    let mean = points.iter().fold(Vec2::ZERO, |m, (p, _)| m + *p) / n;
+    let (mut xx, mut xy, mut yy) = (0.0f32, 0.0f32, 0.0f32);
+    for (p, _) in points {
+        let d = *p - mean;
+        xx += d.x * d.x;
+        xy += d.x * d.y;
+        yy += d.y * d.y;
+    }
+    // The direction of least spread of the 2x2 covariance.
+    let angle = 0.5 * (2.0 * xy).atan2(xx - yy);
+    let along = Vec2::new(angle.cos(), angle.sin());
+    let normal = along.perp();
+    let normal = if normal.dot(near) < 0.0 { -normal } else { normal };
+    (normal.is_finite() && normal.dot(near) > 0.98).then_some((normal, mean.dot(normal)))
 }
 
 /// For each splat, whether it stands behind one of `walls`.
@@ -331,6 +380,42 @@ mod tests {
         s.extend((0..50).map(|i| Splat::surfel(Vec3::new(1.0 + 0.04 * i as f32, 0.5, 0.3), Vec3::Y, 0.02, 0.003, [30; 4])));
         let walls = find_walls(&s, 0.0, Some(2.5), &cameras);
         assert!(behind_walls(&s, &walls)[boxes..].iter().all(|b| !b), "{walls:?}");
+    }
+
+    #[test]
+    fn the_reflection_of_a_whole_wall_goes_too() {
+        let mut s = Vec::new();
+        let cameras = room(&mut s);
+        // Through the glass door at z = 3, the mirror image of the wall at
+        // z = 0 stands at z = 6, floor to ceiling, facing the cameras.
+        let first = s.len();
+        wall(Vec2::new(0.5, 6.0), Vec2::new(3.5, 6.0), Vec2::NEG_Y, 2.5, &mut s);
+        let walls = find_walls(&s, 0.0, Some(2.5), &cameras);
+        let behind = behind_walls(&s, &walls);
+        assert!(behind[first..].iter().all(|b| *b), "{walls:?}");
+        assert!(behind[..first].iter().all(|b| !b));
+    }
+
+    #[test]
+    fn a_shallow_bookcase_keeps_its_wall() {
+        let mut s = Vec::new();
+        let cameras = room(&mut s);
+        // 0.3 m deep, 2.3 m high, against the wall at z = 0.
+        let first = s.len();
+        wall(Vec2::new(0.8, 0.3), Vec2::new(3.2, 0.3), Vec2::Y, 2.3, &mut s);
+        let walls = find_walls(&s, 0.0, Some(2.5), &cameras);
+        let behind = behind_walls(&s, &walls);
+        assert_eq!(behind[..first].iter().filter(|b| **b).count(), 0, "{walls:?}");
+    }
+
+    #[test]
+    fn a_long_wall_is_fitted_end_to_end() {
+        let mut s = Vec::new();
+        let cameras = room(&mut s);
+        let walls = find_walls(&s, 0.0, Some(2.5), &cameras);
+        // The wall at z = 0 runs from x = 0 to 4.
+        let w = walls.iter().find(|w| w.normal.y > 0.99).expect("the wall at z = 0");
+        assert!(w.to - w.from > 3.7, "{w:?}");
     }
 
     #[test]

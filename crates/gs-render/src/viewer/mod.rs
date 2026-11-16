@@ -409,6 +409,13 @@ impl Viewer {
         self.inner.fov_y.get()
     }
 
+    /// The vertical field of view the view is drawn with: [`Self::fov_y`],
+    /// opened on a portrait canvas ([`fov_for_aspect`]). What framing and
+    /// panning must use.
+    pub fn view_fov_y(&self) -> f32 {
+        self.inner.view_fov_y()
+    }
+
     /// Orbit mode: rotate slowly around the target after a few seconds
     /// without input, at `speed` rad/s. `None` turns it off.
     pub fn set_auto_rotate(&self, speed: Option<f32>) {
@@ -658,6 +665,16 @@ impl Inner {
         // The browser may allocate less than requested (memory limits).
         let actual = |v: i32, wanted: u32| if v > 0 { v as u32 } else { wanted };
         (actual(self.gl.drawing_buffer_width(), width), actual(self.gl.drawing_buffer_height(), height), changed, scale)
+    }
+
+    /// The drawn vertical field of view, from the canvas's shape.
+    pub(super) fn view_fov_y(&self) -> f32 {
+        let (w, h) = (self.canvas.client_width(), self.canvas.client_height());
+        if w > 0 && h > 0 {
+            fov_for_aspect(self.fov_y.get(), w as f32 / h as f32)
+        } else {
+            self.fov_y.get()
+        }
     }
 
     fn on_desktop_frame(&self, time_ms: f64) {

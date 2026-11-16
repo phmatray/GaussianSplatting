@@ -631,7 +631,7 @@ impl Core {
         // the phone stood, inside the room and often a step from a wall.
         let capture_view = |state: &SessionState| {
             let (capture, bounds) = (state.capture.as_ref()?, present::scene_hints(state).bounds?);
-            Some(present::capture_view(&bounds, present::capture_room(&capture.mode), self.viewer.fov_y(), self.aspect()))
+            Some(present::capture_view(&bounds, present::capture_room(&capture.mode), self.viewer.view_fov_y(), self.aspect()))
         };
         if reset_view {
             let nav = present::session_nav(state);
@@ -859,7 +859,7 @@ impl Core {
                 new.nav = NavMode::Orbit;
                 self.viewer.set_nav_mode(NavMode::Orbit);
                 let (eye, target) =
-                    present::dollhouse_view(&bounds, wall_top, self.viewer.fov_y(), self.aspect(), self.covered_by_panel());
+                    present::dollhouse_view(&bounds, wall_top, self.viewer.view_fov_y(), self.aspect(), self.covered_by_panel());
                 self.viewer.set_view(eye, target);
             } else {
                 new.dollhouse = false;
@@ -1103,7 +1103,7 @@ impl Core {
         self.saved_view.set(None);
         self.viewer.set_nav_mode(NavMode::Orbit);
         if let Some(bounds) = bounds {
-            let (eye, target) = present::frame_view(&bounds, self.viewer.fov_y(), self.aspect());
+            let (eye, target) = present::frame_view(&bounds, self.viewer.view_fov_y(), self.aspect());
             self.viewer.set_view(eye, target);
         }
         // A file is shown as it was written (`scale_scene`).

@@ -307,8 +307,8 @@ pub struct RefineJob {
     pub trainer: Trainer<CpuRasterizer>,
     holdout: Vec<ViewInfo>,
     fused: Vec<Splat>,
-    /// Walls of the room; a job resumed from a checkpoint has none (the
-    /// result is then not cut behind them).
+    /// Walls of the room, behind which the result is cut (also kept in
+    /// checkpoints).
     walls: Vec<gs_core::walls::Wall>,
     pool: rayon::ThreadPool,
     cache: ViewCache,
@@ -866,6 +866,11 @@ struct CheckpointHeader {
     best: Option<(f32, u32, usize)>,
     warm_up: WarmUp,
     last_width: u32,
+    /// The room's walls ([`gs_core::walls::Wall::to_array`]): a resumed job
+    /// cuts its result behind them as a job run at one go does. Absent from
+    /// checkpoints written before them.
+    #[serde(default)]
+    walls: Vec<[f32; 8]>,
 }
 
 fn view_floats(state: &ViewState) -> [f32; VIEW_FLOATS] {
@@ -939,6 +944,7 @@ impl RefineJob {
             fusion_score: self.fusion_score,
             fused_splats: self.fused.len(),
             best: self.best.as_ref().map(|(score, iteration, model)| (*score, *iteration, model.len())),
+            walls: self.walls.iter().map(gs_core::walls::Wall::to_array).collect(),
             warm_up: self.warm_up,
             last_width: self.last_width,
         };
@@ -1048,7 +1054,7 @@ impl RefineJob {
             trainer,
             holdout,
             fused,
-            walls: Vec::new(),
+            walls: header.walls.iter().copied().map(gs_core::walls::Wall::from_array).collect(),
             checkpoint: Some(checkpoint.to_path_buf()),
             wall_s: header.wall_s,
             cpu_s: header.cpu_s,
