@@ -177,8 +177,8 @@ fn state(core: &Core) -> Value {
         "errors": core.errors(),
     });
     // Added one by one: the macro above is at its recursion limit.
-    state["captures"] = json!(ui.captures.get_untracked().iter().map(|c| json!({ "file": c.file, "title": c.title, "mode": c.mode, "size": c.size, "capturing": c.capturing })).collect::<Vec<_>>());
-    state["refined"] = json!(ui.refined.get_untracked().iter().map(|r| json!({ "file": r.file, "title": r.title, "capture": r.capture, "preset": r.preset, "gaussians": r.gaussians, "size": r.size })).collect::<Vec<_>>());
+    state["captures"] = json!(ui.captures.get_untracked().iter().map(|c| json!({ "file": c.file, "title": c.title, "mode": c.mode, "size": c.size, "capturing": c.capturing, "frames": c.frames, "durationS": c.duration_s })).collect::<Vec<_>>());
+    state["refined"] = json!(ui.refined.get_untracked().iter().map(|r| json!({ "file": r.file, "title": r.title, "capture": r.capture, "preset": r.preset, "gaussians": r.gaussians, "size": r.size, "psnr": r.psnr })).collect::<Vec<_>>());
     state["job"] = json!(ui.job.get_untracked().map(|j| json!({ "id": j.id, "kind": j.kind, "capture": j.capture, "stage": j.stage, "iteration": j.iteration, "iterations": j.iterations, "cancelling": j.cancelling })));
     state["jobEnd"] = json!(ui.job_end.get_untracked().map(|e| json!({ "id": e.id, "kind": e.kind, "outcome": e.outcome, "result": e.result.as_ref().map(|r| r.file.clone()), "dataset": e.dataset.as_ref().map(|d| d.dir.clone()) })));
     state["storage"] = json!(ui.storage.get_untracked().map(|s| json!({ "freeBytes": s.free_bytes, "low": s.low })));

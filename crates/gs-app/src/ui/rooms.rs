@@ -95,7 +95,7 @@ fn RoomCard(room: Room) -> impl IntoView {
     let open = room.clone();
     view! {
         <li class="room-card" data-room=room.key.clone()>
-            <button type="button" class="room-open" on:click=move |_| enter_room(ui, &open) aria-label=format!("Ouvrir «\u{a0}{title}\u{a0}»")>
+            <button type="button" class="room-card-button" on:click=move |_| enter_room(ui, &open) aria-label=format!("Ouvrir «\u{a0}{title}\u{a0}»")>
                 <span class="room-photo">
                     {match photo {
                         Some(src) => view! {
@@ -320,7 +320,7 @@ fn RoomView(room: Room) -> impl IntoView {
     let refinable = room.capture.as_ref().is_some_and(|c| c.refinable()) && ui.lan_admin.get_untracked();
     let job_here = {
         let file = capture_file.clone();
-        move || ui.job.with(|job| job.as_ref().is_some_and(|j| file.as_deref() == Some(j.capture.as_str())))
+        Signal::derive(move || ui.job.with(|job| job.as_ref().is_some_and(|j| file.as_deref() == Some(j.capture.as_str()))))
     };
     let compare_label = {
         let room = room.clone();
@@ -337,6 +337,20 @@ fn RoomView(room: Room) -> impl IntoView {
             Some(name)
         })
     };
+    // With nothing seen before, Comparer offers the raw capture.
+    {
+        let capture_key = room.capture.as_ref().map(|c| format!("capture:{}", c.file));
+        Effect::new(move |_| {
+            let shown = ui.version.get();
+            if ui.compare.with_untracked(Option::is_none) {
+                if let (Some(shown), Some(capture)) = (shown, capture_key.clone()) {
+                    if shown != capture {
+                        ui.compare.set(Some(capture));
+                    }
+                }
+            }
+        });
+    }
     let subtitle = room.capture.as_ref().map_or_else(
         || "Capture absente de cet ordinateur : seuls ses résultats sont là.".to_string(),
         |c| rooms::capture_facts(c),
@@ -382,10 +396,17 @@ fn RoomView(room: Room) -> impl IntoView {
                     {room.takes.iter().map(|t| view! {
                         <VersionCard key=format!("take:{}", t.id) label=t.label().to_string() facts=t.facts() kind="take" />
                     }).collect_view()}
-                    <Show when=job_here.clone()>
-                        <li class="version job"><JobCard /></li>
+                    <Show when=move || job_here.get()>
+                        <li class="version job">
+                            <div class="version-open" role="status">
+                                <span class="version-label">{move || ui.job.get().map(|j| j.stage_label()).unwrap_or_default()}</span>
+                                <span class="version-facts">
+                                    {move || ui.job.get().and_then(|j| j.fraction()).map(|f| format!("{} %", (f * 100.0).floor())).unwrap_or_else(|| "en cours".to_string())}
+                                </span>
+                            </div>
+                        </li>
                     </Show>
-                    <Show when=move || refinable && !job_here()>
+                    <Show when=move || refinable && !job_here.get()>
                         <li class="version add">
                             <button type="button" class="version-open" aria-expanded=move || adding.get().to_string() on:click=move |_| adding.update(|a| *a = !*a)>
                                 <Icon name="sparkle" />
@@ -398,7 +419,12 @@ fn RoomView(room: Room) -> impl IntoView {
                     <div class="room-last"><LastJob /></div>
                 </Show>
             </section>
-            <Show when=move || adding.get() && capture_file.with_value(Option::is_some)>
+            <Show when=move || job_here.get()>
+                <div class="room-refine" role="region" aria-label="Calcul en cours">
+                    <JobCard />
+                </div>
+            </Show>
+            <Show when=move || adding.get() && capture_file.with_value(Option::is_some) && !job_here.get()>
                 <div class="room-refine" role="dialog" aria-label="Nouvel affinage">
                     <div class="room-refine-head">
                         <h3>"Nouvel affinage"</h3>

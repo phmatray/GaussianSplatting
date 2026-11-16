@@ -1,5 +1,5 @@
-// "Affiner cette capture", end to end, with a native gs-server: a capture
-// file goes to the server, is listed among the kept captures, is refined
+// "Nouvel affinage", end to end, with a native gs-server: a capture
+// file goes to the server, becomes a room of the Pièces gallery, is refined
 // (the rapide preset cut down to seconds with --refine-iterations), its
 // result is shown, downloaded, shared and deleted; a job is cancelled; the
 // capture is exported as a dataset and reopened. Also what day one with a
@@ -57,9 +57,25 @@ async function run({ browser, url: staticUrl }) {
       if (request.method() === 'POST') posts.push(new URL(request.url()).pathname);
     });
     let s = await open(page, url);
-    const section = page.locator('#section-captures');
-    await section.scrollIntoViewIfNeeded();
-    check('refine: with a server the panel lists the kept captures, none yet', (await page.locator('#captures-empty').count()) === 1 && (await page.locator('#captures-absent').count()) === 0 && s.captures.length === 0 && s.refined.length === 0, (await section.innerText()).replace(/\s+/g, ' ').slice(0, 160));
+    // The kept captures live in the Pièces workspace, one card per room.
+    const toRooms = async () => {
+      if ((await page.locator('#ws-rooms').getAttribute('aria-selected')) !== 'true') await page.click('#ws-rooms');
+      if ((await page.locator('#room-view').count()) === 1) await page.click('#ws-rooms');
+      await page.waitForSelector('#gallery');
+    };
+    const toDirect = async () => {
+      await page.click('#ws-direct');
+      await page.waitForFunction(() => !document.querySelector('#gallery') && !document.querySelector('#room-view'));
+    };
+    const openRoom = async () => {
+      await toRooms();
+      await page.locator('.room-card .room-card-button').first().click();
+      // The room's container has no box of its own: its parts are fixed.
+      await page.waitForSelector('#room-view .room-strip');
+    };
+    await toRooms();
+    check('refine: with a server the gallery lists the kept captures, none yet', (await page.locator('.gallery-empty').count()) === 1 && !/application de bureau/.test(await page.locator('.gallery-empty').innerText()) && s.captures.length === 0 && s.refined.length === 0, (await page.locator('#gallery').innerText()).replace(/\s+/g, ' ').slice(0, 160));
+    await toDirect();
 
     // ---- a file that is no capture is refused before anything is sent
     const wrong = path.join(OUT, 'wrong.gscap');
@@ -85,14 +101,26 @@ async function run({ browser, url: staticUrl }) {
     const fused = await content(page, fusedView);
     check('refine: the captured room is drawn', fused.colors > 40 && fused.bright > 0.05, `colors ${fused.colors}, bright ${fused.bright.toFixed(3)}`);
 
-    // ---- the list and the form
-    await section.scrollIntoViewIfNeeded();
-    const row = page.locator('#captures .capture').first();
-    const rowText = (await row.innerText()).replace(/\s+/g, ' ');
-    check('refine: the kept capture is listed with its mode, size and date', (await page.locator('#captures .capture').count()) === 1 && /Simulation bedroom/.test(rowText) && /Pièce/.test(rowText) && /(ko|Mo)/.test(rowText) && /\d\d\/\d\d\/\d{4}/.test(rowText), rowText);
-    const labels = await row.locator('.take-actions button').evaluateAll((buttons) => buttons.map((b) => b.getAttribute('aria-label')));
-    check('refine: a capture can be reopened, refined and deleted', labels.length === 3 && /^Rouvrir/.test(labels[0]) && /^Affiner/.test(labels[1]) && /^Supprimer/.test(labels[2]), labels.join(' | '));
-    await row.locator('.capture-refine').click();
+    // ---- the gallery, the room and the form
+    await toRooms();
+    const card = page.locator('.room-card').first();
+    await waitState(page, (s) => s.captures.length === 1 && s.captures[0].frames === 80, 30000);
+    await sleep(300);
+    const cardText = (await card.innerText()).replace(/\s+/g, ' ');
+    check('refine: the kept capture is a room card with its mode, frames, size and versions', (await page.locator('.room-card').count()) === 1 && /Simulation bedroom/.test(cardText) && /Pièce/.test(cardText) && /80 images/.test(cardText) && /(ko|Mo)/.test(cardText) && /\d versions?/.test(cardText) && /pas encore affinée/.test(cardText), cardText);
+    await openRoom();
+    const strip = (await page.locator('.room-strip').innerText()).replace(/\s+/g, ' ');
+    check('refine: an opened room shows its raw capture and offers a new refinement', /Capture brute/.test(strip) && /Nouvel affinage/.test(strip) && (await page.locator('.version[data-kind=refined]').count()) === 0, strip);
+    // The mouse over the window of an open room moves nothing: the app root
+    // once shared a class with the gallery's cards and took their hover
+    // lift, which re-anchored every fixed part (the view, the strip) to it.
+    const boxes = [];
+    for (let i = 0; i < 12; i++) {
+      await page.mouse.move(300 + i * 40, 300 + (i % 3) * 20);
+      boxes.push(await page.evaluate(() => [Math.round(document.querySelector('.room-strip').getBoundingClientRect().top), document.getElementById('view').clientHeight, getComputedStyle(document.getElementById('app')).transform]));
+    }
+    check('refine: the mouse over an open room moves neither the strip nor the view', boxes.every((b) => b[0] === boxes[0][0] && b[1] === boxes[0][1] && b[2] === 'none'), JSON.stringify(boxes.slice(0, 3)));
+    await page.click('.version.add .version-open');
     await page.waitForSelector('#refine-form');
     const honest = await page.locator('#refine-honest').innerText();
     check('refine: the form says what the refinement gains, on what data, and that it is CPU only', /simulées/.test(honest) && /contours/.test(honest) && /trajet du téléphone/.test(honest) && /moutonnement/.test(honest) && /processeur/.test(honest) && /GPU/.test(honest) && /n'existe pas encore/.test(honest), honest);
@@ -103,14 +131,14 @@ async function run({ browser, url: staticUrl }) {
     }
     check('refine: each preset says what it costs, as measured on the development machine', /480 pixels/.test(hints[0]) && /minutes/.test(hints[0]) && /640 pixels/.test(hints[1]) && /960 pixels/.test(hints[2]) && /Jamais mené à son terme/.test(hints[2]) && hints.every((h) => /machine de développement/.test(h)), hints.join(' | '));
     check('refine: the choice for what the sensor did not measure is offered', /Peindre/.test(await page.locator('#refine-beyond-0').innerText()) && /Laisser les trous/.test(await page.locator('#refine-beyond-1').innerText()));
-    check('refine: no text of the form uses a dash as punctuation', !/[\u2013\u2014]/.test(await page.locator('#refine-form').innerText()));
+    check('refine: no text of the form uses a dash as punctuation', !/[–—]/.test(await page.locator('#refine-form').innerText()));
     await page.click('#refine-preset-0');
     await shot(page, 'refine-form.png');
 
     // ---- a job is started, watched and cancelled: nothing is kept
     await page.click('#refine-start');
     s = await waitState(page, (s) => s.job && s.job.stage === 'optimise' && s.job.iteration >= 5, 120000);
-    check('refine: the job runs on the server and the page follows it', s.job.kind === 'refine' && s.job.capture === kept.file && s.job.iterations === ITERATIONS && (await page.locator('#refine-form').count()) === 0, JSON.stringify(s.job));
+    check('refine: the job runs on the server and the page follows it, in the strip', s.job.kind === 'refine' && s.job.capture === kept.file && s.job.iterations === ITERATIONS && (await page.locator('.version.job').count()) === 1 && (await page.locator('.room-refine #refine-job').count()) === 1, JSON.stringify(s.job));
     const info = await getJson(`${url}api/info`);
     check('refine: the server stays responsive while it refines', info.status === 200 && s.connected);
     await page.click('#refine-cancel');
@@ -122,14 +150,13 @@ async function run({ browser, url: staticUrl }) {
     await page.waitForFunction(() => !document.querySelector('#refine-last'));
 
     // ---- the job again, to its end
-    await row.locator('.capture-refine').click();
+    if ((await page.locator('#refine-form').count()) === 0) await page.click('.version.add .version-open');
     await page.click('#refine-preset-0');
     const started = Date.now();
     await page.click('#refine-start');
     s = await waitState(page, (s) => s.job && s.job.stage === 'optimise' && s.job.iteration >= 10, 120000);
-    await section.scrollIntoViewIfNeeded();
-    const card = (await page.locator('#refine-job').innerText()).replace(/\s+/g, ' ');
-    check('refine: the job card shows the stage, the iteration, the time and the way to stop', /Optimisation/.test(card) && /Rapide/.test(card) && /Itération \d+ sur 150/.test(card) && /gaussiennes/.test(card) && /Depuis/.test(card) && /Annuler/.test(card) && /Simulation bedroom/.test(card) && !/dB|PSNR/.test(card), card);
+    const jobCard = (await page.locator('#refine-job').innerText()).replace(/\s+/g, ' ');
+    check('refine: the job card shows the stage, the iteration, the time and the way to stop', /Optimisation/.test(jobCard) && /Rapide/.test(jobCard) && /Itération \d+ sur 150/.test(jobCard) && /gaussiennes/.test(jobCard) && /Depuis/.test(jobCard) && /Annuler/.test(jobCard) && /Simulation bedroom/.test(jobCard) && !/dB|PSNR/.test(jobCard), jobCard);
     const bar = await page.locator('#refine-job [role=progressbar]').getAttribute('aria-valuenow');
     check('refine: the progress bar follows the iterations', Number(bar) > 0 && Number(bar) < 100, `aria-valuenow ${bar}`);
     check('refine: while a job runs no other can be started', (await page.locator('#refine-start').count()) === 0 || (await page.locator('#refine-start').isDisabled()));
@@ -140,31 +167,37 @@ async function run({ browser, url: staticUrl }) {
     const result = s.refined[0];
     const summary = await page.locator('#refine-summary').innerText();
     check('refine: the job ends with a result, summed up in one sentence', s.jobEnd.outcome === 'done' && s.jobEnd.result === result.file && /est affinée/.test(summary) && /gaussiennes/.test(summary) && !/dB|PSNR/.test(summary) && /est affinée/.test(s.notice.text), summary);
-    check('refine: the result is listed with its preset and size', result.preset === 'rapide' && result.capture === kept.file && result.gaussians > 1000 && /-rapide\.ply$/.test(result.file) && /Rapide/.test(await page.locator('#refined .refined .take-meta').innerText()), JSON.stringify(result));
+    const resultCard = page.locator('.version[data-kind=refined]').first();
+    await resultCard.waitFor();
+    check('refine: the result joins the room\'s strip with its preset and held-out score', result.preset === 'rapide' && result.capture === kept.file && result.gaussians > 1000 && /-rapide\.ply$/.test(result.file) && typeof result.psnr === 'number' && /Rapide/.test(await resultCard.innerText()) && /dB/.test(await resultCard.innerText()), JSON.stringify(result));
     const onDisk = fs.readdirSync(path.join(tmp, 'refined')).sort();
     check('refine: the server keeps the .ply and its description', onDisk.length === 2 && onDisk[0] === result.file.replace(/\.ply$/, '.json') && onDisk[1] === result.file, onDisk.join(','));
 
-    // ---- "Voir le résultat"
-    await page.click('#refine-view');
+    // ---- the result on screen
+    await resultCard.locator('.version-open').click();
     s = await waitState(page, (s, n) => s.file && s.fileMode && s.layers.static === n, 120000, result.gaussians);
     check('refine: the result opens in the viewer as an imported file, drawn sorted', s.file.name === result.file && s.file.splats === result.gaussians && s.viewer.blend === 'sorted' && s.layers.dynamic === 0, `${s.file.splats} splats, blend ${s.viewer.blend}`);
     check('refine: a refined room is looked at from inside, for a walk', s.nav === 'fly' && s.eye[1] > 0.5 && s.eye[1] < 2.0 && Math.abs(s.eye[0]) < 4 && Math.abs(s.eye[2]) < 6, `nav ${s.nav}, eye ${JSON.stringify(s.eye)}`);
     await sleep(600);
-    await section.scrollIntoViewIfNeeded();
     await shot(page, 'refine-result.png');
     const refinedView = await viewShot(page, 'refine-result-view.png');
     const refined = await content(page, refinedView);
     check('refine: the refined room is drawn', refined.colors > 40 && refined.bright > 0.05, `colors ${refined.colors}, bright ${refined.bright.toFixed(3)}`);
-    check('refine: the row of the result on screen is marked', (await page.locator('#refined .refined').first().getAttribute('class')).includes('playing'));
-    await page.locator('#section-file').scrollIntoViewIfNeeded();
-    await page.click('#back-live');
+    check('refine: the version on screen is marked in the strip', (await resultCard.getAttribute('class')).includes('on'));
+    check('refine: Comparer offers the raw capture', !(await page.locator('#room-compare').isDisabled()) && /Capture brute/.test(await page.locator('#room-compare').getAttribute('title')));
+    await toDirect();
     s = await waitState(page, (s) => !s.file && s.capture && s.layers.static > 0 && s.sceneName === 'capture', 60000);
-    check('refine: "Revenir au direct" returns to the capture as it was fused', s.capture.stats === null || s.capture.stats.finished);
+    check('refine: Direct returns to the capture as it was fused', s.capture.stats === null || s.capture.stats.finished);
 
     // ---- download
-    await section.scrollIntoViewIfNeeded();
-    const resultRow = page.locator('#refined .refined').first();
-    const [download] = await Promise.all([page.waitForEvent('download'), resultRow.locator('.refined-download').click()]);
+    const showResult = async () => {
+      await openRoom();
+      const r = page.locator('.version[data-kind=refined]').first();
+      if (!(await r.getAttribute('class')).includes('on')) await r.locator('.version-open').click();
+      await page.waitForSelector('.version-actions [aria-label=Télécharger]');
+    };
+    await showResult();
+    const [download] = await Promise.all([page.waitForEvent('download'), page.click('.version-actions [aria-label=Télécharger]')]);
     const saved = path.join(OUT, 'refine-result.ply');
     await download.saveAs(saved);
     const head = fs.readFileSync(saved).subarray(0, 4).toString('latin1');
@@ -172,7 +205,7 @@ async function run({ browser, url: staticUrl }) {
     fs.rmSync(saved, { force: true });
 
     // ---- shared like a recording: LAN link, embedded viewer, archive
-    await resultRow.locator('.refined-share').click();
+    await page.click('.version-actions [aria-label=Partager]');
     await page.waitForSelector('#share-dialog');
     check('refine: the share dialog opens on the refined result', /Simulation bedroom/.test(await page.locator('#share-title').innerText()) && /Capture affinée/.test(await page.locator('#share-dialog').innerText()));
     if ((await page.locator('#share-lan-on').count()) === 1) await page.click('#share-lan-on');
@@ -202,39 +235,45 @@ async function run({ browser, url: staticUrl }) {
     // A client of the LAN side lists the results and nothing else.
     await guestPage.goto(`https://127.0.0.1:${lanPort}/`);
     g = await waitState(guestPage, (s) => s.connected && s.refined.length === 1, 90000);
-    check('refine: a LAN client sees the refined results, not the raw captures', (await guestPage.locator('#captures-remote').count()) === 1 && (await guestPage.locator('#captures .capture').count()) === 0 && g.captures.length === 0 && (await guestPage.locator('#refined .refined-view').count()) === 1 && (await guestPage.locator('#refined .refined-delete').count()) === 0);
+    await guestPage.click('#ws-rooms');
+    await guestPage.waitForSelector('#gallery');
+    check('refine: a LAN client sees the refined results, not the raw captures', (await guestPage.locator('.orphan').count()) === 1 && (await guestPage.locator('.room-card').count()) === 0 && (await guestPage.locator('#gallery-import').count()) === 0 && g.captures.length === 0);
     await guest.close();
 
     // ---- the capture as a dataset for another trainer
-    await row.locator('.capture-refine').click();
+    await openRoom();
+    await page.click('.version.add .version-open');
     await page.click('#export-colmap');
     s = await waitState(page, (s) => !s.job && s.jobEnd && s.jobEnd.kind === 'export', 180000);
     const dir = await page.locator('#dataset-dir').inputValue();
     check('refine: the capture is exported as a COLMAP dataset, in a directory the page shows', s.jobEnd.outcome === 'done' && s.jobEnd.dataset === dir && dir.startsWith(path.join(tmp, 'datasets')) && fs.existsSync(path.join(dir, 'sparse/0/cameras.txt')) && fs.readdirSync(path.join(dir, 'images')).length > 20 && /COLMAP/.test(await page.locator('#refine-summary').innerText()), dir);
     await page.click('#refine-dismiss');
 
-    // ---- leaving the capture, and opening it again from the list
+    // ---- leaving the capture, and opening it again from its room
+    await toDirect();
     await page.click('#mode-stage');
     s = await waitState(page, (s) => s.scene === 'stage' && !s.capture && s.layers.dynamic > 0, 60000);
     check('refine: the pause button is back with the simulation', await page.locator('#btn-pause').isVisible());
-    await section.scrollIntoViewIfNeeded();
-    await row.locator('.capture-open').click();
+    await openRoom();
+    await page.click('.version[data-kind=capture] .version-open');
     s = await waitState(page, (s) => s.capture && s.capture.stats && s.capture.stats.finished && s.import && s.import.progress.done, 180000);
-    check('refine: a kept capture is reopened from the list', s.sceneName === 'capture' && s.import.upload && s.import.progress.frames === 80 && posts.includes('/api/captures/open'), JSON.stringify(s.import.progress));
-    await page.click('#import-dismiss');
+    check('refine: a kept capture is reopened from its room', s.sceneName === 'capture' && s.import.upload && s.import.progress.frames === 80 && posts.includes('/api/captures/open'), JSON.stringify(s.import.progress));
 
     // ---- deleting asks once more
-    const bin = resultRow.locator('.refined-delete');
+    await page.locator('.version[data-kind=refined] .version-open').first().click();
+    s = await waitState(page, (s, name) => s.file && s.file.name === name, 120000, result.file);
+    const bin = page.locator('.version-delete');
     await bin.click();
     check('refine: the bin of a result asks before it deletes', (await bin.getAttribute('class')).includes('confirm') && /Supprimer/.test(await bin.innerText()) && s.refined.length === 1);
     await bin.click();
     s = await waitState(page, (s) => s.refined.length === 0, 30000);
     check('refine: the result and its description are deleted from the disk', fs.readdirSync(path.join(tmp, 'refined')).length === 0);
-    const captureBin = row.locator('.capture-delete');
+    await page.click('.version[data-kind=capture] .version-open');
+    const captureBin = page.locator('.room-delete');
     await captureBin.click();
     await captureBin.click();
     s = await waitState(page, (s) => s.captures.length === 0, 30000);
-    check('refine: a kept capture can be deleted', fs.readdirSync(path.join(tmp, 'captures')).filter((f) => f.endsWith('.gscap')).length === 0);
+    check('refine: a kept capture can be deleted from its room', fs.readdirSync(path.join(tmp, 'captures')).filter((f) => f.endsWith('.gscap')).length === 0);
 
     s = await state(page);
     check('refine: no application error', s.errors.length === 0, s.errors.join(' | '));
@@ -244,9 +283,10 @@ async function run({ browser, url: staticUrl }) {
     // ---- without a server: one sentence
     const alone = await newPage(browser);
     await open(alone.page, staticUrl);
-    await alone.page.locator('#section-captures').scrollIntoViewIfNeeded();
-    const absent = await alone.page.locator('#section-captures').innerText();
-    check('refine: without a server the feature is absent, with one sentence saying why', (await alone.page.locator('#captures-absent').count()) === 1 && /application de bureau/.test(absent) && /ne tourne pas dans une page web/.test(absent) && (await alone.page.locator('#captures').count()) === 0 && (await alone.page.locator('#refine-start').count()) === 0, absent.replace(/\s+/g, ' '));
+    await alone.page.click('#ws-rooms');
+    await alone.page.waitForSelector('#gallery');
+    const absent = await alone.page.locator('#gallery').innerText();
+    check('refine: without a server the feature is absent, with one sentence saying why', /application de bureau/.test(absent) && /ne tourne pas dans une page web/.test(absent) && (await alone.page.locator('.room-card').count()) === 0 && (await alone.page.locator('#refine-start').count()) === 0, absent.replace(/\s+/g, ' '));
     await shot(alone.page, 'refine-absent.png');
     await alone.ctx.close();
   } finally {
