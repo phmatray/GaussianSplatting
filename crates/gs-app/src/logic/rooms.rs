@@ -73,7 +73,11 @@ impl Room {
             parts.push(mode.to_string());
         }
         if let Some(capture) = &self.capture {
-            parts.push(super::replay::size(capture.size));
+            if capture.frames > 0 {
+                parts.push(format!("{} images", format::count(u64::from(capture.frames))));
+            } else {
+                parts.push(super::replay::size(capture.size));
+            }
         } else {
             parts.push("capture absente de cet ordinateur".to_string());
         }
@@ -93,9 +97,18 @@ pub fn mode_label(mode: &str) -> Option<&'static str> {
     }
 }
 
-/// `Pièce · 164 Mo · iPhone16,2`: the title already says when.
+/// `Pièce · 1 318 images · 4 min 08 · 164 Mo · iPhone 15 Pro Max`: the
+/// title already says when.
 pub fn capture_facts(capture: &KeptCapture) -> String {
-    let mut parts = vec![mode_label(&capture.mode).unwrap_or("Capture").to_string(), super::replay::size(capture.size)];
+    let mut parts = vec![mode_label(&capture.mode).unwrap_or("Capture").to_string()];
+    if capture.frames > 0 {
+        parts.push(format!("{} images", format::count(u64::from(capture.frames))));
+    }
+    if capture.duration_s >= 1.0 {
+        let s = capture.duration_s.round() as u64;
+        parts.push(if s >= 60 { format!("{} min {:02}", s / 60, s % 60) } else { format!("{s} s") });
+    }
+    parts.push(super::replay::size(capture.size));
     if let Some(name) = device_name(&capture.device) {
         parts.push(name.to_string());
     }
@@ -223,5 +236,7 @@ mod tests {
         assert_eq!(room.best().map(|r| r.file.as_str()), Some("good.ply"));
         assert_eq!(score(25.92), "25,9 dB");
         assert_eq!((device_name("iPhone16,2"), device_name("iPad13,8")), (Some("iPhone 15 Pro Max"), None));
+        let c = KeptCapture { mode: "room".into(), frames: 1318, duration_s: 247.7, size: 164_000_000, device: "iPhone16,2".into(), ..KeptCapture::default() };
+        assert_eq!(capture_facts(&c), "Pièce · 1\u{202f}318 images · 4 min 08 · 164 Mo · iPhone 15 Pro Max");
     }
 }

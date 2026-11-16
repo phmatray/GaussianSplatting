@@ -107,6 +107,9 @@ pub struct KeptCapture {
     pub size: u64,
     /// The server is still writing it.
     pub capturing: bool,
+    /// Frames and the seconds they span (0 while unknown).
+    pub frames: u32,
+    pub duration_s: f64,
 }
 
 impl KeptCapture {

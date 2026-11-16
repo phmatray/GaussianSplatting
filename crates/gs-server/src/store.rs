@@ -128,6 +128,10 @@ pub struct CaptureEntry {
     /// capture its phone has finished is no longer `capturing`, although
     /// its file stays held (not deletable) for as long as it is on show.
     pub capturing: bool,
+    /// Frames in the file and seconds between the first and the last, once
+    /// the file is complete (0 while a phone is still filming it).
+    pub frames: u32,
+    pub duration_s: f64,
 }
 
 /// What is kept next to a refined result (`<stem>.json`): where it comes
@@ -263,6 +267,9 @@ pub(crate) struct Store {
     /// Those of the busy files that are complete on disk for now and may be
     /// read ([`Hold::set_settled`]).
     settled: Mutex<HashSet<(Kind, String)>>,
+    /// Frames and duration of complete captures, by file name and size:
+    /// counting reads the whole file, once.
+    capture_lengths: Mutex<std::collections::HashMap<(String, u64), (u32, f64)>>,
 }
 
 /// A file of the store that is being written. While this exists the file
@@ -412,6 +419,35 @@ fn capture_header(prefix: &[u8]) -> Option<GscapHeader> {
     }
 }
 
+/// Frames of a `.gscap` and the seconds from the first to the last.
+fn count_frames(path: &Path) -> Option<(u32, f64)> {
+    use gs_core::ingest::{FrameHeader, GscapParser, ParsedItem};
+    let mut reader = File::open(path).ok()?;
+    let mut parser = GscapParser::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    let (mut frames, mut first, mut last) = (0u32, None::<f64>, 0.0f64);
+    loop {
+        loop {
+            match parser.next_item() {
+                Ok(Some(ParsedItem::Frame(bytes))) => {
+                    if let Ok(header) = FrameHeader::parse(bytes) {
+                        frames += 1;
+                        first.get_or_insert(header.timestamp);
+                        last = header.timestamp;
+                    }
+                }
+                Ok(Some(ParsedItem::Header(_))) => {}
+                Ok(None) => break,
+                Err(_) => return Some((frames, (last - first.unwrap_or(last)).max(0.0))),
+            }
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => return Some((frames, (last - first.unwrap_or(last)).max(0.0))),
+            Ok(read) => parser.push(&chunk[..read]),
+        }
+    }
+}
+
 /// A colour frame as the phone was held: portrait frames are stored in the
 /// sensor's landscape and turned a quarter, upside-down ones a half.
 fn turn_upright(jpeg: &[u8], orientation: gs_core::ingest::Orientation) -> Option<Vec<u8>> {
@@ -446,6 +482,7 @@ impl Store {
             problem: Mutex::new(None),
             busy: Mutex::new(HashSet::new()),
             settled: Mutex::new(HashSet::new()),
+            capture_lengths: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -756,6 +793,18 @@ impl Store {
         Some(turn_upright(&jpeg, orientation).unwrap_or(jpeg))
     }
 
+    /// Frames of a complete capture and the seconds they span, read once
+    /// per file and size (frame headers only, no image is decoded).
+    fn capture_length(&self, file: &str, path: &Path, size: u64) -> (u32, f64) {
+        let key = (file.to_string(), size);
+        if let Some(known) = self.capture_lengths.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return *known;
+        }
+        let length = count_frames(path).unwrap_or((0, 0.0));
+        self.capture_lengths.lock().unwrap_or_else(|e| e.into_inner()).insert(key, length);
+        length
+    }
+
     /// Every raw capture of the directory, newest first.
     pub fn list_captures(&self) -> Vec<CaptureEntry> {
         self.files(Kind::Capture)
@@ -763,6 +812,8 @@ impl Store {
             .map(|(file, path, meta)| {
                 let header = read_prefix(&path).ok().and_then(|prefix| capture_header(&prefix)).unwrap_or_default();
                 let name = file.strip_suffix(CAPTURE_EXT).unwrap_or(&file).to_string();
+                let capturing = self.is_growing(Kind::Capture, &file);
+                let (frames, duration_s) = if capturing { (0, 0.0) } else { self.capture_length(&file, &path, meta.len()) };
                 CaptureEntry {
                     title: if header.name.is_empty() { name.clone() } else { header.name },
                     name,
@@ -771,7 +822,9 @@ impl Store {
                     created: header.created,
                     size: meta.len(),
                     url: url_of(Kind::Capture, &file),
-                    capturing: self.is_growing(Kind::Capture, &file),
+                    capturing,
+                    frames,
+                    duration_s,
                     file,
                 }
             })
