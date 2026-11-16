@@ -75,9 +75,8 @@ impl Room {
         if let Some(capture) = &self.capture {
             if capture.frames > 0 {
                 parts.push(format!("{} images", format::count(u64::from(capture.frames))));
-            } else {
-                parts.push(super::replay::size(capture.size));
             }
+            parts.push(super::replay::size(capture.size));
         } else {
             parts.push("capture absente de cet ordinateur".to_string());
         }
@@ -112,7 +111,8 @@ pub fn capture_facts(capture: &KeptCapture) -> String {
     if let Some(name) = device_name(&capture.device) {
         parts.push(name.to_string());
     }
-    parts.join(" · ")
+    // A fact never breaks across two lines; the separators may.
+    parts.iter().map(|p| p.replace(' ', "\u{a0}")).collect::<Vec<_>>().join(" · ")
 }
 
 /// The product name of an iPhone with a LiDAR sensor, from Apple's model
@@ -237,6 +237,6 @@ mod tests {
         assert_eq!(score(25.92), "25,9 dB");
         assert_eq!((device_name("iPhone16,2"), device_name("iPad13,8")), (Some("iPhone 15 Pro Max"), None));
         let c = KeptCapture { mode: "room".into(), frames: 1318, duration_s: 247.7, size: 164_000_000, device: "iPhone16,2".into(), ..KeptCapture::default() };
-        assert_eq!(capture_facts(&c), "Pièce · 1\u{202f}318 images · 4 min 08 · 164 Mo · iPhone 15 Pro Max");
+        assert_eq!(capture_facts(&c).replace('\u{a0}', " "), "Pièce · 1\u{202f}318 images · 4 min 08 · 164 Mo · iPhone 15 Pro Max");
     }
 }

@@ -559,6 +559,18 @@ fn layer_index(layer: u8) -> Result<usize, String> {
     }
 }
 
+/// The vertical field of view for a viewport of this aspect: a portrait
+/// screen opens it until the horizontal one reaches 60 degrees, so a phone
+/// held upright still sees the room around it, not a close-up.
+fn fov_for_aspect(fov_y: f32, aspect: f32) -> f32 {
+    const MIN_HORIZONTAL: f32 = 60.0 * std::f32::consts::PI / 180.0;
+    if !(aspect > 0.0 && aspect < 1.0) {
+        return fov_y;
+    }
+    let needed = 2.0 * ((MIN_HORIZONTAL / 2.0).tan() / aspect).atan();
+    fov_y.max(needed).min(110f32.to_radians())
+}
+
 fn sanitize_fov(fov_y: f32) -> f32 {
     if fov_y.is_finite() {
         fov_y.clamp(5f32.to_radians(), 150f32.to_radians())
@@ -617,6 +629,14 @@ impl Inner {
         let scale = dpr * self.params.get().render_scale;
         let size = |css: i32| (css as f32 * scale).round().clamp(1.0, MAX_CANVAS_SIZE) as u32;
         let (css_width, css_height) = (self.canvas.client_width(), self.canvas.client_height());
+        // A canvas momentarily laid out with no width or height (a reflow
+        // under way) keeps its buffer: resizing it to one pixel clears it,
+        // and the next frame's resize back clears it again. Seen alternating
+        // frame after frame, a full-window blink.
+        if css_width <= 0 || css_height <= 0 {
+            let (w, h) = (self.canvas.width(), self.canvas.height());
+            return (w.max(1), h.max(1), false, scale);
+        }
         let (width, height) = (size(css_width), size(css_height));
         let changed = self.canvas.width() != width || self.canvas.height() != height;
         if changed {
@@ -670,7 +690,8 @@ impl Inner {
 
         let params = self.params.get();
         let view = self.nav.borrow().view_matrix();
-        let proj = perspective(self.fov_y.get(), width as f32 / height as f32, NEAR, FAR);
+        let aspect = width as f32 / height as f32;
+        let proj = perspective(fov_for_aspect(self.fov_y.get(), aspect), aspect, NEAR, FAR);
         let clip_y = self.clip_y(&params, false);
         let gl = &self.gl;
         gl.bind_framebuffer(GL::FRAMEBUFFER, None);
